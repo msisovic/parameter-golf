@@ -716,9 +716,10 @@ class Block(nn.Module):
         self.mlp_B = nn.Parameter(torch.ones(2, dtype=torch.float32))
 
     def forward(self, h0: Tensor, h1: Tensor, x0: Tensor) -> tuple[Tensor, Tensor]:
-        # resid_mix: blend stream 0 with x0
+        # resid_mix: blend all streams with x0 (symmetric, before attn)
         mix = self.resid_mix.to(dtype=h0.dtype)
         h0 = mix[0][None, None, :] * h0 + mix[1][None, None, :] * x0
+        h1 = mix[0][None, None, :] * h1 + mix[1][None, None, :] * x0
 
         # --- Attention sublayer (HC n=2 unrolled) ---
         Am = self.attn_Am.to(dtype=h0.dtype)
