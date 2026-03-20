@@ -827,7 +827,7 @@ class GPT(nn.Module):
 
         for block in self.blocks:
             h0, h1 = block(h0, h1, x0)
-        x = h0
+        x = h0 + h1  # sum all HC streams (paper: sum row-wise)
 
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -871,7 +871,7 @@ class GPT(nn.Module):
         h0, h1 = x, x.clone()
         for block in self.blocks:
             h0, h1 = block(h0, h1, x0)
-        x = h0
+        x = h0 + h1  # sum all HC streams (paper: sum row-wise)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
