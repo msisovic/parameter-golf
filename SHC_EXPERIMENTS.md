@@ -123,6 +123,23 @@ Extended to ~1040 steps for per-step comparison:
 
 v5 is the best per-step among correct implementations. Symmetric routing preserved.
 
+### 10-min: HC v6a — x0 scalar bias on MLP output
+
+Replace per-dim resid_mix with a single scalar x0_scale added to MLP sublayer output.
+x0 enters via `t_out = mlp(norm(h_in)) + x0_scale * x0`, then B distributes to both
+streams naturally. Inspired by reference repo's additive hc_bias approach.
+
+| Metric              | Baseline | HC v5 (mix both) | HC v6a (x0 on MLP out) |
+|---------------------|----------|-------------------|------------------------|
+| step_avg            | 628ms    | 690ms (+10%)      | **653ms (+4%)**        |
+| steps completed     | 956      | 869               | **920**                |
+| val_bpb (pre-quant) | 1.3323   | 1.3367            | **1.3296**             |
+| int6 roundtrip bpb  | 1.9367   | 2.1948            | **2.0094**             |
+
+**First HC variant to beat baseline on wallclock pre-quant.** Only 4% overhead
+(scalar add is much cheaper than per-dim blend on both lanes). val_bpb 1.3296
+vs baseline 1.3323 = -0.0027 improvement.
+
 ## Am Convergence Analysis
 
 - v3 (resid_mix on h0 before Am): Am drifts to favor h1 (clean stream), routing
@@ -131,13 +148,12 @@ v5 is the best per-step among correct implementations. Symmetric routing preserv
 - v5 (resid_mix on both lanes): Clean alternating pattern, best per-step of correct variants.
 
 ## Key Takeaways
-- HC is **sample-efficient**: every variant beats baseline per-step (~0.004-0.006 bpb)
-- HC **overhead kills wallclock**: 6-10% (n=2) or 30% (n=4) step overhead
-- **resid_mix placement critical**: must be symmetric across lanes to avoid routing bias
-- v5 (symmetric mix) is the correct design: best per-step, clean routing
+- HC is **sample-efficient**: every variant beats baseline per-step
+- **Overhead is the bottleneck**: per-dim resid_mix on both lanes = 10%, scalar x0 bias = 4%
+- **v6a (scalar x0 on MLP output) beats baseline on wallclock** — first HC variant to do so
+- x0 anchoring works best as additive bias on sublayer output (symmetric, cheap)
 - n=4 not viable (30% overhead, not memory-bound)
-- On 8xH100 with DDP, communication may mask compute overhead — HC could become viable
-- 1xH100 10-min is ~1/8 of competition budget; at full budget HC has more room
+- On 8xH100 with DDP, communication may further mask the 4% overhead
 
 ## Paper Findings
 - No weight decay on static HC params
@@ -148,6 +164,6 @@ v5 is the best per-step among correct implementations. Symmetric routing preserv
 - Paper trained at 500B tokens vs our ~2B
 
 ## Open Questions
-- Does v5 hold up at 30+ min? Does per-step gap widen with more training?
-- On 8xH100 with DDP, does communication mask the 10% overhead?
-- Is the improvement partly from removing U-Net skips (independent of HC)?
+- Does v6a hold up at 30 min? Does wallclock advantage persist?
+- Try x0 bias on both sublayers (attn + MLP) — better quality or just more overhead?
+- On 8xH100 with DDP, does communication further mask the 4% overhead?

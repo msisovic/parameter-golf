@@ -311,7 +311,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,q_gain,skip_weight,skip_weights,smear,attn_Am,attn_Ar,attn_B,mlp_Am,mlp_Ar,mlp_B",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,x0_scale,q_gain,skip_weight,skip_weights,smear,attn_Am,attn_Ar,attn_B,mlp_Am,mlp_Ar,mlp_B",
     ).split(",")
     if pattern
 )
@@ -702,7 +702,7 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.x0_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         # Static HC (n=2) per paper: Am=e_{k mod 2}, B=[1,1], Ar=I
         # Alternating init: even layers aggregate stream 0, odd layers stream 1
         am_init = [1.0, 0.0] if layer_idx % 2 == 0 else [0.0, 1.0]
@@ -716,11 +716,6 @@ class Block(nn.Module):
         self.mlp_B = nn.Parameter(torch.ones(2, dtype=torch.float32))
 
     def forward(self, h0: Tensor, h1: Tensor, x0: Tensor) -> tuple[Tensor, Tensor]:
-        # resid_mix: blend all streams with x0 (symmetric, before attn)
-        mix = self.resid_mix.to(dtype=h0.dtype)
-        h0 = mix[0][None, None, :] * h0 + mix[1][None, None, :] * x0
-        h1 = mix[0][None, None, :] * h1 + mix[1][None, None, :] * x0
-
         # --- Attention sublayer (HC n=2 unrolled) ---
         Am = self.attn_Am.to(dtype=h0.dtype)
         Ar = self.attn_Ar.to(dtype=h0.dtype)
@@ -736,7 +731,7 @@ class Block(nn.Module):
         Ar = self.mlp_Ar.to(dtype=h0.dtype)
         B = self.mlp_B.to(dtype=h0.dtype)
         h_in = Am[0] * h0 + Am[1] * h1
-        t_out = self.mlp(self.mlp_norm(h_in))
+        t_out = self.mlp(self.mlp_norm(h_in)) + self.x0_scale.to(dtype=h0.dtype) * x0
         h0_new = Ar[0, 0] * h0 + Ar[0, 1] * h1 + B[0] * t_out
         h1_new = Ar[1, 0] * h0 + Ar[1, 1] * h1 + B[1] * t_out
 
