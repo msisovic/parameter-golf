@@ -311,7 +311,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,attn_Am,attn_Ar,attn_B,mlp_Am,mlp_Ar,mlp_B",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,q_gain,skip_weight,skip_weights,smear,attn_Am,attn_Ar,attn_B,mlp_Am,mlp_Ar,mlp_B",
     ).split(",")
     if pattern
 )
@@ -695,6 +695,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -702,16 +703,17 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        # Static HC (n=2) unrolled as scalar params for compile-friendly ops.
-        # Init: Am=[1,0], B=[1,0], Ar=I  =>  standard pre-norm residual on stream 0
+        # Static HC (n=2) per paper: Am=e_{k mod 2}, B=[1,1], Ar=I
+        # Alternating init: even layers aggregate stream 0, odd layers stream 1
+        am_init = [1.0, 0.0] if layer_idx % 2 == 0 else [0.0, 1.0]
         # Attn sublayer
-        self.attn_Am = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+        self.attn_Am = nn.Parameter(torch.tensor(am_init, dtype=torch.float32))
         self.attn_Ar = nn.Parameter(torch.eye(2, dtype=torch.float32))
-        self.attn_B = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+        self.attn_B = nn.Parameter(torch.ones(2, dtype=torch.float32))
         # MLP sublayer
-        self.mlp_Am = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+        self.mlp_Am = nn.Parameter(torch.tensor(am_init, dtype=torch.float32))
         self.mlp_Ar = nn.Parameter(torch.eye(2, dtype=torch.float32))
-        self.mlp_B = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+        self.mlp_B = nn.Parameter(torch.ones(2, dtype=torch.float32))
 
     def forward(self, h0: Tensor, h1: Tensor, x0: Tensor) -> tuple[Tensor, Tensor]:
         # resid_mix: blend stream 0 with x0
@@ -738,6 +740,11 @@ class Block(nn.Module):
         h1_new = Ar[1, 0] * h0 + Ar[1, 1] * h1 + B[1] * t_out
 
         return h0_new, h1_new
+
+    def hc_params(self) -> list[nn.Parameter]:
+        """Return HC-specific params (for no-WD optimizer group)."""
+        return [self.attn_Am, self.attn_Ar, self.attn_B,
+                self.mlp_Am, self.mlp_Ar, self.mlp_B]
 
 
 class GPT(nn.Module):
@@ -779,6 +786,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    layer_idx=i,
                 )
                 for i in range(num_layers)
             ]
@@ -1179,10 +1187,18 @@ def main() -> None:
     ]
     if base_model.mtp_num_heads > 0:
         matrix_params.extend([p for p in base_model.mtp_heads.parameters() if p.ndim == 2])
+    # HC params: no weight decay (per paper), separate group
+    hc_param_set: set[int] = set()
+    hc_params_list: list[nn.Parameter] = []
+    for block in base_model.blocks:
+        for p in block.hc_params():
+            hc_param_set.add(id(p))
+            hc_params_list.append(p)
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+        and id(p) not in hc_param_set
     ]
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
@@ -1216,7 +1232,14 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_hc = torch.optim.AdamW(
+        [{"params": hc_params_list, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        weight_decay=0.0,
+        fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_hc]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1408,6 +1431,14 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    # Log converged HC params for interpretability
+    for i, block in enumerate(base_model.blocks):
+        for sub in ("attn", "mlp"):
+            Am = getattr(block, f"{sub}_Am").data.tolist()
+            Ar = getattr(block, f"{sub}_Ar").data.tolist()
+            B = getattr(block, f"{sub}_B").data.tolist()
+            log0(f"hc_params block:{i} {sub} Am={Am} Ar={Ar} B={B}")
 
     if args.swa_enabled and swa_state is not None and swa_count > 1:
         log0(f"swa:applying averaged {swa_count} checkpoints")

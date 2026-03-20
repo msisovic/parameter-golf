@@ -55,6 +55,22 @@ HC allows the network to dynamically rearrange layer execution:
 * **Parallel:** Specific matrix configurations allow adjacent layers to operate in parallel (Layer $k$ does not depend on Layer $k-1$).
 * **Dynamic Mixture:** The network learns a "soft-mixture" of sequential and parallel arrangements.
 
+### 2.4 Initialization (Static HC)
+The static matrices are initialized per-layer as:
+$$\mathcal{HC}^{(k)} = \begin{pmatrix} 0_{1\times1} & \mathbf{1}_{1\times n} \\ \mathbf{e}_{k \bmod n} & I_{n\times n} \end{pmatrix}$$
+
+Where $\mathbf{e}_{k \bmod n}$ is the one-hot basis vector — layer 0 aggregates from stream 0, layer 1 from stream 1, layer 2 from stream 0 again, etc. This alternating pattern forces all streams to carry useful information from the start.
+
+B is initialized to all-ones, and A_r to identity.
+
+### 2.5 Output Standardization
+Since the hyper hidden vectors of the final transformer block are ultimately summed, the std of output projections (attn proj, MLP proj) at all layers is scaled by $1/\sqrt{n}$ at init to preserve output statistics.
+
+### 2.6 Training Details
+* **No weight decay on static HC params** (A_m, A_r, B). The paper explicitly states: "The static component does not utilize weight decay, whereas the dynamic component does."
+* **No special learning rate** for HC params — they use the baseline model's optimizer config unchanged.
+* HC is designed as a drop-in replacement requiring minimal changes to existing training configurations.
+
 ---
 
 ## 4. Experimental Results
