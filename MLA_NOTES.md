@@ -88,20 +88,35 @@ Replace separate K/V projections with shared low-rank latent:
 - Killed early — 11-layer MLA already over 16MB, 12 layers would be worse
 - Step speed was ~180ms (extra layer adds ~10%)
 
+### Exp 5: Materialized MLA d_c=128 + 12 layers + force int6 quantization
+- Status: DONE
+- Params: 27,618,913
+- Steps: 6701 (vs 7299 baseline), step_avg: 179.08ms
+- val_bpb trajectory: 1.3449 (1k) → 1.2766 (2k) → 1.2484 (3k) → 1.2042 (5k) → 1.1749 (6k) → 1.1535 (6.7k)
+- final_int6_roundtrip val_bpb: 1.1595
+- **final_int6_sliding_window val_bpb: 1.1360** (stride=64)
+- Artifact size: 16.54MB (zstd) — **still over 16MB limit**
+- Peak memory: 22314 MiB
+- **Result: 0.011 worse than baseline. Force int6 helped (16.5MB vs 16.68MB for 11L without it)**
+  **but 12 layers has more total params (27.6M) so artifact still too large.**
+- Note: val_bpb overtook baseline at step 5k (1.2042 vs 1.2076) — extra depth helps,
+  but ~600 fewer steps (wallclock penalty) erases the advantage by end of training.
+
 ## Key Findings
 1. Naive MLA (sequential matmuls) adds ~7-15% step time overhead — kills wallclock-limited runs
 2. **Materialized MLA (W_k = W_down @ W_up_k computed inline) has ZERO speed overhead** — this is the way
 3. d_c=64 compresses KV too aggressively, hurting quality
 4. d_c=128 loses ~0.013 val_bpb from rank constraint, saves 1.4M params / ~50% KV compression
 5. The competition is BOTH param-limited (16MB artifact) AND wallclock-limited (10min)
-6. **CRITICAL: MLA saves params but INCREASES artifact size** (~16.68MB vs ~15.6MB baseline with zstd)
-   - Factored weights (w_down, w_up_k, w_up_v) compress ~2.1MB worse than original (c_k, c_v)
-   - Likely due to per-tensor quantization overhead + worse entropy structure for zstd
-   - This makes MLA counterproductive for the 16MB artifact constraint
+6. MLA artifact size is larger than baseline even with force int6 fix:
+   - 11L MLA: 16.68MB without fix → would be ~15.5MB with fix (but quality too low)
+   - 12L MLA: 16.54MB with fix (more params offsets compression savings)
+   - Baseline 11L GQA: ~15.6MB
+7. 12-layer MLA overtakes baseline mid-training (step 5k) but loses advantage due to fewer total steps
 
 ## Conclusion
 MLA is not beneficial for this competition format:
-- Wallclock-limited: materialized MLA solves this (zero overhead), but...
-- Param-limited (16MB artifact): factored weights compress WORSE, making the artifact bigger
-- Quality: low-rank KV constraint hurts val_bpb by ~0.013 at d_c=128
-- Net effect: worse on all three axes that matter (quality, artifact size, or speed if not materialized)
+- Wallclock-limited: materialized MLA solves this (zero overhead), but extra layer costs ~10% steps
+- Param-limited (16MB artifact): 11L MLA fits but quality gap too large; 12L MLA busts limit
+- Quality: low-rank KV constraint hurts val_bpb by ~0.011-0.013
+- Net effect: no configuration found that beats baseline on all three constraints simultaneously

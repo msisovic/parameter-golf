@@ -708,6 +708,10 @@ class MultiHeadLatentAttention(nn.Module):
         nn.init.orthogonal_(self.w_down, gain=1.0)
         nn.init.orthogonal_(self.w_up_k, gain=1.0)
         nn.init.orthogonal_(self.w_up_v, gain=1.0)
+        # Mark for int6 quantization (these are small enough to hit the passthrough threshold)
+        self.w_down._force_int6 = True
+        self.w_up_k._force_int6 = True
+        self.w_up_v._force_int6 = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rope_dims = rope_dims
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
@@ -1108,12 +1112,17 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     ) + 1
     late_k_layers = set(range(num_layers_total - 2, num_layers_total))
 
+    # Collect names marked _force_int6 (e.g. MLA factored KV weights)
+    force_int6_names = set()
+    if hasattr(mixed_quantize_int6, '_force_int6_names'):
+        force_int6_names = mixed_quantize_int6._force_int6_names
+
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
-        if not t.is_floating_point() or t.numel() <= 65536:
+        if not t.is_floating_point() or (t.numel() <= 65536 and name not in force_int6_names):
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough"
             continue
@@ -1579,6 +1588,11 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
 
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
+    # Collect params marked _force_int6 (MLA factored weights below numel threshold)
+    mixed_quantize_int6._force_int6_names = {
+        name for name, p in base_model.named_parameters()
+        if getattr(p, '_force_int6', False) and "mtp_heads" not in name
+    }
     quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
