@@ -144,7 +144,7 @@ Peak memory: 55888 MiB (vs 26300 MiB in Run 1 — deep steps use more memory).
 
 ## Run 5: Geiping-inspired — input injection, exit block, truncated backprop (next)
 
-**Architecture change:** 2 entry blocks + 1 recurrent block + 1 exit block (4 blocks total).
+**Architecture change:** 1 entry block + 1 recurrent block + 1 exit block (3 blocks, same param budget as before).
 - **Input injection (Geiping et al. 2025):** At every recurrent iteration, concat entry encoding `e` with recurrent state `s`, project `R^{2d} → R^d` via learned adapter. Anchors recurrence to input, prevents drift.
 - **Exit block:** Decouples latent refinement space from decodable space. Recurrent block operates freely; exit block translates to LM-head-compatible representation.
 - **Truncated backprop:** Only backprop through last k=8 recurrent iterations. Saves memory AND regularizes (prevents iteration-specific behavior).

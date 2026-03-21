@@ -1,5 +1,5 @@
 """
-train_gpt_submit.py — Depth-recurrent architecture: 2 entry blocks + 1 recurrent block + 1 exit block.
+train_gpt_submit.py — Depth-recurrent architecture: 1 entry block + 1 recurrent block + 1 exit block.
 Geiping-style input injection (concat+project) at each recurrent iteration.
 Truncated backprop through last k iterations. Poisson depth sampling.
 Int8 quantization for POC. Keeps: partial RoPE, EMA, late QAT, Muon,
@@ -726,15 +726,14 @@ class GPT(nn.Module):
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
 
-        # Depth-recurrent: 2 entry blocks + 1 recurrent block + 1 exit block
+        # Depth-recurrent: 1 entry + 1 recurrent + 1 exit (3 blocks, same param budget)
         def _make_block() -> Block:
             return Block(
                 model_dim, num_heads, num_kv_heads, mlp_mult,
                 rope_base, qk_gain_init, rope_dims=rope_dims,
             )
 
-        self.entry_block_0 = _make_block()
-        self.entry_block_1 = _make_block()
+        self.entry_block = _make_block()
         self.recurrent_block = _make_block()
         self.exit_block = _make_block()
 
@@ -755,7 +754,7 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         # Effective depth accounts for mean recurrent depth
-        effective_num_layers = 2 + self.mean_depth + 1  # entry + recurrent + exit
+        effective_num_layers = 1 + self.mean_depth + 1  # entry + recurrent + exit
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -799,9 +798,8 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
 
-        # Entry blocks (representation lifting)
-        x = self.entry_block_0(x)
-        x = self.entry_block_1(x)
+        # Entry block (representation lifting)
+        x = self.entry_block(x)
         e = x  # save entry encoding for input injection
 
         # Recurrent block × N with input injection (loss only at final iteration)
@@ -820,8 +818,7 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
 
-        x = self.entry_block_0(x)
-        x = self.entry_block_1(x)
+        x = self.entry_block(x)
         e = x
 
         x = self._run_recurrence(x, e)
@@ -1050,7 +1047,7 @@ def main() -> None:
 
     # Optimizer split: gather params from all blocks + inject adapter
     all_block_params = []
-    for block_name in ("entry_block_0", "entry_block_1", "recurrent_block", "exit_block"):
+    for block_name in ("entry_block", "recurrent_block", "exit_block"):
         block = getattr(base_model, block_name)
         all_block_params.extend([(f"{block_name}.{n}", p) for n, p in block.named_parameters()])
     # Input injection adapter is a matrix param
