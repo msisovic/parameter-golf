@@ -795,21 +795,11 @@ class GPT(nn.Module):
         x = self.entry_block_0(x, x0)
         x = self.entry_block_1(x, x0)
 
-        targets = target_ids.reshape(-1)
-
-        # Recurrent block × N with aux loss at every iteration
-        loss_sum = x.new_zeros(())
+        # Recurrent block × N (loss only at final iteration)
         for _ in range(self.n_recurrent_iters):
             x = self.recurrent_block(x, x0)
-            if self.training:
-                loss_sum = loss_sum + self._compute_loss(x, targets)
 
-        if self.training:
-            # Average loss across all iterations (equal weighting, like Universal Transformer)
-            return loss_sum / self.n_recurrent_iters
-        else:
-            # Eval: just use the final iteration
-            return self._compute_loss(x, targets)
+        return self._compute_loss(x, target_ids.reshape(-1))
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""

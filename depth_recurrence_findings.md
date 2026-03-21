@@ -84,15 +84,61 @@ Peak memory: 55888 MiB (vs 26300 MiB in Run 1 — deep steps use more memory).
 
 **Submission size:** 9.91MB int8+zlib
 
-## Ideas for Next Runs
+## Run 3: Equal-weighted aux loss at every iteration (FAILED)
 
-**To close the gap to baseline (0.094 BPB):**
-- Lightweight auxiliary loss at 1-2 random intermediate iterations (norm+logits only, no exit block — nearly free compute). Forces each iteration to produce useful predictions.
-- Jacobian regularization on recurrent block (soft contraction constraint)
-- Stronger x0 injection (clamp resid_mix[1] minimum to prevent forgetting input)
-- Step-index conditioning (adaLN-style, let block know which iteration it's on)
-- Try lower Poisson mean (e.g. 6) to get more training steps while keeping tail exposure
-- Widen the model further (we use 9.9MB of 16MB budget)
+**Config:** 2 entry blocks (no exit block) + recurrent. Poisson(mean=6). Aux cross-entropy loss at every recurrent iteration, equally weighted (averaged).
+
+**Result: Training diverged.** Val BPB went 1.53 → 1.95 → 3.97 over steps 1000-3000. Killed at step ~3000.
+
+**Root cause:** Equal-weighted aux loss creates conflicting gradients. Shallow iterations (depth 2-3) want representations optimized for immediate decoding. Deep iterations (depth 10+) want representations optimized for further refinement. These objectives conflict, destabilizing training.
+
+**Key finding:** Equal-weighted aux loss at every iteration is **not used by any major paper** in this space.
+
+## Literature Survey: Aux Loss Weighting Schemes
+
+### Option A — Final-only loss + randomized depth (most proven at scale)
+**Used by:** Geiping et al. 2025 ("Scaling up Test-Time Compute with Latent Reasoning", arXiv 2502.05171)
+- Loss computed **only at the final iteration** after all N recurrent steps
+- Depth N sampled from log-normal Poisson distribution (heavy-tailed)
+- Truncated backprop through only the last k=8 iterations (saves memory)
+- **Scales to 3.5B params / 800B tokens.** Most proven approach for LLMs.
+- No aux losses means no conflicting gradients
+
+### Option B — Stop-gradient consistency loss
+**Used by:** LoopFormer (ICLR 2026, arXiv 2602.11451), Schwarzschild et al. 2022
+- `loss = final_loss + 0.1 * ||stopgrad(h_deep) - h_shallow||²`
+- Shallow iterations learn to *match* deep representations without corrupting deep path gradients
+- LoopFormer also conditions on step index via adaLN (the block knows which iteration it's on)
+- Schwarzschild: run prefix iterations with **detached gradients**, then continue with gradients. Prevents iteration-specific behavior.
+
+### Option C — Linearly increasing weights
+**Used by:** CALM (Schuster et al. 2022), RLTT (2025)
+- `weight_t = t / sum(1..N)` — final iteration dominates, shallow iterations barely contribute
+- CALM: for 8 layers, layer 1 gets weight 1/36, layer 8 gets 8/36
+- RLTT progressive: `weight_t = t^alpha / sum(s^alpha)`
+
+### Option D — Learned halting probability weighting
+**Used by:** PonderNet (Banino et al. 2021), LoopLM
+- Model learns per-step halting probability `lambda_n`
+- Loss = `sum(p_n * L_n)` weighted by halting distribution
+- KL regularizer against geometric prior prevents always using max steps
+- More complex to implement, adds parameters
+
+### Recommendation priority
+1. **Option A first** — simplest, most proven, already close to our Run 2 setup
+2. **Option B if A doesn't scale** — stop-gradient consistency is the cleanest way to add intermediate supervision
+3. **Option C as middle ground** — simple to implement, mild regularization
+4. **Option D if we need adaptive halting** — most complex, best for variable-difficulty inputs
+
+## Run 4: Final-only loss, 2 entry blocks, no exit block (next)
+
+**Architecture change:** 2 entry blocks + 1 recurrent block (no exit block). Same 3 blocks = same 12.1M params.
+- Entry blocks specialize on representation lifting
+- Recurrent block specializes on iterative refinement
+- Loss only at final iteration (Option A from literature)
+- Poisson(mean=6) depth sampling
+
+**Hypothesis:** Combining the Poisson depth benefit from Run 2 with the cleaner 2-entry architecture should match or beat Run 2, while the 2 entry blocks help convergence speed.
 
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
