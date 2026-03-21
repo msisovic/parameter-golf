@@ -47,7 +47,14 @@ Replace separate K/V projections with shared low-rank latent:
 - Peak memory: 20713 MiB
 
 ### Exp 1: MLA d_c=128 (same layers/heads, just swap attn)
-- Status: RUNNING
+- Status: DONE
 - Params: 26,109,017 (saved 720,896 vs baseline)
-- step_avg: ~176ms (vs 164ms baseline, ~8% slower due to extra matmuls)
-- val_bpb @ step 3000: 1.2519 (vs baseline 1.2369 @ 3k)
+- Steps: 7018 (vs 7299 baseline), step_avg: 170.99ms (~4% slower)
+- val_bpb trajectory: 1.3464 (1k) → 1.2519 (3k) → 1.2409 (4k) → 1.1868 (6k) → 1.1533 (7k) → 1.1532 (7.0k)
+- final_int6_roundtrip val_bpb: 1.1591
+- **final_int6_sliding_window val_bpb: 1.1357** (stride=64)
+- Peak memory: 23044 MiB
+- **Result: 0.011 worse than baseline (1.1357 vs 1.1248)**
+- Analysis: MLA adds overhead from 3 matmuls (W_dkv, W_uk, W_uv) vs 2 (c_k, c_v).
+  Fewer steps + fewer params (not reinvested) = worse result.
+  Need to reinvest saved params and/or reduce latency.
