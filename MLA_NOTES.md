@@ -58,3 +58,22 @@ Replace separate K/V projections with shared low-rank latent:
 - Analysis: MLA adds overhead from 3 matmuls (W_dkv, W_uk, W_uv) vs 2 (c_k, c_v).
   Fewer steps + fewer params (not reinvested) = worse result.
   Need to reinvest saved params and/or reduce latency.
+- NOTE: all runs used zlib (zstandard not installed). PR #315 used zstd-22 (15.6MB).
+  Installed zstandard for future runs. Artifact sizes above are inflated.
+
+### Exp 2: MLA d_c=64 + wider MLP (mlp_mult=3.31, fused W_ukv)
+- Status: DONE
+- Params: 26,807,385 (reinvested savings into MLP width)
+- Steps: 6323 (vs 7299 baseline), step_avg: 189.79ms (~15% slower!)
+- val_bpb trajectory: 1.2927 (2k) → 1.2657 (3k) → 1.2133 (5k) → 1.1791 (6k) → 1.1695 (6.3k)
+- final_int6_roundtrip val_bpb: 1.1749
+- **final_int6_sliding_window val_bpb: 1.1520** (stride=64)
+- Peak memory: 23621 MiB
+- **Result: 0.027 worse than baseline. d_c=64 too aggressive, plus 15% slower = ~1000 fewer steps.**
+
+## Key Findings So Far
+1. MLA adds ~7-15% step time overhead from the extra down+up projection matmuls
+2. d_c=64 compresses KV too aggressively, hurting quality
+3. d_c=128 is modest savings (~720K) but still slower
+4. The competition is BOTH param-limited (16MB artifact) AND wallclock-limited (10min)
+5. Baseline with zlib is over 16MB limit (16.99MB), but fits with zstd (15.6MB per PR #315)

@@ -688,9 +688,8 @@ class MultiHeadLatentAttention(nn.Module):
         self.d_c = d_c
         # KV compression: x → shared latent → per-head K, V
         self.w_dkv = CastedLinear(dim, d_c, bias=False)
-        # Expand from latent to all heads (not per-group like GQA — all heads share the latent)
-        self.w_uk = CastedLinear(d_c, num_heads * self.head_dim, bias=False)
-        self.w_uv = CastedLinear(d_c, num_heads * self.head_dim, bias=False)
+        # Fused up-projection: latent → [K, V] in one matmul to reduce kernel launches
+        self.w_ukv = CastedLinear(d_c, 2 * num_heads * self.head_dim, bias=False)
         # Q projection — same as GQA
         self.c_q = CastedLinear(dim, dim, bias=False)
         # Output projection
@@ -705,10 +704,10 @@ class MultiHeadLatentAttention(nn.Module):
         bsz, seqlen, dim = x.shape
         # Q — identical to GQA path
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        # KV through shared latent
+        # KV through shared latent (fused up-projection)
         c_kv = self.w_dkv(x)
-        k = self.w_uk(c_kv).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        v = self.w_uv(c_kv).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        kv = self.w_ukv(c_kv).reshape(bsz, seqlen, 2, self.num_heads, self.head_dim)
+        k, v = kv[:, :, 0], kv[:, :, 1]
         # QK normalization
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
