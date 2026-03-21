@@ -38,5 +38,8 @@ Replace separate K/V projections with shared low-rank latent:
 ## Experiment Results
 
 ### Exp 0: GQA Baseline (11 layers, no MLA)
-- Status: RUNNING
-- val_bpb @ step 2000: 1.2614
+- Status: DONE
+- Steps: 7299 (wallclock capped at 1200s), step_avg: 164.41ms
+- val_bpb trajectory: 1.2614 (2k) → 1.2369 (3k) → 1.2296 (4k) → 1.2076 (5k) → 1.1828 (6k) → 1.1499 (7k) → 1.1415 (7.3k)
+- **final_int6_roundtrip val_bpb: 1.1483**
+- Peak memory: 20713 MiB
