@@ -98,7 +98,7 @@ class Hyperparameters:
     # Depth recurrence (Poisson sampling: mean=recurrent_mean_depth, clipped to [min, max])
     recurrent_min_depth = int(os.environ.get("RECURRENT_MIN_DEPTH", 2))
     recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 24))
-    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 8))
+    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 6))
     eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 20))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
@@ -733,7 +733,7 @@ class GPT(nn.Module):
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
 
-        # Depth-recurrent: entry block, recurrent block (shared, iterated), exit block
+        # Depth-recurrent: 2 entry blocks (representation lifting) + 1 recurrent block (iterative refinement)
         def _make_block(layer_idx: int) -> Block:
             return Block(
                 model_dim, num_heads, num_kv_heads, mlp_mult,
@@ -741,9 +741,9 @@ class GPT(nn.Module):
                 layer_idx=layer_idx, ln_scale=ln_scale,
             )
 
-        self.entry_block = _make_block(layer_idx=0)
-        self.recurrent_block = _make_block(layer_idx=1)
-        self.exit_block = _make_block(layer_idx=2)
+        self.entry_block_0 = _make_block(layer_idx=0)
+        self.entry_block_1 = _make_block(layer_idx=1)
+        self.recurrent_block = _make_block(layer_idx=2)
 
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -770,6 +770,19 @@ class GPT(nn.Module):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * effective_num_layers))
 
+    def _compute_loss(self, x: Tensor, targets: Tensor) -> Tensor:
+        """Compute cross-entropy loss from hidden states (norm → logits → loss)."""
+        x_norm = self.final_norm(x)
+        x_flat = x_norm.reshape(-1, x_norm.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(x_flat, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x_flat)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -778,28 +791,25 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
 
-        # Entry block
-        x = self.entry_block(x, x0)
+        # Entry blocks (representation lifting)
+        x = self.entry_block_0(x, x0)
+        x = self.entry_block_1(x, x0)
 
-        # Recurrent block × N
+        targets = target_ids.reshape(-1)
+
+        # Recurrent block × N with aux loss at every iteration
+        loss_sum = x.new_zeros(())
         for _ in range(self.n_recurrent_iters):
             x = self.recurrent_block(x, x0)
+            if self.training:
+                loss_sum = loss_sum + self._compute_loss(x, targets)
 
-        # Exit block
-        x = self.exit_block(x, x0)
-
-        x = self.final_norm(x)
-        x_flat = x.reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x_flat, self.tok_emb.weight)
+        if self.training:
+            # Average loss across all iterations (equal weighting, like Universal Transformer)
+            return loss_sum / self.n_recurrent_iters
         else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x_flat)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        return main_loss
+            # Eval: just use the final iteration
+            return self._compute_loss(x, targets)
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
@@ -810,10 +820,10 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
 
-        x = self.entry_block(x, x0)
+        x = self.entry_block_0(x, x0)
+        x = self.entry_block_1(x, x0)
         for _ in range(self.n_recurrent_iters):
             x = self.recurrent_block(x, x0)
-        x = self.exit_block(x, x0)
 
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1038,7 +1048,7 @@ def main() -> None:
 
     # Optimizer split: gather params from the 3 named blocks
     all_block_params = []
-    for block_name in ("entry_block", "recurrent_block", "exit_block"):
+    for block_name in ("entry_block_0", "entry_block_1", "recurrent_block"):
         block = getattr(base_model, block_name)
         all_block_params.extend([(f"{block_name}.{n}", p) for n, p in block.named_parameters()])
 
