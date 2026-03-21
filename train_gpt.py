@@ -95,9 +95,10 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
 
-    # Depth recurrence
-    recurrent_min_depth = int(os.environ.get("RECURRENT_MIN_DEPTH", 4))
-    recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 10))
+    # Depth recurrence (Poisson sampling: mean=recurrent_mean_depth, clipped to [min, max])
+    recurrent_min_depth = int(os.environ.get("RECURRENT_MIN_DEPTH", 2))
+    recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 24))
+    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 8))
     eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 20))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
@@ -1095,7 +1096,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"recurrence: min_depth={args.recurrent_min_depth} max_depth={args.recurrent_max_depth} eval_depth={args.eval_recurrent_depth}")
+    log0(f"recurrence: min_depth={args.recurrent_min_depth} max_depth={args.recurrent_max_depth} mean_depth={args.recurrent_mean_depth} eval_depth={args.eval_recurrent_depth} sampling=poisson")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1136,18 +1137,24 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
-    # We cycle through all recurrence depths to pre-compile every graph variant.
-    torch._dynamo.config.cache_size_limit = max(16, args.recurrent_max_depth - args.recurrent_min_depth + 2)
+    # Pre-compile the most common Poisson depths; rare deep ones compile lazily.
+    torch._dynamo.config.cache_size_limit = max(32, args.recurrent_max_depth - args.recurrent_min_depth + 4)
 
-    all_depths = list(range(args.recurrent_min_depth, args.recurrent_max_depth + 1))
-    warmup_steps_needed = max(args.warmup_steps, len(all_depths))
+    # Pre-compile depths covering ~95% of Poisson mass + a few deep ones
+    common_depths = list(range(args.recurrent_min_depth, min(args.recurrent_mean_depth * 2, args.recurrent_max_depth) + 1))
+    # Add a couple of deep depths so those compile too
+    for d in [args.recurrent_max_depth, args.eval_recurrent_depth]:
+        if d not in common_depths and d <= args.recurrent_max_depth:
+            common_depths.append(d)
+    common_depths = sorted(set(common_depths))
+    warmup_steps_needed = max(args.warmup_steps, len(common_depths))
     if warmup_steps_needed > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(warmup_steps_needed):
             # Cycle through all depths to pre-compile each graph variant
-            base_model.n_recurrent_iters = all_depths[warmup_step % len(all_depths)]
+            base_model.n_recurrent_iters = common_depths[warmup_step % len(common_depths)]
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -1168,7 +1175,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        log0(f"warmup:compiled {len(all_depths)} depth variants (depths {args.recurrent_min_depth}-{args.recurrent_max_depth})")
+        log0(f"warmup:compiled {len(common_depths)} depth variants (depths {common_depths})")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1232,11 +1239,9 @@ def main() -> None:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
 
-        # Curriculum on recurrence depth: linearly increase max_depth over training
-        progress = step / max(args.iterations, 1)
-        curr_max_depth = args.recurrent_min_depth + int(progress * (args.recurrent_max_depth - args.recurrent_min_depth))
-        curr_max_depth = max(curr_max_depth, args.recurrent_min_depth)
-        n_iters = random.randint(args.recurrent_min_depth, curr_max_depth)
+        # Poisson depth sampling: heavy tail lets model occasionally see deep iterations
+        # Mean ~recurrent_mean_depth, clipped to [recurrent_min_depth, recurrent_max_depth]
+        n_iters = min(max(np.random.poisson(args.recurrent_mean_depth), args.recurrent_min_depth), args.recurrent_max_depth)
         base_model.n_recurrent_iters = n_iters
 
         zero_grad_all()
