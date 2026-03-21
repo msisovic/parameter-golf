@@ -112,6 +112,8 @@ class Hyperparameters:
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    mla_enabled = bool(int(os.environ.get("MLA_ENABLED", "0")))
+    mla_d_c = int(os.environ.get("MLA_D_C", 128))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -667,6 +669,65 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
+class MultiHeadLatentAttention(nn.Module):
+    """MLA: compress KV through a shared low-rank latent, then expand to per-head K/V.
+    Same Q/K/V head_dim as GQA so FA3 runs at full speed. Partial RoPE reused as-is."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        d_c: int,
+        rope_base: float,
+        qk_gain_init: float,
+        rope_dims: int = 0,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.d_c = d_c
+        # KV compression: x → shared latent → per-head K, V
+        self.w_dkv = CastedLinear(dim, d_c, bias=False)
+        # Expand from latent to all heads (not per-group like GQA — all heads share the latent)
+        self.w_uk = CastedLinear(d_c, num_heads * self.head_dim, bias=False)
+        self.w_uv = CastedLinear(d_c, num_heads * self.head_dim, bias=False)
+        # Q projection — same as GQA
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        # Output projection
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rope_dims = rope_dims
+        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
+        self.use_xsa = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        # Q — identical to GQA path
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        # KV through shared latent
+        c_kv = self.w_dkv(x)
+        k = self.w_uk(c_kv).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        v = self.w_uv(c_kv).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        # QK normalization
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        # Partial RoPE — same as GQA
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        # FA3 — Q, K, V all have head_dim, no padding needed
+        y = flash_attn_3_func(q, k, v, causal=True)
+        if self.use_xsa:
+            # XSA: all heads, no GQA grouping needed since MLA expands to all heads
+            vn = F.normalize(v, dim=-1)
+            proj_val = (y * vn).sum(dim=-1, keepdim=True) * vn
+            y = y - proj_val
+        y = y.reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -729,11 +790,16 @@ class Block(nn.Module):
         rope_dims: int = 0,
         layer_idx: int = 0,
         ln_scale: bool = False,
+        mla_enabled: bool = False,
+        mla_d_c: int = 128,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
+        if mla_enabled:
+            self.attn = MultiHeadLatentAttention(dim, num_heads, mla_d_c, rope_base, qk_gain_init, rope_dims=rope_dims)
+        else:
+            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -771,6 +837,8 @@ class GPT(nn.Module):
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
+        mla_enabled: bool = False,
+        mla_d_c: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -799,6 +867,8 @@ class GPT(nn.Module):
                     rope_dims=rope_dims,
                     layer_idx=i,
                     ln_scale=ln_scale,
+                    mla_enabled=mla_enabled,
+                    mla_d_c=mla_d_c,
                 )
                 for i in range(num_layers)
             ]
@@ -1192,6 +1262,8 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
+        mla_enabled=args.mla_enabled,
+        mla_d_c=args.mla_d_c,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1268,7 +1340,8 @@ def main() -> None:
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    attn_mode = f"mla d_c:{args.mla_d_c}" if args.mla_enabled else f"gqa num_kv_heads:{args.num_kv_heads}"
+    log0(f"attention_mode:{attn_mode} num_heads:{args.num_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1524,6 +1597,8 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
+        mla_enabled=args.mla_enabled,
+        mla_d_c=args.mla_d_c,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
