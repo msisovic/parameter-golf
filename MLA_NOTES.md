@@ -84,10 +84,24 @@ Replace separate K/V projections with shared low-rank latent:
 - The materialized approach (computing W_down @ W_up_k inline) eliminates the speed overhead entirely.
   This is the right MLA implementation strategy for wallclock-limited settings.
 
-## Key Findings So Far
+### Exp 4: Materialized MLA d_c=128 + 12 layers (ABORTED)
+- Killed early — 11-layer MLA already over 16MB, 12 layers would be worse
+- Step speed was ~180ms (extra layer adds ~10%)
+
+## Key Findings
 1. Naive MLA (sequential matmuls) adds ~7-15% step time overhead — kills wallclock-limited runs
 2. **Materialized MLA (W_k = W_down @ W_up_k computed inline) has ZERO speed overhead** — this is the way
 3. d_c=64 compresses KV too aggressively, hurting quality
 4. d_c=128 loses ~0.013 val_bpb from rank constraint, saves 1.4M params / ~50% KV compression
 5. The competition is BOTH param-limited (16MB artifact) AND wallclock-limited (10min)
-6. Baseline with zstd fits at ~15.6MB, MLA d_c=128 at 16.68MB — need higher d_c or other approach
+6. **CRITICAL: MLA saves params but INCREASES artifact size** (~16.68MB vs ~15.6MB baseline with zstd)
+   - Factored weights (w_down, w_up_k, w_up_v) compress ~2.1MB worse than original (c_k, c_v)
+   - Likely due to per-tensor quantization overhead + worse entropy structure for zstd
+   - This makes MLA counterproductive for the 16MB artifact constraint
+
+## Conclusion
+MLA is not beneficial for this competition format:
+- Wallclock-limited: materialized MLA solves this (zero overhead), but...
+- Param-limited (16MB artifact): factored weights compress WORSE, making the artifact bigger
+- Quality: low-rank KV constraint hurts val_bpb by ~0.013 at d_c=128
+- Net effect: worse on all three axes that matter (quality, artifact size, or speed if not materialized)
