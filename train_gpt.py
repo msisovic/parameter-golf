@@ -670,59 +670,76 @@ class CausalSelfAttention(nn.Module):
 
 
 class MultiHeadLatentAttention(nn.Module):
-    """MLA: compress KV through a shared low-rank latent, then expand to per-head K/V.
-    Same Q/K/V head_dim as GQA so FA3 runs at full speed. Partial RoPE reused as-is."""
+    """MLA: factorize KV through shared low-rank W_down, but materialize W_k/W_v
+    in forward pass so compute cost is identical to GQA. Low-rank structure only
+    matters for compression (fewer stored params) and as an implicit regularizer."""
 
     def __init__(
         self,
         dim: int,
         num_heads: int,
+        num_kv_heads: int,
         d_c: int,
         rope_base: float,
         qk_gain_init: float,
         rope_dims: int = 0,
     ):
         super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        self.d_c = d_c
-        # KV compression: x → shared latent → per-head K, V
-        self.w_dkv = CastedLinear(dim, d_c, bias=False)
-        # Fused up-projection: latent → [K, V] in one matmul to reduce kernel launches
-        self.w_ukv = CastedLinear(d_c, 2 * num_heads * self.head_dim, bias=False)
-        # Q projection — same as GQA
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        kv_dim = self.num_kv_heads * self.head_dim
+        # Q and output proj — identical to GQA
         self.c_q = CastedLinear(dim, dim, bias=False)
-        # Output projection
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
+        # KV factored through shared W_down: W_k = W_down @ W_up_k, W_v = W_down @ W_up_v
+        # Forward materializes the product so compute cost = GQA
+        # Init so that W_k = W_down @ W_up_k starts ~orthogonal
+        self.w_down = nn.Parameter(torch.empty(dim, d_c))
+        self.w_up_k = nn.Parameter(torch.empty(d_c, kv_dim))
+        self.w_up_v = nn.Parameter(torch.empty(d_c, kv_dim))
+        nn.init.orthogonal_(self.w_down, gain=1.0)
+        nn.init.orthogonal_(self.w_up_k, gain=1.0)
+        nn.init.orthogonal_(self.w_up_v, gain=1.0)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rope_dims = rope_dims
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
         self.use_xsa = False
 
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        """Subtract self-value projection via GQA-aware reshape (no repeat_interleave)."""
+        B, T, H, D = y.shape
+        Hkv = v.size(-2)
+        group = H // Hkv
+        y_g = y.reshape(B, T, Hkv, group, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(-2)
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, T, H, D)
+
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        # Q — identical to GQA path
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        # KV through shared latent (fused up-projection)
-        c_kv = self.w_dkv(x)
-        kv = self.w_ukv(c_kv).reshape(bsz, seqlen, 2, self.num_heads, self.head_dim)
-        k, v = kv[:, :, 0], kv[:, :, 1]
-        # QK normalization
+        # Materialize W_k and W_v from factored params — same matmul cost as GQA
+        w_k = self.w_down @ self.w_up_k  # (dim, kv_dim)
+        w_v = self.w_down @ self.w_up_v  # (dim, kv_dim)
+        k = (x @ w_k).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = (x @ w_v).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        # Partial RoPE — same as GQA
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        # FA3 — Q, K, V all have head_dim, no padding needed
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
-            # XSA: all heads, no GQA grouping needed since MLA expands to all heads
-            vn = F.normalize(v, dim=-1)
-            proj_val = (y * vn).sum(dim=-1, keepdim=True) * vn
-            y = y - proj_val
+            y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -796,7 +813,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         if mla_enabled:
-            self.attn = MultiHeadLatentAttention(dim, num_heads, mla_d_c, rope_base, qk_gain_init, rope_dims=rope_dims)
+            self.attn = MultiHeadLatentAttention(dim, num_heads, num_kv_heads, mla_d_c, rope_base, qk_gain_init, rope_dims=rope_dims)
         else:
             self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)

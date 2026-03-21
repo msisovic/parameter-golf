@@ -71,9 +71,23 @@ Replace separate K/V projections with shared low-rank latent:
 - Peak memory: 23621 MiB
 - **Result: 0.027 worse than baseline. d_c=64 too aggressive, plus 15% slower = ~1000 fewer steps.**
 
+### Exp 3: Materialized MLA d_c=128 (W_k = W_down @ W_up_k in forward)
+- Status: DONE
+- Params: 25,388,121 (saved 1,441,792 vs baseline — 50% KV compression)
+- Steps: 7253 (vs 7299 baseline), step_avg: 165.45ms (**same speed as baseline!**)
+- val_bpb trajectory: 1.3430 (1k) → 1.2773 (2k) → 1.2186 (5k) → 1.1940 (6k) → 1.1625 (7k) → 1.1562 (7.3k)
+- final_int6_roundtrip val_bpb: 1.1613
+- **final_int6_sliding_window val_bpb: 1.1379** (stride=64)
+- Artifact size: 16.68MB (zstd) — still over 16MB limit
+- Peak memory: 20679 MiB
+- **Result: 0.013 worse than baseline. Speed identical. Quality gap is purely from rank-128 KV constraint.**
+- The materialized approach (computing W_down @ W_up_k inline) eliminates the speed overhead entirely.
+  This is the right MLA implementation strategy for wallclock-limited settings.
+
 ## Key Findings So Far
-1. MLA adds ~7-15% step time overhead from the extra down+up projection matmuls
-2. d_c=64 compresses KV too aggressively, hurting quality
-3. d_c=128 is modest savings (~720K) but still slower
-4. The competition is BOTH param-limited (16MB artifact) AND wallclock-limited (10min)
-5. Baseline with zlib is over 16MB limit (16.99MB), but fits with zstd (15.6MB per PR #315)
+1. Naive MLA (sequential matmuls) adds ~7-15% step time overhead — kills wallclock-limited runs
+2. **Materialized MLA (W_k = W_down @ W_up_k computed inline) has ZERO speed overhead** — this is the way
+3. d_c=64 compresses KV too aggressively, hurting quality
+4. d_c=128 loses ~0.013 val_bpb from rank constraint, saves 1.4M params / ~50% KV compression
+5. The competition is BOTH param-limited (16MB artifact) AND wallclock-limited (10min)
+6. Baseline with zstd fits at ~15.6MB, MLA d_c=128 at 16.68MB — need higher d_c or other approach
