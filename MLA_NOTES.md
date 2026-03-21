@@ -114,9 +114,32 @@ Replace separate K/V projections with shared low-rank latent:
    - Baseline 11L GQA: ~15.6MB
 7. 12-layer MLA overtakes baseline mid-training (step 5k) but loses advantage due to fewer total steps
 
-## Conclusion
-MLA is not beneficial for this competition format:
+## Next Experiment: MLA with 8 KV heads (up from 4)
+
+MLA makes increasing KV heads cheap. Per-layer KV param comparison:
+- GQA 4 KV heads: 2 × 512×256 = 262,144
+- GQA 8 KV heads: 2 × 512×512 = 524,288 (doubles!)
+- MLA d_c=128, 8 KV heads: 512×128 + 128×512 + 128×512 = 196,608
+
+So MLA with 8 KV heads uses **fewer params than GQA with 4 KV heads**, while doubling
+KV expressiveness (less KV sharing → more specialized keys/values per query head group).
+This is the natural way to reinvest MLA's param savings: more KV heads, not more layers.
+
+### Exp 6 plan: 12L MLA d_c=128, 8 KV heads (up from 4)
+- Expected params: ~27.6M + 11×(128×256 + 128×256) = ~27.6M + 720K ≈ 28.3M
+  Wait — going from 4→8 KV heads with MLA increases w_up_k and w_up_v from (128,256)→(128,512),
+  so delta per layer = 2 × 128 × 256 = 65,536. Over 12 layers = 786,432 extra params.
+  But we also removed c_k/c_v savings... let me recalculate vs GQA 4KV baseline:
+  - GQA 4KV: c_k(512×256) + c_v(512×256) = 262,144/layer
+  - MLA 8KV: w_down(512×128) + w_up_k(128×512) + w_up_v(128×512) = 196,608/layer
+  - Still saves 65,536/layer vs GQA 4KV — while having 2× the KV heads!
+- Hypothesis: more KV heads improves quality enough to overcome the rank-128 constraint
+- Risk: artifact size — more params in w_up tensors means bigger artifact
+
+## Conclusion (so far)
+MLA is not beneficial in its current configurations:
 - Wallclock-limited: materialized MLA solves this (zero overhead), but extra layer costs ~10% steps
 - Param-limited (16MB artifact): 11L MLA fits but quality gap too large; 12L MLA busts limit
 - Quality: low-rank KV constraint hurts val_bpb by ~0.011-0.013
-- Net effect: no configuration found that beats baseline on all three constraints simultaneously
+- Net effect: no configuration found yet that beats baseline on all three constraints
+- **Next bet: use MLA's cheap KV heads to improve quality without adding net params**
