@@ -1,7 +1,8 @@
 """
-train_gpt_submit.py — Depth-recurrent architecture: 1 entry block + 1 recurrent block + 1 exit block.
-Random-depth training with curriculum, extra iterations at eval for test-time compute.
-Int8 quantization for POC. Keeps: partial RoPE, ln_scale, resid_mix, EMA, late QAT, Muon,
+train_gpt_submit.py — Depth-recurrent architecture: 2 entry blocks + 1 recurrent block + 1 exit block.
+Geiping-style input injection (concat+project) at each recurrent iteration.
+Truncated backprop through last k iterations. Poisson depth sampling.
+Int8 quantization for POC. Keeps: partial RoPE, EMA, late QAT, Muon,
 sliding window eval, relu² MLP, QK RMSNorm, logit softcap, SmearGate, BigramHash.
 """
 
@@ -108,7 +109,6 @@ class Hyperparameters:
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
-    ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -304,7 +304,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear",
+        "q_gain,skip_weight,skip_weights,smear",
     ).split(",")
     if pattern
 )
@@ -682,26 +682,16 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         rope_dims: int = 0,
-        layer_idx: int = 0,
-        ln_scale: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        s = self.ln_scale_factor
-        attn_out = self.attn(self.attn_norm(x) * s)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.attn_norm(x))
+        x = x + self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -721,7 +711,8 @@ class GPT(nn.Module):
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         rope_dims: int = 0,
-        ln_scale: bool = False,
+        mean_depth: int = 6,
+        truncated_backprop_k: int = 8,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -729,21 +720,26 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.mean_depth = mean_depth
+        self.truncated_backprop_k = truncated_backprop_k
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
 
-        # Depth-recurrent: 2 entry blocks (representation lifting) + 1 recurrent block (iterative refinement)
-        def _make_block(layer_idx: int) -> Block:
+        # Depth-recurrent: 2 entry blocks + 1 recurrent block + 1 exit block
+        def _make_block() -> Block:
             return Block(
                 model_dim, num_heads, num_kv_heads, mlp_mult,
                 rope_base, qk_gain_init, rope_dims=rope_dims,
-                layer_idx=layer_idx, ln_scale=ln_scale,
             )
 
-        self.entry_block_0 = _make_block(layer_idx=0)
-        self.entry_block_1 = _make_block(layer_idx=1)
-        self.recurrent_block = _make_block(layer_idx=2)
+        self.entry_block_0 = _make_block()
+        self.entry_block_1 = _make_block()
+        self.recurrent_block = _make_block()
+        self.exit_block = _make_block()
+
+        # Input injection adapter: concat(s, e) → h  (Geiping et al. 2025)
+        self.inject_adapter = CastedLinear(2 * model_dim, model_dim, bias=False)
 
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -758,8 +754,8 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        # Effective depth = entry + mean_recurrent + exit
-        effective_num_layers = 3 + 4  # 3 unique + ~4 mean recurrent depth
+        # Effective depth accounts for mean recurrent depth
+        effective_num_layers = 2 + self.mean_depth + 1  # entry + recurrent + exit
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -783,21 +779,36 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
+    def _run_recurrence(self, x: Tensor, e: Tensor) -> Tensor:
+        """Run recurrent block with input injection and truncated backprop."""
+        k = self.truncated_backprop_k
+        n = self.n_recurrent_iters
+        for i in range(n):
+            # Truncated backprop: detach before the last k iterations
+            if i == n - k and n > k:
+                x = x.detach()
+            # Input injection: concat state with entry encoding, project down
+            x = self.inject_adapter(torch.cat([x, e], dim=-1))
+            x = self.recurrent_block(x)
+        return x
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
-        x0 = x
 
         # Entry blocks (representation lifting)
-        x = self.entry_block_0(x, x0)
-        x = self.entry_block_1(x, x0)
+        x = self.entry_block_0(x)
+        x = self.entry_block_1(x)
+        e = x  # save entry encoding for input injection
 
-        # Recurrent block × N (loss only at final iteration)
-        for _ in range(self.n_recurrent_iters):
-            x = self.recurrent_block(x, x0)
+        # Recurrent block × N with input injection (loss only at final iteration)
+        x = self._run_recurrence(x, e)
+
+        # Exit block (decode from latent space)
+        x = self.exit_block(x)
 
         return self._compute_loss(x, target_ids.reshape(-1))
 
@@ -808,12 +819,13 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
-        x0 = x
 
-        x = self.entry_block_0(x, x0)
-        x = self.entry_block_1(x, x0)
-        for _ in range(self.n_recurrent_iters):
-            x = self.recurrent_block(x, x0)
+        x = self.entry_block_0(x)
+        x = self.entry_block_1(x)
+        e = x
+
+        x = self._run_recurrence(x, e)
+        x = self.exit_block(x)
 
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1027,7 +1039,7 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         rope_dims=args.rope_dims,
-        ln_scale=args.ln_scale,
+        mean_depth=args.recurrent_mean_depth,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1036,11 +1048,13 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split: gather params from the 3 named blocks
+    # Optimizer split: gather params from all blocks + inject adapter
     all_block_params = []
-    for block_name in ("entry_block_0", "entry_block_1", "recurrent_block"):
+    for block_name in ("entry_block_0", "entry_block_1", "recurrent_block", "exit_block"):
         block = getattr(base_model, block_name)
         all_block_params.extend([(f"{block_name}.{n}", p) for n, p in block.named_parameters()])
+    # Input injection adapter is a matrix param
+    all_block_params.append(("inject_adapter.weight", base_model.inject_adapter.weight))
 
     matrix_params = [
         p
@@ -1375,7 +1389,7 @@ def main() -> None:
             tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
             logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
             bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-            rope_dims=args.rope_dims, ln_scale=args.ln_scale,
+            rope_dims=args.rope_dims, mean_depth=args.recurrent_mean_depth,
         ).to(device).bfloat16()
         for mod in m.modules():
             if isinstance(mod, CastedLinear):

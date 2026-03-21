@@ -130,7 +130,7 @@ Peak memory: 55888 MiB (vs 26300 MiB in Run 1 — deep steps use more memory).
 3. **Option C as middle ground** — simple to implement, mild regularization
 4. **Option D if we need adaptive halting** — most complex, best for variable-difficulty inputs
 
-## Run 4: Final-only loss, 2 entry blocks, no exit block (next)
+## Run 4: Final-only loss, 2 entry blocks, no exit block (FAILED — diverged)
 
 **Architecture change:** 2 entry blocks + 1 recurrent block (no exit block). Same 3 blocks = same 12.1M params.
 - Entry blocks specialize on representation lifting
@@ -138,7 +138,26 @@ Peak memory: 55888 MiB (vs 26300 MiB in Run 1 — deep steps use more memory).
 - Loss only at final iteration (Option A from literature)
 - Poisson(mean=6) depth sampling
 
-**Hypothesis:** Combining the Poisson depth benefit from Run 2 with the cleaner 2-entry architecture should match or beat Run 2, while the 2 entry blocks help convergence speed.
+**Result: Training diverged.** Without exit block, the recurrent block must produce decodable representations at every depth — conflicting objectives at different depths.
+
+**Root cause:** No exit block means the recurrent representation space is constrained to be "LM-head-ready" at every iteration. Combined with varied Poisson depths, different training steps want representations optimized for different depths, destabilizing training. This is the "School B" problem (LoopFormer-style) without LoopFormer's compensating tricks (adaLN conditioning, consistency loss).
+
+## Run 5: Geiping-inspired — input injection, exit block, truncated backprop (next)
+
+**Architecture change:** 2 entry blocks + 1 recurrent block + 1 exit block (4 blocks total).
+- **Input injection (Geiping et al. 2025):** At every recurrent iteration, concat entry encoding `e` with recurrent state `s`, project `R^{2d} → R^d` via learned adapter. Anchors recurrence to input, prevents drift.
+- **Exit block:** Decouples latent refinement space from decodable space. Recurrent block operates freely; exit block translates to LM-head-compatible representation.
+- **Truncated backprop:** Only backprop through last k=8 recurrent iterations. Saves memory AND regularizes (prevents iteration-specific behavior).
+- **Removed baseline artifacts:** attn_scale, mlp_scale, resid_mix, ln_scale_factor — these were designed for non-recurrent baselines with unique layers. In weight-shared recurrence they're either constant multipliers or redundant with input injection.
+- **Fixed effective depth in init:** Output projections now scaled by `1/√(2*(2+mean_depth+1))` instead of hardcoded 7.
+- Poisson(mean=6) depth sampling, final-only loss.
+
+**Hypothesis:** Input injection (the critical missing piece from Runs 1-4) will anchor the recurrence and prevent drift, while the exit block allows the recurrent block to refine freely in latent space. This is "School A" (Geiping-style): proven at 3.5B scale.
+
+**Key papers informing this run:**
+- Geiping et al. 2025 ("Scaling up Test-Time Compute with Latent Reasoning", arXiv 2502.05171): 2 prelude + 4×r recurrent + 2 coda, concat+project input injection, truncated backprop k=8, sandwich RMSNorm, random s₀ init
+- LoopFormer (ICLR 2026, arXiv 2602.11451): No exit block but uses adaLN + stop-gradient consistency loss to compensate
+- Universal Transformer (ICLR 2019): Additive input injection + timestep encoding, simpler but unscaled
 
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
