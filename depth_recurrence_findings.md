@@ -297,6 +297,40 @@ Stopped at step 2896 (wallclock cap). EMA applied.
 - Reduce recurrent cost: either fewer iterations (mean=4?) or single recurrent block with wider MLP
 - The training curve suggests this architecture would be very strong with more steps — need to find the right param/compute tradeoff
 
+## Run 7b: Compilation fix + mean_depth=5 (2026-03-22)
+
+**Changes from Run 7:**
+- **Fixed compilation:** Pre-compile ALL depths from min to max (2-24) instead of only up to 2×mean. Eliminated lazy recompilation during training that caused step_avg to spike from 305ms → 1228ms in Run 7.
+- **Mean depth 5** (down from 6): 2 recurrent blocks × 5 iterations = 10 recurrent passes (vs 12 in Run 7).
+
+**Training:** 4085 steps, 1200s wallclock, ~294ms/step avg. 27.2M params (dim=640). Log-normal Poisson(mean=5, σ=0.5).
+
+**Training trajectory:**
+| Step | Val BPB | Step Avg |
+|------|---------|----------|
+| 1000 | 1.3516  | 297ms    |
+| 2000 | 1.2749  | 296ms    |
+| 3000 | 1.2181  | 295ms    |
+| 4000 | 1.1709  | 294ms    |
+| 4085 | 1.1689  | 294ms    |
+
+Stopped at step 4085 (wallclock cap). Late QAT enabled at step 3788. EMA applied.
+
+**Final eval (int8+zlib):**
+- Standard eval: **1.1719 BPB** (depth 5)
+- Sliding window (stride 64): **1.1481 BPB** (depth 5)
+- Submission size: **21.1MB** (int8+zlib — OVER budget, needs int6 + zstd)
+- Peak memory: 70,951 MiB
+
+**Comparison:**
+| Run | Steps | Step Avg | Sliding BPB | Standard BPB | Size |
+|-----|-------|----------|-------------|--------------|------|
+| 7b  | 4085  | 294ms    | **1.1481**  | 1.1719       | 21.1MB |
+| 7   | 2896  | 414ms    | 1.1647      | 1.1888       | 18.6MB |
+| 5   | 7239  | 165ms    | 1.2004      | 1.2247       | 9.9MB  |
+
+**Conclusion:** Compilation fix gave 1189 extra steps (+41%) and 0.017 BPB improvement. Step avg rock-solid at 294ms with zero recompilation spikes. Loss still dropping at cutoff (1.2181 → 1.1689 in last 1000 steps). Architecture clearly benefits from more steps — primary bottleneck is now model size (needs int6/int5 to fit 16MB) and step speed (294ms leaves room for ~4K steps).
+
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
 - **1.1248 BPB** (target to beat)

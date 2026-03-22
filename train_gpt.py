@@ -105,9 +105,9 @@ class Hyperparameters:
     # Depth recurrence (log-normal Poisson sampling, Geiping et al. 2025)
     recurrent_min_depth = int(os.environ.get("RECURRENT_MIN_DEPTH", 2))
     recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 24))
-    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 6))
+    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 5))
     recurrent_depth_sigma = float(os.environ.get("RECURRENT_DEPTH_SIGMA", 0.5))
-    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 6))
+    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 5))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
@@ -1187,12 +1187,10 @@ def main() -> None:
     # Pre-compile the most common Poisson depths; rare deep ones compile lazily.
     torch._dynamo.config.cache_size_limit = max(32, args.recurrent_max_depth - args.recurrent_min_depth + 4)
 
-    # Pre-compile depths covering ~95% of Poisson mass + a few deep ones
-    common_depths = list(range(args.recurrent_min_depth, min(args.recurrent_mean_depth * 2, args.recurrent_max_depth) + 1))
-    # Add a couple of deep depths so those compile too
-    for d in [args.recurrent_max_depth, args.eval_recurrent_depth]:
-        if d not in common_depths and d <= args.recurrent_max_depth:
-            common_depths.append(d)
+    # Pre-compile ALL depths from min to max to avoid lazy recompilation during training
+    common_depths = list(range(args.recurrent_min_depth, args.recurrent_max_depth + 1))
+    if args.eval_recurrent_depth not in common_depths:
+        common_depths.append(args.eval_recurrent_depth)
     common_depths = sorted(set(common_depths))
     warmup_steps_needed = max(args.warmup_steps, len(common_depths))
     if warmup_steps_needed > 0:
