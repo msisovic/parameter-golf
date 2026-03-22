@@ -362,6 +362,52 @@ Stopped at step 4085 (wallclock cap). Late QAT enabled at step 3788. EMA applied
 
 **TODO:** Add XSA (cross-sequence attention) to exit blocks — zero extra params, proven ~0.01 BPB gain in SOTA entries. Simple implementation: subtract self-value projection after attention output.
 
+## Run 9: dim=768 + XSA on exit + mean_depth=5 (2026-03-22)
+
+**Changes from Run 8:**
+- **dim=768** (up from 640), 12 heads, 6 KV heads, head_dim=64
+- **XSA** enabled on exit blocks (subtract self-value projection, zero extra params)
+- **Mean depth 5** (back from 4)
+- **zstd** compression (was zlib — zstandard package was missing before)
+- **max_depth=16** (down from 24 to avoid OOM at dim=768)
+- **warmdown_iters=1500, muon_warmup=700** (schedule from Run 8)
+
+**Training:** 3171 steps, 1200s wallclock, ~379ms/step avg. 38.9M params (dim=768).
+
+**Training trajectory:**
+| Step | Val BPB | Step Avg |
+|------|---------|----------|
+| 1000 | 1.3372  | 381ms    |
+| 2000 | 1.2532  | 380ms    |
+| 3000 | 1.1740  | 379ms    |
+| 3171 | 1.1655  | 379ms    |
+
+Late QAT at step 3017. EMA applied.
+
+**Final eval (int6+zstd):**
+- Standard eval: **1.2028 BPB** (depth 5)
+- Sliding window (stride 64): **1.1801 BPB** (depth 5)
+- Submission size: **20.8MB** (OVER 16MB budget)
+- Peak memory: 53,731 MiB
+
+**Key findings:**
+1. **Pre-quant 1.1655 BPB in only 3171 steps** — dim=768 learns significantly faster per step than dim=640 (1.2532 vs 1.2749 at step 2000). Confirms width > depth for BPB.
+2. **Int6 penalty: 0.037 BPB** (1.1655 → 1.2028 standard, 1.1801 sliding). QAT only ran 154 steps. Baseline gets 0.007 BPB penalty with similar QAT duration but 7K total steps — the issue is model maturity, not QAT duration alone.
+3. **20.8MB** — 39M params doesn't fit in 16MB even at int6+zstd. Need ~27M params or less.
+4. **XSA impact unclear** — can't isolate since dim also changed. Would need controlled experiment.
+
+**Comparison across all runs (per-step learning rate at step 2000):**
+| Run | Dim | Val BPB @2000 |
+|-----|-----|---------------|
+| 9   | 768 | **1.2532**    |
+| 7b  | 640 | 1.2749        |
+| 8   | 640 | 1.2946        |
+
+**The fundamental tradeoff:**
+- dim=768: learns fast but too many params to store (20.8MB) and too slow (379ms/step, only 3171 steps)
+- dim=640: fits at int8 (18.6MB) but not int6 (16.6MB zlib). Gets 4085 steps but int6 penalty is large.
+- Need a dim between 640-768, OR fix int6 penalty, OR use int8 on recurrent + int6 on entry/exit (original plan)
+
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
 - **1.1248 BPB** (target to beat)
