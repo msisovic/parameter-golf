@@ -331,6 +331,37 @@ Stopped at step 4085 (wallclock cap). Late QAT enabled at step 3788. EMA applied
 
 **Conclusion:** Compilation fix gave 1189 extra steps (+41%) and 0.017 BPB improvement. Step avg rock-solid at 294ms with zero recompilation spikes. Loss still dropping at cutoff (1.2181 → 1.1689 in last 1000 steps). Architecture clearly benefits from more steps — primary bottleneck is now model size (needs int6/int5 to fit 16MB) and step speed (294ms leaves room for ~4K steps).
 
+## Run 8: Int6 everywhere + mean_depth=4 (2026-03-22)
+
+**Changes from Run 7b:**
+- **Int6 quantization** for all block weights (entry, recurrent, exit, inject_adapter). Embeddings stay int8.
+- **Mean depth 4** (down from 5): 2 recurrent blocks × 4 iterations = 8 recurrent passes.
+- **Adjusted schedule:** warmdown_iters=1500 (from 3000), muon_momentum_warmup=700 (from 1500) — proportional to fewer expected steps.
+
+**Training:** 4497 steps, 1200s wallclock, ~267ms/step avg. 27.2M params.
+
+**Training trajectory:**
+| Step | Val BPB | Step Avg |
+|------|---------|----------|
+| 1000 | 1.3641  | 268ms    |
+| 2000 | 1.2946  | 268ms    |
+| 3000 | 1.2731  | 267ms    |
+| 4000 | 1.2097  | 267ms    |
+| 4497 | 1.1783  | 267ms    |
+
+**Final eval (int6+zlib):**
+- Standard eval: **1.2150 BPB** (depth 4)
+- Sliding window (stride 64): **1.1914 BPB** (depth 4)
+- Submission size: **16.6MB** (int6+zlib — still over! zstd would be ~14MB)
+
+**Conclusion: REGRESSION.** 1.1914 vs Run 7b's 1.1481. Two problems:
+1. **Int6 quantization noise:** ~0.04 BPB degradation from int6 vs int8 (comparing standard eval: 1.2150 vs 1.1719 in Run 7b). The QAT STE simulates int6 during training, but late_qat only kicked in at step 4343 — very late, only 154 steps of QAT-aware training before cutoff. The model barely adapted to quantization noise.
+2. **Mean=4 too shallow:** Per-step learning was worse than mean=5 (1.2731 vs 1.2181 at step 3000), and the extra steps didn't compensate.
+
+**Key finding:** Late QAT threshold timing is critical. At step 4343/4497, the model got only 154 steps of int6-aware training. Need to enable QAT earlier or use a higher threshold.
+
+**TODO:** Add XSA (cross-sequence attention) to exit blocks — zero extra params, proven ~0.01 BPB gain in SOTA entries. Simple implementation: subtract self-value projection after attention output.
+
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
 - **1.1248 BPB** (target to beat)

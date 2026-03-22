@@ -60,7 +60,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 9000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1500))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -94,7 +94,7 @@ class Hyperparameters:
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 700))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -105,9 +105,9 @@ class Hyperparameters:
     # Depth recurrence (log-normal Poisson sampling, Geiping et al. 2025)
     recurrent_min_depth = int(os.environ.get("RECURRENT_MIN_DEPTH", 2))
     recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 24))
-    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 5))
+    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 4))
     recurrent_depth_sigma = float(os.environ.get("RECURRENT_DEPTH_SIGMA", 0.5))
-    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 5))
+    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 4))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
@@ -429,6 +429,80 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         if isinstance(orig_dtype, str):
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
+    return out
+
+
+# -----------------------------
+# INT6 MIXED QUANTIZATION (int6 for entry/exit, int8 for recurrent)
+# -----------------------------
+
+def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    """Quantize to int6 range [-32, 31] with per-row scaling."""
+    t32 = t.float()
+    if t32.ndim == 2:
+        row_max = t32.abs().amax(dim=1)
+        scale = (row_max / 31.0).clamp_min(1.0 / 31.0).to(torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -32, 31).to(torch.int8)
+        return q, scale
+    amax = t32.abs().max().item()
+    scale = torch.tensor(amax / 31.0 if amax > 0 else 1.0, dtype=torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float()), -32, 31).to(torch.int8)
+    return q, scale
+
+
+def mixed_quantize_int6_int8(state_dict: dict[str, Tensor], int6_prefixes: tuple[str, ...]):
+    """Mixed quantization: int6 for params matching int6_prefixes, int8 for rest."""
+    result: dict[str, Tensor] = {}
+    meta: dict[str, object] = {}
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu().contiguous()
+        if not t.is_floating_point() or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+                result[name] = t.float()
+            elif t.is_floating_point():
+                result[name] = t.to(torch.float16)
+            else:
+                result[name] = t
+            meta[name] = "passthrough"
+            continue
+        if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+            result[name] = t.float()
+            meta[name] = "passthrough"
+            continue
+        use_int6 = any(name.startswith(prefix) for prefix in int6_prefixes)
+        if use_int6:
+            q, s = quantize_int6_per_row(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int6"}
+        else:
+            q, s = quantize_float_tensor(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int8"}
+    return result, meta
+
+
+def dequantize_mixed_int6_int8(result: dict[str, Tensor], meta: dict[str, object],
+                               template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Dequantize mixed int6/int8 state dict."""
+    out: dict[str, Tensor] = {}
+    for name, orig in template_sd.items():
+        info = meta.get(name)
+        if info is None:
+            continue
+        orig_dtype = orig.dtype
+        if info == "passthrough":
+            t = result[name]
+            if t.dtype == torch.float16 and orig_dtype in (torch.float32, torch.bfloat16):
+                t = t.to(orig_dtype)
+            out[name] = t
+            continue
+        q, s = result[name + ".q"], result[name + ".scale"]
+        if s.ndim > 0:
+            out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
+        else:
+            out[name] = (q.float() * float(s.item())).to(orig_dtype)
     return out
 
 
@@ -1388,32 +1462,32 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
 
-    # Int8 quantization for POC (recurrent block is only 1 set of weights, small enough)
+    # Mixed int6 quantization: int6 for all block weights, int8 for embeddings
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    quant_obj, quant_stats = quantize_state_dict_int8(sd_cpu)
+    int6_prefixes = ("entry_blocks.", "recurrent_blocks.", "exit_blocks.", "inject_adapter.")
+    quant_result, quant_meta = mixed_quantize_int6_int8(sd_cpu, int6_prefixes)
     quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
+    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw) if _COMPRESSOR == "zstd" else zlib.compress(quant_raw, 9)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int8+{_COMPRESSOR}: {quant_file_bytes} bytes")
-        log0(f"Total submission size int8+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
-        log0(f"Int8 quant stats: {quant_stats}")
+        log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
+        log0(f"Total submission size int6+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
 
     # Roundtrip: decompress + dequantize into fresh model + eval
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(
         io.BytesIO(zstandard.ZstdDecompressor().decompress(quant_blob_disk) if _COMPRESSOR == "zstd" else zlib.decompress(quant_blob_disk)),
         map_location="cpu",
     )
-    deq_state = dequantize_state_dict_int8(quant_state)
+    deq_state = dequantize_mixed_int6_int8(quant_state["w"], quant_state["m"], sd_cpu)
 
     def _build_eval_model():
         m = GPT(
@@ -1473,7 +1547,7 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"depth:{args.eval_recurrent_depth} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
 
@@ -1491,11 +1565,11 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_int8_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
             f"stride:{args.eval_stride} depth:{args.eval_recurrent_depth} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
         )
-        log0(f"final_int8_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
