@@ -233,6 +233,39 @@ Peak memory: 55888 MiB (vs 26300 MiB in Run 1 — deep steps use more memory).
 
 For our competition (BPB metric), the value of depth recurrence is **parameter efficiency** (same quality, fewer unique params), NOT unbounded test-time compute scaling.
 
+## Run 7: Multi-block recurrence — 2 entry + 2 recurrent (group) + 2 exit (next)
+
+**Motivation:** Runs 1-6 showed depth recurrence gives parameter efficiency but was capped at ~5MB of 16MB budget. Chinchilla analysis shows we're massively overtrained (450 tokens/param vs optimal 20). More unique params = better use of training compute. Current SOTA uses 11 unique layers.
+
+**Architecture:**
+- 2 entry blocks (4x MLP) + 2 recurrent blocks as group (3x MLP, iterated ×N) + 2 exit blocks (4x MLP)
+- dim=640, 10 heads, 5 KV heads throughout (same dim everywhere, no projection between blocks)
+- Log-normal Poisson(mean=16, σ=0.5) depth sampling
+- Effective depth at mean: 2 + 32 + 2 = 36 layers. Much deeper than 11-layer SOTA.
+- ~27M unique params (6 unique blocks) → fits in 16MB at int8+zstd
+- Eval at mean depth (16) instead of max
+
+**Hyperparams aligned with SOTA baseline:**
+- EMA(0.997), no SWA, late QAT(threshold=0.1)
+- Partial RoPE(16 dims), Muon WD=0.04, Adam WD=0.04
+- matrix_lr=0.025, scalar_lr=0.025, tied_embed_lr=0.035
+- Muon momentum 0.99 (warmup from 0.92 over 1500 steps)
+- Warmdown 3000 iters, max wallclock 1200s
+- BigramHash(2048), eval stride=64
+
+**Key design decisions:**
+- 2 recurrent blocks as a group (not 1): a single attention+MLP pass isn't a rich enough "loop body". Two gives the unit a proper mini-network per iteration (attend→transform→attend→transform).
+- 4x MLP on entry/exit: these run once, so more capacity is cheap. Extra dense capacity for feature extraction and decoding.
+- 3x MLP on recurrent: keeps iteration cost manageable since it's multiplied by depth.
+- Input injection happens once per group iteration (before both blocks).
+
+**Hypothesis:** Using the full 16MB param budget with recurrence for parameter efficiency will close the gap to SOTA. The recurrent group of 2 blocks should produce more meaningful iterative refinement than a single block (which converged to near-identity in Run 5).
+
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
 - **1.1248 BPB** (target to beat)
+
+## Reference: Current SOTA (not yet accepted)
+- 1.1221 BPB: 11L + EMA + 20-epoch TTT
+- 1.1233 BPB: 11L + EMA + XSA4 + GPTQ-lite + Late QAT (no TTT)
+- 1.1250 BPB: 11L + Partial RoPE + LN Scale + Late QAT + XSA + EMA + FA3

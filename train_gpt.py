@@ -1,8 +1,9 @@
 """
-train_gpt_submit.py — Depth-recurrent architecture: 1 entry block + 1 recurrent block + 1 exit block.
-Geiping-style input injection (concat+project) at each recurrent iteration.
-Truncated backprop through last k iterations. Poisson depth sampling.
-Int8 quantization for POC. Keeps: partial RoPE, EMA, late QAT, Muon,
+train_gpt_submit.py — Depth-recurrent architecture: 2 entry + 2 recurrent (group) + 2 exit blocks.
+Entry/exit blocks use 4x MLP, recurrent blocks use 3x MLP (same dim throughout).
+Geiping-style input injection (concat+project) at each recurrent group iteration.
+Truncated backprop through last k iterations. Log-normal Poisson depth sampling.
+Int8 quantization. Keeps: partial RoPE, EMA, late QAT, Muon,
 sliding window eval, relu² MLP, QK RMSNorm, logit softcap, SmearGate, BigramHash.
 """
 
@@ -58,22 +59,27 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    iterations = int(os.environ.get("ITERATIONS", 9000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1200.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 5))
+    model_dim = int(os.environ.get("MODEL_DIM", 640))
+    num_heads = int(os.environ.get("NUM_HEADS", 10))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    entry_mlp_mult = float(os.environ.get("ENTRY_MLP_MULT", 4.0))
+    exit_mlp_mult = float(os.environ.get("EXIT_MLP_MULT", 4.0))
+    num_entry_blocks = int(os.environ.get("NUM_ENTRY_BLOCKS", 2))
+    num_exit_blocks = int(os.environ.get("NUM_EXIT_BLOCKS", 2))
+    num_recurrent_blocks = int(os.environ.get("NUM_RECURRENT_BLOCKS", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -81,14 +87,14 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -101,17 +107,17 @@ class Hyperparameters:
     recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 48))
     recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 16))
     recurrent_depth_sigma = float(os.environ.get("RECURRENT_DEPTH_SIGMA", 0.5))
-    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 32))
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 16))
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
-    muon_wd = float(os.environ.get("MUON_WD", 0.02))
-    adam_wd = float(os.environ.get("ADAM_WD", 0.01))
+    muon_wd = float(os.environ.get("MUON_WD", 0.04))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
-    rope_dims = int(os.environ.get("ROPE_DIMS", 0))
-    late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+    late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
 # -----------------------------
@@ -712,8 +718,13 @@ class GPT(nn.Module):
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         rope_dims: int = 0,
-        mean_depth: int = 6,
+        mean_depth: int = 16,
         truncated_backprop_k: int = 8,
+        num_entry_blocks: int = 2,
+        num_exit_blocks: int = 2,
+        num_recurrent_blocks: int = 2,
+        entry_mlp_mult: float = 4.0,
+        exit_mlp_mult: float = 4.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -723,20 +734,27 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.mean_depth = mean_depth
         self.truncated_backprop_k = truncated_backprop_k
+        self.num_recurrent_blocks = num_recurrent_blocks
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
 
-        # Depth-recurrent: 1 entry + 1 recurrent + 1 exit (3 blocks, same param budget)
-        def _make_block() -> Block:
-            return Block(
-                model_dim, num_heads, num_kv_heads, mlp_mult,
-                rope_base, qk_gain_init, rope_dims=rope_dims,
-            )
-
-        self.entry_block = _make_block()
-        self.recurrent_block = _make_block()
-        self.exit_block = _make_block()
+        # Depth-recurrent: N_entry entry + N_recurrent recurrent (×iters) + N_exit exit
+        self.entry_blocks = nn.ModuleList([
+            Block(model_dim, num_heads, num_kv_heads, entry_mlp_mult,
+                  rope_base, qk_gain_init, rope_dims=rope_dims)
+            for _ in range(num_entry_blocks)
+        ])
+        self.recurrent_blocks = nn.ModuleList([
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult,
+                  rope_base, qk_gain_init, rope_dims=rope_dims)
+            for _ in range(num_recurrent_blocks)
+        ])
+        self.exit_blocks = nn.ModuleList([
+            Block(model_dim, num_heads, num_kv_heads, exit_mlp_mult,
+                  rope_base, qk_gain_init, rope_dims=rope_dims)
+            for _ in range(num_exit_blocks)
+        ])
 
         # Input injection adapter: concat(s, e) → h  (Geiping et al. 2025)
         self.inject_adapter = CastedLinear(2 * model_dim, model_dim, bias=False)
@@ -754,8 +772,12 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        # Effective depth accounts for mean recurrent depth
-        effective_num_layers = 1 + self.mean_depth + 1  # entry + recurrent + exit
+        # Effective depth: entry + (mean_depth × recurrent_blocks) + exit
+        effective_num_layers = (
+            len(self.entry_blocks)
+            + self.mean_depth * len(self.recurrent_blocks)
+            + len(self.exit_blocks)
+        )
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -780,7 +802,7 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def _run_recurrence(self, x: Tensor, e: Tensor) -> Tensor:
-        """Run recurrent block with input injection and truncated backprop."""
+        """Run recurrent block group with input injection and truncated backprop."""
         k = self.truncated_backprop_k
         n = self.n_recurrent_iters
         for i in range(n):
@@ -789,7 +811,9 @@ class GPT(nn.Module):
                 x = x.detach()
             # Input injection: concat state with entry encoding, project down
             x = self.inject_adapter(torch.cat([x, e], dim=-1))
-            x = self.recurrent_block(x)
+            # Run all recurrent blocks in the group
+            for block in self.recurrent_blocks:
+                x = block(x)
         return x
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -799,15 +823,17 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
 
-        # Entry block (representation lifting)
-        x = self.entry_block(x)
+        # Entry blocks (representation lifting)
+        for block in self.entry_blocks:
+            x = block(x)
         e = x  # save entry encoding for input injection
 
-        # Recurrent block × N with input injection (loss only at final iteration)
+        # Recurrent block group × N with input injection (loss only at final iteration)
         x = self._run_recurrence(x, e)
 
-        # Exit block (decode from latent space)
-        x = self.exit_block(x)
+        # Exit blocks (decode from latent space)
+        for block in self.exit_blocks:
+            x = block(x)
 
         return self._compute_loss(x, target_ids.reshape(-1))
 
@@ -819,11 +845,14 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
 
-        x = self.entry_block(x)
+        for block in self.entry_blocks:
+            x = block(x)
         e = x
 
         x = self._run_recurrence(x, e)
-        x = self.exit_block(x)
+
+        for block in self.exit_blocks:
+            x = block(x)
 
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1038,6 +1067,11 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         rope_dims=args.rope_dims,
         mean_depth=args.recurrent_mean_depth,
+        num_entry_blocks=args.num_entry_blocks,
+        num_exit_blocks=args.num_exit_blocks,
+        num_recurrent_blocks=args.num_recurrent_blocks,
+        entry_mlp_mult=args.entry_mlp_mult,
+        exit_mlp_mult=args.exit_mlp_mult,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1048,9 +1082,10 @@ def main() -> None:
 
     # Optimizer split: gather params from all blocks + inject adapter
     all_block_params = []
-    for block_name in ("entry_block", "recurrent_block", "exit_block"):
-        block = getattr(base_model, block_name)
-        all_block_params.extend([(f"{block_name}.{n}", p) for n, p in block.named_parameters()])
+    for list_name in ("entry_blocks", "recurrent_blocks", "exit_blocks"):
+        block_list = getattr(base_model, list_name)
+        for i, block in enumerate(block_list):
+            all_block_params.extend([(f"{list_name}.{i}.{n}", p) for n, p in block.named_parameters()])
     # Input injection adapter is a matrix param
     all_block_params.append(("inject_adapter.weight", base_model.inject_adapter.weight))
 
@@ -1213,9 +1248,9 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            # Use fixed max depth for mid-training eval (not the random training depth)
+            # Use fixed eval depth for mid-training eval (not the random training depth)
             saved_depth = base_model.n_recurrent_iters
-            base_model.n_recurrent_iters = args.recurrent_max_depth
+            base_model.n_recurrent_iters = args.eval_recurrent_depth
             val_loss, val_bpb = eval_val(
                 args,
                 model,
@@ -1390,6 +1425,9 @@ def main() -> None:
             logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
             bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
             rope_dims=args.rope_dims, mean_depth=args.recurrent_mean_depth,
+            num_entry_blocks=args.num_entry_blocks, num_exit_blocks=args.num_exit_blocks,
+            num_recurrent_blocks=args.num_recurrent_blocks,
+            entry_mlp_mult=args.entry_mlp_mult, exit_mlp_mult=args.exit_mlp_mult,
         ).to(device).bfloat16()
         for mod in m.modules():
             if isinstance(mod, CastedLinear):
