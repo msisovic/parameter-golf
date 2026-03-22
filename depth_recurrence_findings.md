@@ -261,6 +261,42 @@ For our competition (BPB metric), the value of depth recurrence is **parameter e
 
 **Hypothesis:** Using the full 16MB param budget with recurrence for parameter efficiency will close the gap to SOTA. The recurrent group of 2 blocks should produce more meaningful iterative refinement than a single block (which converged to near-identity in Run 5).
 
+## Run 7 Results (2026-03-22)
+
+**Training:** 2896 steps, 1200s wallclock, ~414ms/step avg. 27.2M params (dim=640). Log-normal Poisson(mean=6, σ=0.5). 2 entry (4x MLP) + 2 recurrent (3x MLP, ×N) + 2 exit (4x MLP).
+
+**Training trajectory:**
+| Step | Val BPB | Step Avg |
+|------|---------|----------|
+| 1000 | 1.3094  | 566ms    |
+| 2000 | 1.2377  | 458ms    |
+| 2896 | 1.1804  | 414ms    |
+
+Stopped at step 2896 (wallclock cap). EMA applied.
+
+**Final eval (int8+zlib):**
+- Standard eval: **1.1888 BPB** (depth 6)
+- Sliding window (stride 64): **1.1647 BPB** (depth 6)
+- Submission size: **18.6MB** (OVER 16MB budget — needs int6/int5 quant)
+- Peak memory: 70,956 MiB
+
+**Comparison with previous runs:**
+| Run | Params | Steps | Sliding BPB | Standard BPB |
+|-----|--------|-------|-------------|--------------|
+| 7   | 27.2M  | 2896  | 1.1647      | 1.1888       |
+| 5   | 12.9M  | 7239  | 1.2004      | 1.2247       |
+| 6   | 8.5M   | 4238  | 1.2464      | 1.2719       |
+
+**Conclusion:** Best recurrent result by far — **1.1647 BPB** closes the gap to SOTA (1.1221-1.1428). The multi-block architecture with 27M params works. BUT:
+1. **Over budget:** 18.6MB at int8+zlib. Needs int6 or int5 quantization + zstd to fit in 16MB.
+2. **Too few steps:** Only 2896 steps (vs 7239 in Run 5). Step avg 414ms is 2.5x slower than Run 5's 165ms. The 2-block recurrent group at mean depth 6 = 12 recurrent block passes per step is expensive.
+3. **Loss still dropping fast:** The gap between step 2000 (1.2377) and step 2896 (1.1804) was 0.057 in just 900 steps. More steps would clearly help.
+
+**Next directions:**
+- Int6 quantization (late QAT with int6 STE) to fit under 16MB
+- Reduce recurrent cost: either fewer iterations (mean=4?) or single recurrent block with wider MLP
+- The training curve suggests this architecture would be very strong with more steps — need to find the right param/compute tradeoff
+
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
 - **1.1248 BPB** (target to beat)

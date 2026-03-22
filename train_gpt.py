@@ -104,10 +104,10 @@ class Hyperparameters:
 
     # Depth recurrence (log-normal Poisson sampling, Geiping et al. 2025)
     recurrent_min_depth = int(os.environ.get("RECURRENT_MIN_DEPTH", 2))
-    recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 48))
-    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 16))
+    recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 24))
+    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 6))
     recurrent_depth_sigma = float(os.environ.get("RECURRENT_DEPTH_SIGMA", 0.5))
-    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 16))
+    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 6))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
