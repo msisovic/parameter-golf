@@ -188,6 +188,51 @@ Peak memory: 55888 MiB (vs 26300 MiB in Run 1 — deep steps use more memory).
 
 **Hypothesis:** The model needs to frequently train at high depths (16-32+) to learn that later iterations should produce meaningfully different/better representations. Log-normal Poisson ensures ~50% of training at depth ≥16, unlike plain Poisson(mean=6) where only ~1% was at depth ≥14.
 
+## Run 6 Results (2026-03-22)
+
+**Training:** 4238 steps, 1200s wallclock, ~283ms/step avg. 8.45M params (dim=512). Log-normal Poisson(mean=16, σ=0.5).
+
+**Depth sweep results:**
+| Depth | Run 6 | Run 5 |
+|-------|-------|-------|
+| 4     | 1.3119 | 1.2333 |
+| 8     | 1.2754 | 1.2249 |
+| 12    | 1.2722 | 1.2246 |
+| 16    | 1.2719 | 1.2246 |
+| 24    | 1.2718 | — |
+| 32    | 1.2719 | — |
+
+**Sliding window (depth 32, stride 64): 1.2464 BPB**
+
+**Conclusion: Depth scaling works up to ~mean training depth.** First run where deeper = better: depth 12 beats depth 8 by 0.003, depth 16 beats depth 8 by 0.004. But saturates at depth ~16 (the training mean). Absolute numbers worse than Run 5 due to smaller model (8.45M vs 12.88M) and fewer steps (4238 vs 7239).
+
+**Key observation:** Depth improvement saturates at approximately the mean training depth in every run:
+- Run 5 (mean=6): saturates at depth ~8
+- Run 6 (mean=16): saturates at depth ~16
+- Geiping (mean=32): saturates at depth ~32 for perplexity, improves to 64 only on hard reasoning tasks (GSM8K)
+
+## Literature Survey: Does Depth Extrapolation Beyond Training Mean Actually Work?
+
+### YES — but only on hard tasks with task-specific metrics:
+
+**Geiping et al. 2025 (3.5B):** Train mean=32, eval r=64. GSM8K 38.1% → 47.2% (2x mean). But perplexity saturates at ~mean. Gains only on mathematical reasoning, not HellaSwag or general LM.
+
+**Hyper-SET (ICLR 2026, arXiv 2502.11646):** Train 12 iters, eval 24 (2x). Sudoku accuracy improves. Key enablers: learned adaptive step sizes conditioned on iteration index + energy minimization framework. Iteration-aware conditioning is critical.
+
+**DEQ (NeurIPS 2019):** More solver iterations = closer to fixed point. Extrapolates by construction. But converges to the SAME fixed point — more iterations approach it, don't exceed it.
+
+### NO — degrades beyond training depth:
+
+**LoopFormer (ICLR 2026):** Explicitly only tests M ≤ L. Never claims extrapolation works.
+
+**"Scaling Latent Reasoning via Looped LMs" (2025, arXiv 2510.25741):** Train T=4, eval T=8: MMLU 67.4% → 64.5%. Degrades. Exception: safety alignment improves beyond training depth.
+
+### Key Insight
+
+**Language model perplexity/BPB fundamentally does not benefit from depth beyond ~mean training depth.** Most tokens are "easy" and saturate early in the recurrence. The average (BPB) washes out any gains on hard tokens. Papers that show extrapolation use task-specific accuracy metrics where hard problems dominate (GSM8K, Sudoku).
+
+For our competition (BPB metric), the value of depth recurrence is **parameter efficiency** (same quality, fewer unique params), NOT unbounded test-time compute scaling.
+
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
 - **1.1248 BPB** (target to beat)
