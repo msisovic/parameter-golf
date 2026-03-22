@@ -159,6 +159,35 @@ Peak memory: 55888 MiB (vs 26300 MiB in Run 1 — deep steps use more memory).
 - LoopFormer (ICLR 2026, arXiv 2602.11451): No exit block but uses adaLN + stop-gradient consistency loss to compensate
 - Universal Transformer (ICLR 2019): Additive input injection + timestep encoding, simpler but unscaled
 
+## Run 5 Results (2026-03-22)
+
+**Training:** 7239 steps, 1200s wallclock, ~165ms/step avg. 12.88M params (dim=640). Poisson(mean=6).
+
+**Depth sweep results:**
+| Depth | Run 5 | Run 2 | Run 1 |
+|-------|-------|-------|-------|
+| 4     | 1.2333 | 1.2424 | 1.2317 |
+| 8     | 1.2249 | 1.2196 | 1.2150 |
+| 12    | 1.2246 | 1.2228 | 1.2288 |
+| 16    | 1.2246 | 1.2314 | 1.2546 |
+| 20    | 1.2247 | 1.2437 | 1.2968 |
+
+**Sliding window (depth 20, stride 64): 1.2004 BPB** (best so far, Run 2: 1.2186)
+
+**Conclusion:** Input injection completely solved drift — depth curve is flat (depth 8→20 spread = 0.0003 vs Run 2's 0.024). However, depth does NOT improve performance past ~8. The recurrence converges to a near-fixed-point by depth 8. Every iteration past 8 is approximately identity.
+
+**Root cause:** Poisson(mean=6) puts ~85% of training at depth ≤8. The model never learns to use depth >8 productively because it almost never trains there. Geiping uses log-normal Poisson(mean=32) — fundamentally different depth distribution.
+
+## Run 6: Log-normal Poisson + smaller model for more steps (next)
+
+**Changes from Run 5:**
+- **Log-normal Poisson sampling** (Geiping et al. 2025): `τ ~ N(log(μ) - σ²/2, σ), r ~ Poisson(exp(τ)) + 1` with mean=16, σ=0.5. Heavy tail reaches depth 30-48. Substantial training mass at depth 10-24.
+- **Smaller model** (dim=512, 8 heads, 4 KV heads): ~36% fewer params → faster steps → more training steps in 1200s wallclock. Compensates for higher avg depth costing more per step.
+- Max depth raised to 48, eval depth 32.
+- Depth sweep extended to [4, 8, 12, 16, 24, 32].
+
+**Hypothesis:** The model needs to frequently train at high depths (16-32+) to learn that later iterations should produce meaningfully different/better representations. Log-normal Poisson ensures ~50% of training at depth ≥16, unlike plain Poisson(mean=6) where only ~1% was at depth ≥14.
+
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
 - **1.1248 BPB** (target to beat)

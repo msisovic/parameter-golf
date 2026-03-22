@@ -70,9 +70,9 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 5))
-    model_dim = int(os.environ.get("MODEL_DIM", 640))
-    num_heads = int(os.environ.get("NUM_HEADS", 10))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -96,11 +96,12 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
 
-    # Depth recurrence (Poisson sampling: mean=recurrent_mean_depth, clipped to [min, max])
+    # Depth recurrence (log-normal Poisson sampling, Geiping et al. 2025)
     recurrent_min_depth = int(os.environ.get("RECURRENT_MIN_DEPTH", 2))
-    recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 24))
-    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 6))
-    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 20))
+    recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 48))
+    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 16))
+    recurrent_depth_sigma = float(os.environ.get("RECURRENT_DEPTH_SIGMA", 0.5))
+    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 32))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
     muon_wd = float(os.environ.get("MUON_WD", 0.02))
@@ -1107,7 +1108,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"recurrence: min_depth={args.recurrent_min_depth} max_depth={args.recurrent_max_depth} mean_depth={args.recurrent_mean_depth} eval_depth={args.eval_recurrent_depth} sampling=poisson")
+    log0(f"recurrence: min_depth={args.recurrent_min_depth} max_depth={args.recurrent_max_depth} mean_depth={args.recurrent_mean_depth} sigma={args.recurrent_depth_sigma} eval_depth={args.eval_recurrent_depth} sampling=lognormal_poisson")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1250,9 +1251,11 @@ def main() -> None:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
 
-        # Poisson depth sampling: heavy tail lets model occasionally see deep iterations
-        # Mean ~recurrent_mean_depth, clipped to [recurrent_min_depth, recurrent_max_depth]
-        n_iters = min(max(np.random.poisson(args.recurrent_mean_depth), args.recurrent_min_depth), args.recurrent_max_depth)
+        # Log-normal Poisson depth sampling (Geiping et al. 2025): heavy-tailed, frequently trains deep
+        # tau ~ N(log(mean) - sigma^2/2, sigma), r ~ Poisson(exp(tau)) + 1
+        _sigma = args.recurrent_depth_sigma
+        _tau = np.random.normal(np.log(args.recurrent_mean_depth) - 0.5 * _sigma**2, _sigma)
+        n_iters = min(max(np.random.poisson(np.exp(_tau)) + 1, args.recurrent_min_depth), args.recurrent_max_depth)
         base_model.n_recurrent_iters = n_iters
 
         zero_grad_all()
@@ -1400,7 +1403,7 @@ def main() -> None:
     # Multi-depth eval: verify performance scales with recurrence depth (dev only)
     depth_sweep = bool(int(os.environ.get("DEPTH_SWEEP", "0")))
     if depth_sweep:
-        eval_depths = sorted(set([4, 8, 12, 16, 20, args.eval_recurrent_depth]))
+        eval_depths = sorted(set([4, 8, 12, 16, 24, 32, args.eval_recurrent_depth]))
         # Bump cache limit to accommodate all eval depths on top of training depths
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, len(eval_depths) + 10)
         compiled_eval = torch.compile(eval_model, dynamic=False)
