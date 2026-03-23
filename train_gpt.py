@@ -88,7 +88,8 @@ class Hyperparameters:
     num_decoder_recurrent = int(os.environ.get("NUM_DECODER_RECURRENT", 2))
     num_exit_blocks = int(os.environ.get("NUM_EXIT_BLOCKS", 1))
 
-    # Depth recurrence (log-normal Poisson sampling)
+    # Depth recurrence
+    fixed_train_depth = int(os.environ.get("FIXED_TRAIN_DEPTH", 0))  # 0 = random sampling
     recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 3))
     recurrent_min_depth = int(os.environ.get("RECURRENT_MIN_DEPTH", 1))
     recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 12))
@@ -1321,11 +1322,13 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    use_fixed_depth = args.fixed_train_depth > 0
     log0(f"recurrent_unet: entry={args.num_entry_blocks} enc={args.num_encoder_recurrent}×N "
          f"dec={args.num_decoder_recurrent}×N exit={args.num_exit_blocks} "
-         f"mean_depth={args.recurrent_mean_depth} eval_depth={args.eval_recurrent_depth}")
+         f"train_depth={'fixed=' + str(args.fixed_train_depth) if use_fixed_depth else 'random(mean=' + str(args.recurrent_mean_depth) + ')'} "
+         f"eval_depth={args.eval_recurrent_depth}")
 
-    # Depth sampling: log-normal Poisson (Geiping et al. 2025)
+    # Depth sampling: log-normal Poisson (Geiping et al. 2025) — only used when not fixed
     def sample_depth() -> int:
         log_mean = math.log(max(args.recurrent_mean_depth, 1))
         lam = math.exp(random.gauss(log_mean, args.recurrent_depth_sigma))
@@ -1355,8 +1358,13 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # Pre-compile all depth variants to avoid lazy recompilation during training
-    all_depths = list(range(args.recurrent_min_depth, args.recurrent_max_depth + 1))
+    # Pre-compile depth variants to avoid lazy recompilation during training
+    if use_fixed_depth:
+        all_depths = [args.fixed_train_depth]
+        if args.eval_recurrent_depth != args.fixed_train_depth:
+            all_depths.append(args.eval_recurrent_depth)
+    else:
+        all_depths = list(range(args.recurrent_min_depth, args.recurrent_max_depth + 1))
     torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, len(all_depths) + 10)
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
@@ -1452,8 +1460,8 @@ def main() -> None:
         if args.late_qat and scale < qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
-        # Sample random depth for this training step
-        train_depth = sample_depth()
+        # Set depth for this training step
+        train_depth = args.fixed_train_depth if use_fixed_depth else sample_depth()
         base_model.n_recurrent_iters = train_depth
         zero_grad_all()
         train_loss = torch.zeros((), device=device)

@@ -82,6 +82,44 @@ QAT_THRESHOLD=0.3 (kicked in at step 2637, scale=0.30 — ~900 steps of QAT).
 | U-Net Run 1 (1+2+2+1) | ~1.14* | 1.1652 | 12.8MB | 4034 |
 | **U-Net Run 2 (2+2+2+2)** | **1.1352** | **1.1481** | **16.4MB** | 3524 |
 
+## Run 3: Fixed depth training (FIXED_TRAIN_DEPTH=3), 600s
+
+**Config:** 2+2+2+2, dim=640, 8 heads, 4 KV heads, 3x MLP, int6+zstd.
+30.5M params. Same as Run 2 except: FIXED_TRAIN_DEPTH=3 (no random Poisson sampling),
+MAX_WALLCLOCK_SECONDS=600 (half of Run 2's 1200s — accidental default).
+QAT_THRESHOLD=0.3 (kicked in at step 1505, scale=0.30 — ~360 steps of QAT).
+
+**Training:**
+| Step | Val BPB | Train Loss | Notes |
+|------|---------|------------|-------|
+| 1000 | 1.2801  | 2.2095     | Run 2 was 1.2983 here — 0.018 better |
+| 1866 | 1.1970  | -          | Wallclock cap (600s) |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1825** (stride 64)
+- Int6 roundtrip BPB: **1.2170** (standard eval)
+- Int6 sliding window BPB: **1.1947** (stride 64)
+- **Quant penalty: 0.012** (1.1825 → 1.1947, slightly better than Run 2's 0.013)
+- Model size: **17.25MB** int6+zstd (over budget)
+- Step avg: 322ms, 1866 steps in 600s
+
+**Observations:**
+1. **Fixed depth converges faster per step.** At step 1000, val_bpb 1.2801 vs Run 2's 1.2983 (0.018 better). Every gradient update optimizes the actual eval configuration instead of wasting signal on unused depths.
+2. **Only half the wallclock** (600s vs 1200s) — accidental default. Need to rerun at 1200s for fair comparison, where we'd expect ~3700 steps (vs Run 2's 3524).
+3. **Compilation much faster**: only 1 depth graph compiled vs 12 in Run 2. Warmup is trivial.
+4. **Step speed slightly improved**: 322ms vs 340ms (~5%) — less dynamo cache pressure from single graph.
+5. **Loss still dropping fast** at step 1866 — strong indication a 1200s run would beat Run 2 significantly.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Size | Steps | Wallclock |
+|---|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~16MB | ~6000+ | 600s |
+| U-Net Run 1 (1+2+2+1) | ~1.14* | 1.1652 | 12.8MB | 4034 | 1200s |
+| U-Net Run 2 (2+2+2+2, random depth) | 1.1352 | 1.1481 | 16.4MB | 3524 | 1200s |
+| **U-Net Run 3 (2+2+2+2, fixed depth)** | **1.1825** | **1.1947** | **17.3MB** | 1866 | 600s |
+
+*Run 3 had half the wallclock of Run 2. Per-step convergence is clearly better — needs 1200s rerun.*
+
 ## Key Insights
 
 1. **U-Net skips work well in recurrent setting.** The encoder-decoder structure with skip connections gives depth-dependent information flow without the fixed-point problem of input injection.
@@ -94,6 +132,8 @@ QAT_THRESHOLD=0.3 (kicked in at step 2637, scale=0.30 — ~900 steps of QAT).
 
 ## Next Steps to Consider
 
+- **Rerun fixed depth at 1200s**: Run 3 only got 600s — need 1200s for fair comparison with Run 2
+- **Try fixed depth=2**: fewer effective layers but faster steps → more steps in wallclock
 - **Mixed quantization**: int8 for recurrent blocks, int6 for entry/exit to reduce quant penalty
 - **Smaller dim + more steps**: dim=576 would be faster and fit budget better
 - **LoRA TTT to patch quant error**: small LoRA at eval time on the quantized model
