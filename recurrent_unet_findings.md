@@ -45,11 +45,56 @@
 | Run 15 (injection 2+3+2 dim=512) | 1.1619 | 16.5MB | 5308 |
 | **U-Net recurrent (1+2+2+1 dim=640)** | **1.1652** | **12.8MB** | 4034 |
 
-## Run 2: 2+2+2+2 dim=640, more QAT (NEXT)
+## Run 2: 2+2+2+2 dim=640, more QAT
 
-**Changes from Run 1:**
-- 2 entry + 2 encoder (×N) + 2 decoder (×N) + 2 exit blocks (8 unique blocks)
-- Lower QAT threshold (0.3 instead of 0.1) for more quantization-aware training time
-- Pre-quant sliding window eval added to measure exact quant penalty
+**Config:** 2+2+2+2, dim=640, 8 heads, 4 KV heads, 3x MLP, int6+zstd.
+30.5M params. BIGRAM_VOCAB_SIZE=2048, XSA_LAST_N=2, EMA_DECAY=0.997.
+QAT_THRESHOLD=0.3 (kicked in at step 2637, scale=0.30 — ~900 steps of QAT).
 
-**Hypothesis:** Extra entry/exit blocks use the 3.2MB budget headroom for better BPB. More QAT time should reduce the 0.015 quant penalty.
+**Training:**
+| Step | Val BPB | Train Loss | Notes |
+|------|---------|------------|-------|
+| 1000 | 1.2983  | 2.2419     | |
+| 2000 | 1.2308  | 2.0248     | |
+| 2637 | -       | -          | QAT enabled (scale < 0.3) |
+| 3000 | 1.1790  | 2.0569     | |
+| 3524 | 1.1583  | -          | Wallclock cap (1200s) |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1352** (stride 64)
+- Int6 roundtrip BPB: **1.1719** (standard eval)
+- Int6 sliding window BPB: **1.1481** (stride 64)
+- **Quant penalty: 0.013** (1.1352 → 1.1481, improved from Run 1's 0.015 — more QAT helped)
+- Model size: **16.44MB** int6+zstd (16.52MB with code — slightly over 16MB budget)
+- Step avg: 340ms, 3524 steps in 1200s
+
+**Observations:**
+1. **Pre-quant BPB 1.1352 is very close to baseline's 1.1248** — only 0.010 behind with 500 fewer steps.
+2. **QAT reduced quant penalty** from 0.015 to 0.013 (QAT_THRESHOLD=0.3 gave ~900 steps of QAT vs ~400 in Run 1).
+3. **Slightly over budget** — 16.52MB with code. Need to trim ~0.5MB (reduce dim slightly or use int8 for recurrent blocks + int6 for entry/exit).
+4. **Fewer steps** (3524 vs 4034 in Run 1) due to larger model — 340ms vs 297ms per step.
+5. **Loss still dropping** at cutoff — the curve suggests we'd reach ~1.14-1.15 BPB pre-quant with more steps.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Size | Steps |
+|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~16MB | ~6000+ |
+| U-Net Run 1 (1+2+2+1) | ~1.14* | 1.1652 | 12.8MB | 4034 |
+| **U-Net Run 2 (2+2+2+2)** | **1.1352** | **1.1481** | **16.4MB** | 3524 |
+
+## Key Insights
+
+1. **U-Net skips work well in recurrent setting.** The encoder-decoder structure with skip connections gives depth-dependent information flow without the fixed-point problem of input injection.
+
+2. **Quantization penalty scales with recurrence depth.** Weights reused N times accumulate N× the quantization error. More QAT helps but doesn't fully solve it. Consider: int8 for recurrent blocks (reused), int6 for entry/exit (single-use).
+
+3. **Parameter efficiency is excellent.** 6 unique blocks + weight sharing gives 14 effective layers at depth 3, fitting in ~16MB. But we're bottlenecked on steps — 340ms/step means only ~3500 steps in 20 min.
+
+4. **Main bottleneck is now step speed.** The baseline gets ~6000+ steps at ~100ms each. We get 3500 at 340ms. If we could speed up (fewer blocks, smaller dim, or faster compilation), BPB would improve further since loss is still dropping fast.
+
+## Next Steps to Consider
+
+- **Mixed quantization**: int8 for recurrent blocks, int6 for entry/exit to reduce quant penalty
+- **Smaller dim + more steps**: dim=576 would be faster and fit budget better
+- **LoRA TTT to patch quant error**: small LoRA at eval time on the quantized model
+- **Depth sweep at eval**: try eval_depth=4 or 5 since depth curve was flat in Run 1
