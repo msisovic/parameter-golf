@@ -203,7 +203,7 @@ class TTTConfig:
     lora_rank = int(os.environ.get("LORA_RANK", 4))
     fixed_depth = int(os.environ.get("TTT_FIXED_DEPTH", 9))  # fixed eval+train depth
     eval_stride = int(os.environ.get("TTT_EVAL_STRIDE", 64))
-    train_stride = int(os.environ.get("TTT_TRAIN_STRIDE", 1024))
+    train_stride = int(os.environ.get("TTT_TRAIN_STRIDE", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     grad_clip_norm = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 

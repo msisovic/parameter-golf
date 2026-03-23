@@ -601,16 +601,23 @@ Best at depth 4: **1.1928 BPB**. Gentle degradation beyond mean (3), worse than 
 2. Training at random depths wastes compute — if eval is at depth 6, training at depth 3 only updates LoRAs 0-2 and misses 3-5
 3. Once eval depth settles, should train at that depth to update ALL relevant LoRAs jointly
 
-### TTT Attempt 2c: Fixed depth 9 + entry/exit LoRA (NEXT)
+### TTT Attempt 2c: Fixed depth 9 + entry/exit LoRA (FAILED — no improvement over baseline)
 
-**Approach:** Simplify radically. Fix depth at 9 (2+27+2 = 31 effective layers). No depth probing, no curriculum. Rank 4 LoRA on ALL blocks (entry, recurrent per-depth, exit). Train stride 1024, eval stride 64.
+**Approach:** Fix depth at 9 (2+27+2 = 31 effective layers). No depth probing, no curriculum. Rank 4 LoRA on ALL blocks (entry, recurrent per-depth, exit). Train stride 2048, eval stride 64. 952K LoRA params (5.48% of base).
 
-**Rationale:**
-- Base model depth sweep shows 3-10 are all within 0.025 BPB — depth 9 not much worse than optimal depth 4
-- At depth 9, each of 27 recurrent block passes gets its own LoRA → maximum differentiation opportunity
-- Entry/exit LoRAs let those blocks adapt to the deeper pipeline
-- Fixed depth eliminates all probing noise and ensures sustained LoRA training
-- Rank 4 + stride 1024 prevents overfitting (each token trained ~2x)
+**Result:** BPB followed exact same trajectory as no-TTT baseline — starts ~1.164, rises to ~1.175-1.185, converges to ~1.177. The LoRAs learn nothing useful.
+
+**No-TTT baseline comparison (stride 64, depth 3):**
+- 155K windows evaluated, BPB converged to **1.1768**
+- This matches TTT eval BPB at every stage — the oscillation pattern is a property of the validation data distribution, not TTT effectiveness
+
+**Conclusion: Per-depth LoRA TTT is a dead end for this architecture.**
+
+The depth-recurrent model's recurrent blocks are weight-shared and learn a general-purpose iterative refinement. Adding per-depth LoRA adapters doesn't help because:
+1. The recurrent blocks already handle depth variation via `resid_mix` (learned residual mixing)
+2. LoRA rank 4 on 512-dim layers provides very limited representational gain
+3. The model's BPB at any depth is dominated by the base weights, not depth-specific adaptation
+4. Score-before-train means LoRAs can never help the tokens they're scored on — only future similar tokens benefit, and the validation set has limited repetition
 
 ## Reference: Baseline
 - 11 specialized layers, dim=512, int6 quantization
