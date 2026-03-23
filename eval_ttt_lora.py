@@ -1,18 +1,16 @@
 """
 eval_ttt_lora.py — Per-depth LoRA TTT for depth-recurrent transformers.
 
-Strategy: freeze base weights, add zero-initialized LoRA at each depth for each
-recurrent block. TTT-train only the LoRAs with a 3-phase curriculum:
-  Phase 1 (stabilize): train at base depth, LoRAs learn near-identity
-  Phase 2 (ramp):      linearly increase depth from base to target
-  Phase 3 (consolidate): train at target depth
+Strategy: freeze base weights, add zero-initialized LoRA (rank 4) at each depth
+for each recurrent block. TTT-train only the LoRAs with randomly sampled depth
+each train step (uniform [base_depth, target_depth]). All depth LoRAs co-evolve.
 
-Eval depth starts at base and is promoted when a deeper depth proves better.
-Scoring uses stride 64 for maximum context overlap.
+Eval stride=64 (scoring), train stride=1024 (fewer updates, less overfitting).
+Eval depth starts at base and is promoted when probing finds a better depth.
 
 Architecture: N entry + M recurrent (x0 residual, no injection) + K exit.
 
-SAFETY: score-before-train on every chunk.
+SAFETY: score-before-train on every chunk — NEVER train on unseen tokens.
 
 Usage:
     torchrun --nproc_per_node=4 eval_ttt_lora.py
@@ -23,8 +21,6 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections import defaultdict
-
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -141,7 +137,7 @@ class DepthLoRAWrapper(nn.Module):
         self.base_model = base_model
         self.max_depth = max_depth
 
-        # Create per-depth LoRA wrappers for each recurrent block
+        # Per-depth LoRA wrappers for each recurrent block
         # depth_loras[d][b] = LoRABlock for depth d, recurrent block b
         self.depth_loras = nn.ModuleList()
         for d in range(max_depth):
@@ -149,6 +145,14 @@ class DepthLoRAWrapper(nn.Module):
             for block in base_model.recurrent_blocks:
                 block_loras.append(LoRABlock(block, rank=lora_rank))
             self.depth_loras.append(block_loras)
+
+        # Single LoRA for entry and exit blocks (run once, not per-depth)
+        self.entry_loras = nn.ModuleList([
+            LoRABlock(block, rank=lora_rank) for block in base_model.entry_blocks
+        ])
+        self.exit_loras = nn.ModuleList([
+            LoRABlock(block, rank=lora_rank) for block in base_model.exit_blocks
+        ])
 
     def forward_logits(self, input_ids: Tensor, n_iters: int) -> Tensor:
         m = self.base_model
@@ -159,24 +163,22 @@ class DepthLoRAWrapper(nn.Module):
         x = m.smear(x)
         x0 = x
 
-        # Entry blocks (frozen, no LoRA)
-        for block in m.entry_blocks:
-            x = block(x, x0)
+        # Entry blocks with LoRA
+        for lora_block in self.entry_loras:
+            x = lora_block(x, x0)
 
         # Recurrent blocks x N with per-depth LoRA
         for depth_idx in range(n_iters):
             if depth_idx < self.max_depth:
-                # Use LoRA-wrapped blocks
-                for b_idx, lora_block in enumerate(self.depth_loras[depth_idx]):
+                for lora_block in self.depth_loras[depth_idx]:
                     x = lora_block(x, x0)
             else:
-                # Beyond max LoRA depth, use base blocks
                 for block in m.recurrent_blocks:
                     x = block(x, x0)
 
-        # Exit blocks (frozen, no LoRA)
-        for block in m.exit_blocks:
-            x = block(x, x0)
+        # Exit blocks with LoRA
+        for lora_block in self.exit_loras:
+            x = lora_block(x, x0)
 
         x = m.final_norm(x)
         if m.tie_embeddings:
@@ -198,24 +200,14 @@ class TTTConfig:
 
     ttt_lr = float(os.environ.get("TTT_LR", 3e-4))
     ttt_wd = float(os.environ.get("TTT_WD", 0.0))
-    lora_rank = int(os.environ.get("LORA_RANK", 8))
-    base_depth = int(os.environ.get("TTT_BASE_DEPTH", 0))  # 0 = from checkpoint
-    target_depth = int(os.environ.get("TTT_TARGET_DEPTH", 6))
+    lora_rank = int(os.environ.get("LORA_RANK", 4))
+    fixed_depth = int(os.environ.get("TTT_FIXED_DEPTH", 9))  # fixed eval+train depth
     eval_stride = int(os.environ.get("TTT_EVAL_STRIDE", 64))
-    train_stride = int(os.environ.get("TTT_TRAIN_STRIDE", 256))
+    train_stride = int(os.environ.get("TTT_TRAIN_STRIDE", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     grad_clip_norm = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
-    # Curriculum phase fractions (of total train steps)
-    phase1_frac = float(os.environ.get("TTT_PHASE1_FRAC", 0.15))
-    phase2_frac = float(os.environ.get("TTT_PHASE2_FRAC", 0.50))
-    # phase3 = 1 - phase1 - phase2
-
-    # Depth probe
-    depth_probe_every = int(os.environ.get("TTT_DEPTH_PROBE_EVERY", 100))
-    depth_probe_margin = float(os.environ.get("TTT_DEPTH_PROBE_MARGIN", 0.0))  # require this much improvement
-
-    log_every = int(os.environ.get("TTT_LOG_EVERY", 50))
+    log_every = int(os.environ.get("TTT_LOG_EVERY", 20))
 
 
 # ---------------------------------------------------------------------------
@@ -257,8 +249,7 @@ def main() -> None:
     model_cfg = ckpt["config"]
     state_dict = ckpt["model_state_dict"]
 
-    base_depth = cfg.base_depth if cfg.base_depth > 0 else model_cfg["eval_recurrent_depth"]
-    target_depth = cfg.target_depth
+    fixed_depth = cfg.fixed_depth
     seq_len = cfg.eval_seq_len
     eval_stride = cfg.eval_stride
     train_stride = cfg.train_stride
@@ -269,7 +260,7 @@ def main() -> None:
 
     log0(f"Model: dim={model_cfg['model_dim']} arch={model_cfg.get('architecture', 'unknown')}")
     log0(f"  blocks: {model_cfg.get('num_entry_blocks', 1)}+{model_cfg.get('num_recurrent_blocks', 1)}+{model_cfg.get('num_exit_blocks', 1)}")
-    log0(f"Depth: base={base_depth} target={target_depth} lora_rank={cfg.lora_rank}")
+    log0(f"Depth: fixed={fixed_depth} lora_rank={cfg.lora_rank}")
     log0(f"Strides: eval={eval_stride} train={train_stride}")
 
     # --- Build base model (frozen) ---
@@ -308,13 +299,17 @@ def main() -> None:
     log0(f"Base model: {n_base_params} params (all frozen)")
 
     # --- Build LoRA wrapper ---
-    wrapper = DepthLoRAWrapper(base_model, max_depth=target_depth, lora_rank=cfg.lora_rank).to(device)
+    wrapper = DepthLoRAWrapper(base_model, max_depth=fixed_depth, lora_rank=cfg.lora_rank).to(device)
 
-    n_lora_params = sum(p.numel() for p in wrapper.depth_loras.parameters())
+    # Collect only actual LoRA A/B params (not frozen base block refs)
+    lora_params = []
+    for module in list(wrapper.depth_loras.modules()) + list(wrapper.entry_loras.modules()) + list(wrapper.exit_loras.modules()):
+        if isinstance(module, LoRALinear):
+            lora_params.extend(list(module.parameters()))
+    n_lora_params = sum(p.numel() for p in lora_params)
     log0(f"LoRA params: {n_lora_params} ({100*n_lora_params/n_base_params:.2f}% of base)")
 
     # --- Optimizer (only LoRA params) ---
-    lora_params = list(wrapper.depth_loras.parameters())
     optimizer = torch.optim.AdamW(lora_params, lr=cfg.ttt_lr, weight_decay=cfg.ttt_wd,
                                    betas=(0.9, 0.999), fused=True)
 
@@ -332,40 +327,24 @@ def main() -> None:
     rank_start = rank * per_rank
     rank_end = (rank + 1) * per_rank if rank < world_size - 1 else total_val_tokens
 
-    # Estimate total train steps for curriculum scheduling
+    # Estimate total train steps
     total_eval_windows = (rank_end - rank_start) // eval_stride
     total_train_steps = total_eval_windows // evals_per_train
-    phase1_end = int(total_train_steps * cfg.phase1_frac)
-    phase2_end = int(total_train_steps * (cfg.phase1_frac + cfg.phase2_frac))
 
     log0(f"Rank {rank}: tokens [{rank_start}, {rank_end})")
-    log0(f"Total train steps: ~{total_train_steps}, phase1 end: {phase1_end}, phase2 end: {phase2_end}")
+    log0(f"Total train steps: ~{total_train_steps}")
 
     # --- Accumulators ---
     nll_accum = torch.zeros((), device=device, dtype=torch.float64)
     bytes_accum = torch.zeros((), device=device, dtype=torch.float64)
     tokens_accum = torch.zeros((), device=device, dtype=torch.float64)
-    depth_nll: dict[int, float] = defaultdict(float)
-    depth_bytes: dict[int, float] = defaultdict(float)
-    depth_tokens: dict[int, int] = defaultdict(int)
 
-    # --- Depth state ---
-    eval_depth = base_depth
+    # --- State ---
     train_step = 0
     eval_step_count = 0
     evals_since_train = 0
     scored_up_to = rank_start
     t_start = time.perf_counter()
-
-    def get_train_depth(step: int) -> int:
-        """Curriculum: base during phase 1, ramp during phase 2, target during phase 3."""
-        if step < phase1_end:
-            return base_depth
-        elif step < phase2_end:
-            frac = (step - phase1_end) / max(phase2_end - phase1_end, 1)
-            return base_depth + int(round(frac * (target_depth - base_depth)))
-        else:
-            return target_depth
 
     def score_window(ws: int, depth: int) -> tuple[float, float, int]:
         end = min(ws + seq_len, rank_end)
@@ -416,14 +395,11 @@ def main() -> None:
     eval_pos = rank_start
 
     while eval_pos < rank_end:
-        # Score one eval window
-        nll_sum, bytes_sum, n_tok = score_window(eval_pos, eval_depth)
+        # Score one eval window (ALWAYS before any training on these tokens)
+        nll_sum, bytes_sum, n_tok = score_window(eval_pos, fixed_depth)
         nll_accum += nll_sum
         bytes_accum += bytes_sum
         tokens_accum += n_tok
-        depth_nll[eval_depth] += nll_sum
-        depth_bytes[eval_depth] += bytes_sum
-        depth_tokens[eval_depth] += n_tok
 
         scored_up_to = max(scored_up_to, min(eval_pos + seq_len, rank_end))
         eval_pos += eval_stride
@@ -433,39 +409,19 @@ def main() -> None:
         # Train after evals_per_train eval windows
         if evals_since_train >= evals_per_train:
             evals_since_train = 0
-            curr_train_depth = get_train_depth(train_step)
 
+            # SAFETY: only train on already-scored tokens
             train_end = scored_up_to
             train_ws = max(train_end - seq_len, rank_start)
-            train_window(train_ws, curr_train_depth)
+            train_window(train_ws, fixed_depth)
             train_step += 1
-
-            # Depth probing
-            if (train_step > 0
-                    and train_step % cfg.depth_probe_every == 0
-                    and eval_depth < target_depth
-                    and curr_train_depth > eval_depth):
-                probe_ws = max(eval_pos - eval_stride, rank_start)
-                probe_nll, _, probe_n = score_window(probe_ws, curr_train_depth)
-                curr_nll, _, _ = score_window(probe_ws, eval_depth)
-                if probe_n > 0:
-                    avg_new = probe_nll / probe_n
-                    avg_cur = curr_nll / probe_n
-                    if avg_new < avg_cur - cfg.depth_probe_margin:
-                        log0(f"EVAL DEPTH UPGRADE: {eval_depth}→{curr_train_depth} "
-                             f"(deeper={avg_new:.4f} < current={avg_cur:.4f})")
-                        eval_depth = curr_train_depth
-                    else:
-                        log0(f"depth_probe: eval stays at {eval_depth} "
-                             f"(deeper={avg_new:.4f} vs current={avg_cur:.4f})")
 
             # Log
             if train_step % cfg.log_every == 0:
                 running_bpb = (nll_accum.item() / math.log(2.0)) / max(bytes_accum.item(), 1)
                 elapsed = time.perf_counter() - t_start
-                phase = "P1-stabilize" if train_step < phase1_end else ("P2-ramp" if train_step < phase2_end else "P3-consolidate")
-                log0(f"step:{train_step} eval:{eval_step_count} {phase} "
-                     f"eval_d:{eval_depth} train_d:{curr_train_depth} "
+                log0(f"step:{train_step} eval:{eval_step_count} "
+                     f"depth:{fixed_depth} "
                      f"bpb:{running_bpb:.4f} tokens:{int(tokens_accum.item())} "
                      f"elapsed:{elapsed:.0f}s")
 
@@ -480,13 +436,9 @@ def main() -> None:
     final_bpb = (nll_accum.item() / math.log(2.0)) / bytes_accum.item() if bytes_accum.item() > 0 else float("inf")
 
     log0(f"\n{'='*80}")
-    log0(f"TTT LORA COMPLETE: bpb={final_bpb:.6f} tokens={int(tokens_accum.item())} "
-         f"time={total_time:.1f}s train_steps={train_step}")
-    log0(f"\nPER-DEPTH BREAKDOWN:")
-    for d in sorted(depth_tokens.keys()):
-        d_bpb = (depth_nll[d] / math.log(2.0)) / depth_bytes[d] if depth_bytes[d] > 0 else float("inf")
-        log0(f"  depth={d}: bpb={d_bpb:.6f} tokens={depth_tokens[d]}")
-    log0(f"\nLoRA params: {n_lora_params}")
+    log0(f"TTT LORA COMPLETE: bpb={final_bpb:.6f} depth={fixed_depth} "
+         f"tokens={int(tokens_accum.item())} time={total_time:.1f}s train_steps={train_step}")
+    log0(f"LoRA params: {n_lora_params} (rank={cfg.lora_rank})")
     log0(f"{'='*80}")
 
     if distributed:
