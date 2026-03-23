@@ -1517,7 +1517,7 @@ def main() -> None:
 
     # Mixed quantization: int6 for entry/exit blocks, int8 for recurrent + embeddings
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    int6_prefixes = ("entry_blocks.", "exit_blocks.")
+    int6_prefixes = ()  # Pure int8 for now
     quant_result, quant_meta = mixed_quantize_int6_int8(sd_cpu, int6_prefixes)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
