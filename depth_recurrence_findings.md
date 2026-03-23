@@ -537,8 +537,75 @@ The fundamental problem is that **TTT on the recurrent block trains one shared w
 
 **Verdict: Depth-recurrence TTT gives real but small gains (0.009 BPB) at high cost (35 min). Not competitive with standard LoRA TTT (0.02-0.03 BPB in ~10 min) for competition purposes.** The no-injection architecture is interesting for parameter efficiency (13.75MB for 1.2144 BPB) but the TTT angle doesn't justify the complexity.
 
+## Run 14: 2+3+2 No-injection dim=512 + Per-depth LoRA TTT (2026-03-23)
+
+### Training (Run 14)
+
+**Architecture:** 2 entry + 3 recurrent (x0 residual, no injection) + 2 exit blocks. dim=512, 8 heads, 4 KV heads, head_dim=64, 3x MLP. Log-normal Poisson(mean=3, σ=0.5, max=10). 17.4M params → ~14.7MB at int8+zstd.
+
+**Training:** ~4K steps, 1200s wallclock on 4xH100. EMA, late QAT.
+
+**Depth sweep (no TTT):**
+| Depth | BPB    |
+|-------|--------|
+| 1     | 1.2817 |
+| 2     | 1.2092 |
+| 3     | 1.1966 |
+| 4     | 1.1928 |
+| 5     | 1.1940 |
+| 6     | 1.1970 |
+| 8     | 1.2063 |
+| 10    | 1.2183 |
+
+Best at depth 4: **1.1928 BPB**. Gentle degradation beyond mean (3), worse than injection model's plateau.
+
+### TTT Attempt 1: Shared-weight depth extension (FAILED)
+
+**Approach:** Freeze entry/exit/embeddings, train recurrent blocks at increasing depth. Score-before-train with train-ahead/eval-behind strategy.
+
+**Result:** BPB degraded from ~1.19 to ~1.23 as depth climbed 3→4→5→6. The shared-weight problem: optimizing recurrent blocks for one depth hurts other depths. Same interference problem as Run 13, but worse because 3 recurrent blocks amplify interference.
+
+### TTT Attempt 2: Per-depth LoRA (IN PROGRESS)
+
+**Approach (from Bae et al. "Relaxed Recursive Transformers", ICLR 2025):** Freeze ALL base weights. Add zero-initialized LoRA adapters (rank 8) to each linear layer of each recurrent block at each depth index. Each recurrence iteration gets its own LoRA, making iterations functionally distinct while sharing the base weights. ~8.2M LoRA params (47% of base — intentionally large).
+
+**3-phase curriculum:**
+- Phase 1 (15%, steps 0-9085): Stabilize at base depth 3
+- Phase 2 (50%, steps 9085-39369): Linearly ramp from depth 3 → 6
+- Phase 3 (35%, steps 39369-60568): Consolidate at target depth 6
+
+**Eval depth probing:** Eval starts at base depth, promoted only when deeper depth proves better on a probe window (every 100 train steps).
+
+**Early observations (Phase 1, ~5000 steps, depth 3 only):**
+- BPB converged to ~1.167 within ~500 steps, then slowly drifted UP to ~1.180
+- Running BPB at step 5000: **~1.180** (vs 1.1928 no-TTT baseline at depth 4 → improvement at same depth 3)
+- Clear signs of LoRA overfitting: plateau then regression with 8.2M LoRA params on ~15M tokens/rank
+- Phase 1 is far too long — LoRAs converge in ~500 steps but Phase 1 runs for 9085
+
+### Observations and Concerns for Depth Transition
+
+1. **Overfitting risk is real.** 8.2M LoRA params vs ~15M tokens per rank = very unfavorable ratio. BPB drift upward after step ~1000 confirms this. Need lower rank or regularization.
+
+2. **Depth transition may fail catastrophically.** During Phase 1, LoRAs at depths 0-2 are optimized assuming output goes directly to exit blocks after 3 iterations. When Phase 2 adds a 4th iteration (depth index 3, identity LoRA), the trained depth 0-2 LoRAs produce "exit-ready" features that now get fed into another recurrent pass. This representation mismatch could cause a BPB spike.
+
+3. **All-depth simultaneous training would be safer.** Instead of the 3-phase curriculum, train LoRAs at ALL depths from step 0 using the same log-normal depth distribution from pre-training. This avoids the phase transition shock and lets all LoRAs co-adapt.
+
+### Possible Next Steps
+
+1. **Reduce LoRA rank** (8→2 or 4) to combat overfitting. 8.2M params is way too much for 62M val tokens.
+
+2. **Skip Phase 1 — train all depths simultaneously from step 0.** Use the same log-normal Poisson depth distribution as pre-training (mean=3, σ=0.5, max=10). Each forward pass randomly samples a depth and trains the corresponding LoRAs. This avoids the phase transition problem entirely because all depth LoRAs co-evolve.
+
+3. **Larger train stride** (256→512 or 1024) to reduce LoRA updates per token and slow overfitting. Currently each token is used for training ~8 times (2048/256).
+
+4. **LR warmup + decay.** Current flat lr=3e-4 may be too aggressive once LoRAs converge. Cosine decay would naturally reduce overfitting in later steps.
+
+5. **Consider whether LoRA TTT is worth the complexity.** Standard LoRA TTT (fixed depth, adapt to val distribution) achieves 0.02-0.03 BPB in ~10 min. Our per-depth LoRA approach is architecturally elegant but adds significant compute (replicated attention forward pass for LoRA injection) and the depth extension gains are uncertain.
+
+6. **Eval-time budget:** Current pace is ~90 min for full eval+TTT. Competition allows 20 min. Need 4-5x speedup: larger train stride, fewer TTT steps, or accept a smaller portion of TTT adaptation.
+
 ## Reference: Baseline
-- 9 specialized layers, U-net skips, int6 quantization
+- 11 specialized layers, dim=512, int6 quantization
 - **1.1248 BPB** (target to beat)
 
 ## Reference: Current SOTA (not yet accepted)

@@ -1,12 +1,14 @@
 """
 eval_ttt_fused.py — Fused Sliding-Window TTT for No-Injection Depth Recurrence.
 
-Combines sliding-window evaluation with test-time training in a single left-to-right
-pass. Each chunk is scored with full sliding-window context BEFORE being used for
-gradient updates. Supports adaptive depth selection: starts at base depth and
-switches to deeper when deeper becomes better.
+Strategy: train-ahead curriculum.
+- EVAL at depth D with stride 64 (high overlap scoring)
+- TRAIN at depth D+1 on full 2048 context with stride 256
+- Each token is scored BEFORE any training that includes it
+- Probe: when training-depth (D+1) outperforms eval-depth (D) at scoring,
+  promote eval_depth to D+1 and train_depth to D+2
 
-Architecture: 1 entry + 1 recurrent (x0 residual, no injection) + 1 exit.
+Architecture: N entry + M recurrent (x0 residual, no injection) + K exit.
 
 SAFETY: score-before-train on every chunk. No token is ever scored after training.
 
@@ -16,23 +18,20 @@ Usage:
 Key env vars:
     CHECKPOINT_PATH       ttt_checkpoint_noinject.pt
     TTT_LR                Learning rate (default: 1e-4)
-    TTT_BASE_DEPTH        Starting depth (default: from checkpoint)
-    TTT_MAX_DEPTH         Max depth to try (default: 20)
-    TTT_STRIDE            Tokens scored per window (default: 256)
-    TTT_BATCH_SEQS        Windows per gradient step (default: 8)
-    TTT_DEPTH_PROBE_EVERY Batches between depth probes (default: 50)
-    TTT_LOG_EVERY         Log every N steps (default: 50)
-    TTT_WARMUP_STEPS      Steps at base depth before probing (default: 100)
+    TTT_BASE_DEPTH        Starting eval depth (default: from checkpoint)
+    TTT_MAX_DEPTH         Max depth to try (default: 6)
+    TTT_EVAL_STRIDE       Scoring stride (default: 64)
+    TTT_TRAIN_STRIDE      Training stride (default: 256)
+    TTT_DEPTH_PROBE_EVERY Train steps between depth probes (default: 50)
+    TTT_LOG_EVERY         Log every N train steps (default: 25)
+    TTT_WARMUP_STEPS      Train steps before probing (default: 50)
 """
 
 from __future__ import annotations
 
 import math
 import os
-import sys
 import time
-import json
-from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
@@ -42,16 +41,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-
-# Import from the no-injection training script
 from train_gpt_noinject import (
     GPT,
     CastedLinear,
-    Hyperparameters,
     build_sentencepiece_luts,
     load_validation_tokens,
     restore_low_dim_params_to_fp32,
-    eval_val,
     CONTROL_TENSOR_NAME_PATTERNS,
 )
 
@@ -69,16 +64,15 @@ class TTTConfig:
     ttt_lr = float(os.environ.get("TTT_LR", 1e-4))
     ttt_wd = float(os.environ.get("TTT_WD", 0.0))
     ttt_base_depth = int(os.environ.get("TTT_BASE_DEPTH", 0))  # 0 = from checkpoint
-    ttt_max_depth = int(os.environ.get("TTT_MAX_DEPTH", 20))
-    ttt_stride = int(os.environ.get("TTT_STRIDE", 256))
-    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 8))
-    ttt_log_every = int(os.environ.get("TTT_LOG_EVERY", 50))
-    ttt_warmup_steps = int(os.environ.get("TTT_WARMUP_STEPS", 100))
+    ttt_max_depth = int(os.environ.get("TTT_MAX_DEPTH", 6))
+    eval_stride = int(os.environ.get("TTT_EVAL_STRIDE", 64))
+    train_stride = int(os.environ.get("TTT_TRAIN_STRIDE", 256))
+    ttt_log_every = int(os.environ.get("TTT_LOG_EVERY", 25))
+    ttt_warmup_steps = int(os.environ.get("TTT_WARMUP_STEPS", 50))
     ttt_depth_probe_every = int(os.environ.get("TTT_DEPTH_PROBE_EVERY", 50))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     grad_clip_norm = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
-    # What to freeze (for no-injection arch: freeze entry+exit, train recurrent only)
     freeze_entry = bool(int(os.environ.get("TTT_FREEZE_ENTRY", "1")))
     freeze_exit = bool(int(os.environ.get("TTT_FREEZE_EXIT", "1")))
     freeze_embeddings = bool(int(os.environ.get("TTT_FREEZE_EMBEDDINGS", "1")))
@@ -112,10 +106,10 @@ def main() -> None:
         if not master_process:
             return
         if console:
-            print(msg)
+            print(msg, flush=True)
         if logfile:
             with open(logfile, "a", encoding="utf-8") as f:
-                print(msg, file=f)
+                print(msg, file=f, flush=True)
 
     log0(f"eval_ttt_fused.py rank={rank} world_size={world_size}")
 
@@ -127,11 +121,18 @@ def main() -> None:
     base_depth = cfg.ttt_base_depth if cfg.ttt_base_depth > 0 else model_cfg["eval_recurrent_depth"]
     max_depth = cfg.ttt_max_depth
     seq_len = cfg.eval_seq_len
-    stride = cfg.ttt_stride
+    eval_stride = cfg.eval_stride
+    train_stride = cfg.train_stride
     vocab_size = model_cfg["vocab_size"]
 
+    # How many eval windows fit in one train stride
+    assert train_stride % eval_stride == 0, f"train_stride ({train_stride}) must be divisible by eval_stride ({eval_stride})"
+    evals_per_train = train_stride // eval_stride
+
     log0(f"Model: dim={model_cfg['model_dim']} arch={model_cfg.get('architecture', 'unknown')}")
-    log0(f"Depth: base={base_depth} max={max_depth} stride={stride}")
+    log0(f"  blocks: {model_cfg.get('num_entry_blocks', 1)}+{model_cfg.get('num_recurrent_blocks', 1)}+{model_cfg.get('num_exit_blocks', 1)}")
+    log0(f"Depth: base_eval={base_depth} max={max_depth}")
+    log0(f"Strides: eval={eval_stride} train={train_stride} evals_per_train={evals_per_train}")
 
     # --- Build model ---
     model = GPT(
@@ -149,7 +150,10 @@ def main() -> None:
         bigram_dim=model_cfg.get("bigram_dim", 128),
         rope_dims=model_cfg.get("rope_dims", 0),
         ln_scale=model_cfg.get("ln_scale", False),
-        mean_depth=model_cfg.get("mean_depth", 8),
+        mean_depth=model_cfg.get("mean_depth", 3),
+        num_entry_blocks=model_cfg.get("num_entry_blocks", 2),
+        num_exit_blocks=model_cfg.get("num_exit_blocks", 2),
+        num_recurrent_blocks=model_cfg.get("num_recurrent_blocks", 3),
     ).to(device).bfloat16()
 
     for mod in model.modules():
@@ -165,9 +169,9 @@ def main() -> None:
     trainable_names = []
     for name, param in model.named_parameters():
         freeze = False
-        if cfg.freeze_entry and name.startswith("entry_block."):
+        if cfg.freeze_entry and name.startswith("entry_blocks."):
             freeze = True
-        elif cfg.freeze_exit and name.startswith("exit_block."):
+        elif cfg.freeze_exit and name.startswith("exit_blocks."):
             freeze = True
         elif cfg.freeze_embeddings and (
             name.startswith("tok_emb.") or name.startswith("bigram.") or name.startswith("smear.")
@@ -198,147 +202,80 @@ def main() -> None:
     total_val_tokens = val_tokens.numel() - 1
     log0(f"Val tokens: {total_val_tokens}")
 
-    # --- Build sliding windows and partition across ranks ---
-    window_starts = [ws for ws in range(0, total_val_tokens, stride)
-                     if min(ws + seq_len, total_val_tokens) - ws >= 1]
-    total_windows = len(window_starts)
-    my_s = (total_windows * rank) // world_size
-    my_e = (total_windows * (rank + 1)) // world_size
-    my_windows = window_starts[my_s:my_e]
-    log0(f"Rank {rank}: windows [{my_s}, {my_e}) = {len(my_windows)} windows")
+    # --- Partition val tokens across ranks ---
+    # Each rank gets a contiguous chunk. We process left-to-right within that chunk.
+    per_rank = total_val_tokens // world_size
+    rank_start = rank * per_rank
+    rank_end = (rank + 1) * per_rank if rank < world_size - 1 else total_val_tokens
+    rank_tokens = rank_end - rank_start
+    log0(f"Rank {rank}: tokens [{rank_start}, {rank_end}) = {rank_tokens}")
 
     # --- Accumulators ---
     nll_accum = torch.zeros((), device=device, dtype=torch.float64)
     bytes_accum = torch.zeros((), device=device, dtype=torch.float64)
     tokens_accum = torch.zeros((), device=device, dtype=torch.float64)
 
-    # Per-depth tracking
     depth_nll: dict[int, float] = defaultdict(float)
     depth_bytes: dict[int, float] = defaultdict(float)
     depth_tokens: dict[int, int] = defaultdict(int)
 
-    # Adaptive depth state
-    current_depth = base_depth
-    # Recent batch losses for depth probing
-    recent_losses: list[float] = []
+    # --- Adaptive depth state ---
+    eval_depth = base_depth
+    train_depth = eval_depth + 1  # always train one step ahead
 
-    step = 0
+    train_step = 0
+    eval_step = 0
     t_start = time.perf_counter()
     model.train()
 
-    for bi in range(0, len(my_windows), cfg.ttt_batch_seqs):
-        batch_ws = my_windows[bi:bi + cfg.ttt_batch_seqs]
-        bsz = len(batch_ws)
-        t_step = time.perf_counter()
+    # --- Scoring helper (no grad) ---
+    def score_window(ws: int, depth: int) -> tuple[float, float, int]:
+        """Score the last eval_stride tokens of the window [ws, ws+seq_len).
+        Returns (nll_sum, bytes_sum, n_tokens). Does NOT train."""
+        end = min(ws + seq_len, rank_end)
+        wlen = end - ws
+        if wlen < 1:
+            return 0.0, 0.0, 0
+        chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+        x = chunk[:-1].unsqueeze(0)
+        y = chunk[1:].unsqueeze(0)
 
-        # --- Build batch ---
-        x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-        y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-        wlens: list[int] = []
-        for i, ws in enumerate(batch_ws):
-            end = min(ws + seq_len, total_val_tokens)
-            wlen = end - ws
-            wlens.append(wlen)
-            chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
-            x_batch[i, :wlen] = chunk[:-1]
-            y_batch[i, :wlen] = chunk[1:]
-
-        # --- Adaptive depth probing ---
-        if (step > cfg.ttt_warmup_steps
-                and step % cfg.ttt_depth_probe_every == 0
-                and current_depth < max_depth):
-            # Try current depth +2 on this batch (no grad)
-            probe_depth = min(current_depth + 2, max_depth)
-            with torch.no_grad():
-                model.n_recurrent_iters = probe_depth
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    probe_logits = model.forward_logits(x_batch)
-                probe_nll = F.cross_entropy(
-                    probe_logits.reshape(-1, vocab_size).float(),
-                    y_batch.reshape(-1), reduction="none",
-                ).reshape(bsz, seq_len)
-                # Score only the new tokens (same as main scoring below)
-                probe_loss = 0.0
-                probe_count = 0
-                for i, ws in enumerate(batch_ws):
-                    wlen = wlens[i]
-                    s = 0 if ws == 0 else max(wlen - stride, 0)
-                    probe_loss += probe_nll[i, s:wlen].sum().item()
-                    probe_count += wlen - s
-                probe_avg = probe_loss / max(probe_count, 1)
-
-                # Compare with current depth
-                model.n_recurrent_iters = current_depth
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    curr_logits = model.forward_logits(x_batch)
-                curr_nll = F.cross_entropy(
-                    curr_logits.reshape(-1, vocab_size).float(),
-                    y_batch.reshape(-1), reduction="none",
-                ).reshape(bsz, seq_len)
-                curr_loss = 0.0
-                curr_count = 0
-                for i, ws in enumerate(batch_ws):
-                    wlen = wlens[i]
-                    s = 0 if ws == 0 else max(wlen - stride, 0)
-                    curr_loss += curr_nll[i, s:wlen].sum().item()
-                    curr_count += wlen - s
-                curr_avg = curr_loss / max(curr_count, 1)
-
-            if probe_avg < curr_avg:
-                log0(f"DEPTH UPGRADE: {current_depth} → {probe_depth} "
-                     f"(probe_loss={probe_avg:.4f} < curr_loss={curr_avg:.4f})")
-                current_depth = probe_depth
-            else:
-                log0(f"depth_probe: staying at {current_depth} "
-                     f"(probe={probe_avg:.4f} >= curr={curr_avg:.4f})")
-
-        # --- Set depth ---
-        model.n_recurrent_iters = current_depth
-
-        # --- Forward pass (with gradients for training) ---
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = model.forward_logits(x_batch)
-
-        nll_flat = F.cross_entropy(
+        model.n_recurrent_iters = depth
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model.forward_logits(x)
+        nll = F.cross_entropy(
             logits.reshape(-1, vocab_size).float(),
-            y_batch.reshape(-1), reduction="none",
-        ).reshape(bsz, seq_len)
+            y.reshape(-1), reduction="none",
+        )
+        # Score only the last eval_stride new tokens (or all if first window)
+        s = 0 if ws == rank_start else max(wlen - eval_stride, 0)
+        scored_nll = nll[s:wlen]
+        tgt = y[0, s:wlen]
+        prev = x[0, s:wlen]
+        tb = base_bytes_lut[tgt].to(torch.float64)
+        tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+        return scored_nll.to(torch.float64).sum().item(), tb.sum().item(), wlen - s
 
-        # --- Score only new tokens (sliding window scoring) ---
-        batch_nll_sum = 0.0
-        batch_bytes_sum = 0.0
-        batch_token_count = 0
-        train_nll_list = []
+    # --- Train helper (with grad) ---
+    def train_window(ws: int, depth: int):
+        """Train on the full window [ws, ws+seq_len) at given depth."""
+        end = min(ws + seq_len, rank_end)
+        wlen = end - ws
+        if wlen < 1:
+            return
+        chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+        x = chunk[:-1].unsqueeze(0)
+        y = chunk[1:].unsqueeze(0)
 
-        with torch.no_grad():
-            for i, ws in enumerate(batch_ws):
-                wlen = wlens[i]
-                s = 0 if ws == 0 else max(wlen - stride, 0)
-                scored_nll = nll_flat[i, s:wlen]
-                batch_nll_sum += scored_nll.to(torch.float64).sum().item()
-                batch_token_count += wlen - s
-
-                tgt = y_batch[i, s:wlen]
-                prev = x_batch[i, s:wlen]
-                tb = base_bytes_lut[tgt].to(torch.float64)
-                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                batch_bytes_sum += tb.sum().item()
-
-            nll_accum += batch_nll_sum
-            bytes_accum += batch_bytes_sum
-            tokens_accum += batch_token_count
-            depth_nll[current_depth] += batch_nll_sum
-            depth_bytes[current_depth] += batch_bytes_sum
-            depth_tokens[current_depth] += batch_token_count
-
-        # --- Train on the full window (all tokens, not just scored ones) ---
-        # Use mean NLL over all valid tokens for training signal
-        train_mask = torch.zeros(bsz, seq_len, device=device)
-        for i in range(bsz):
-            train_mask[i, :wlens[i]] = 1.0
-        masked_nll = nll_flat * train_mask
-        loss = masked_nll.sum() / train_mask.sum()
-
+        model.n_recurrent_iters = depth
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model.forward_logits(x)
+        nll = F.cross_entropy(
+            logits.reshape(-1, vocab_size).float(),
+            y.reshape(-1), reduction="none",
+        )
+        # Train on all valid tokens in the window
+        loss = nll[:wlen].mean()
         loss.backward()
         if cfg.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -348,17 +285,85 @@ def main() -> None:
         optimizer.step()
         optimizer.zero_grad()
 
-        step_time = time.perf_counter() - t_step
+    # --- Main loop: left-to-right over rank's token range ---
+    # We advance by eval_stride. Every evals_per_train eval windows, we do one train step.
+    # The train window covers the same rightmost position but with full 2048 context.
+    #
+    # SAFETY: We score all eval windows FIRST, then train on the region we just scored.
+    # The train window's rightmost token = the last eval window's rightmost token.
+    # So we never train on tokens we haven't scored yet.
 
-        # --- Log ---
-        if step % cfg.ttt_log_every == 0:
-            running_bpb = (nll_accum.item() / math.log(2.0)) / max(bytes_accum.item(), 1)
-            batch_bpb = (batch_nll_sum / math.log(2.0)) / max(batch_bytes_sum, 1)
-            log0(f"ttt step:{step} depth:{current_depth} "
-                 f"batch_bpb:{batch_bpb:.4f} running_bpb:{running_bpb:.4f} "
-                 f"tokens:{int(tokens_accum.item())} step_ms:{1000*step_time:.0f}")
+    # Track furthest scored position for safety
+    scored_up_to = rank_start  # exclusive: all tokens before this have been scored
 
-        step += 1
+    eval_pos = rank_start  # next eval window start position
+    evals_since_train = 0
+
+    while eval_pos < rank_end:
+        # --- Score one eval window ---
+        nll_sum, bytes_sum, n_tok = score_window(eval_pos, eval_depth)
+
+        nll_accum += nll_sum
+        bytes_accum += bytes_sum
+        tokens_accum += n_tok
+        depth_nll[eval_depth] += nll_sum
+        depth_bytes[eval_depth] += bytes_sum
+        depth_tokens[eval_depth] += n_tok
+
+        # Update scored frontier
+        scored_end = min(eval_pos + seq_len, rank_end)
+        new_scored_to = min(eval_pos + seq_len, rank_end)
+        if new_scored_to > scored_up_to:
+            scored_up_to = new_scored_to
+
+        eval_pos += eval_stride
+        evals_since_train += 1
+        eval_step += 1
+
+        # --- Train after every evals_per_train eval windows ---
+        if evals_since_train >= evals_per_train:
+            evals_since_train = 0
+
+            # Train window: ends at scored_up_to, starts seq_len earlier
+            train_end = scored_up_to
+            train_ws = max(train_end - seq_len, rank_start)
+
+            # SAFETY CHECK: we only train on tokens up to scored_up_to
+            assert train_ws + seq_len <= scored_up_to + 1, \
+                f"Safety violation: training beyond scored frontier! train_end={train_ws+seq_len} scored_up_to={scored_up_to}"
+
+            train_window(train_ws, train_depth)
+            train_step += 1
+
+            # --- Depth probing ---
+            if (train_step > cfg.ttt_warmup_steps
+                    and train_step % cfg.ttt_depth_probe_every == 0
+                    and train_depth <= max_depth):
+                # Probe: does train_depth now beat eval_depth for scoring?
+                # Use the most recent eval window position for comparison
+                probe_ws = max(eval_pos - eval_stride, rank_start)
+                probe_nll_new, _, probe_n = score_window(probe_ws, train_depth)
+                probe_nll_cur, _, _ = score_window(probe_ws, eval_depth)
+                if probe_n > 0:
+                    avg_new = probe_nll_new / probe_n
+                    avg_cur = probe_nll_cur / probe_n
+                    if avg_new < avg_cur:
+                        log0(f"DEPTH UPGRADE: eval {eval_depth}→{train_depth} "
+                             f"(train_depth_loss={avg_new:.4f} < eval_depth_loss={avg_cur:.4f})")
+                        eval_depth = train_depth
+                        train_depth = min(eval_depth + 1, max_depth)
+                    else:
+                        log0(f"depth_probe: staying eval={eval_depth} train={train_depth} "
+                             f"(probe={avg_new:.4f} >= curr={avg_cur:.4f})")
+
+            # --- Log ---
+            if train_step % cfg.ttt_log_every == 0:
+                running_bpb = (nll_accum.item() / math.log(2.0)) / max(bytes_accum.item(), 1)
+                elapsed = time.perf_counter() - t_start
+                log0(f"train_step:{train_step} eval_step:{eval_step} "
+                     f"eval_depth:{eval_depth} train_depth:{train_depth} "
+                     f"running_bpb:{running_bpb:.4f} "
+                     f"tokens:{int(tokens_accum.item())} elapsed:{elapsed:.0f}s")
 
     total_time = time.perf_counter() - t_start
 
@@ -372,8 +377,8 @@ def main() -> None:
 
     log0(f"\n{'='*80}")
     log0(f"FUSED TTT COMPLETE: bpb={final_bpb:.6f} tokens={int(tokens_accum.item())} "
-         f"time={total_time:.1f}s steps={step}")
-    log0(f"\nPER-DEPTH BREAKDOWN:")
+         f"time={total_time:.1f}s train_steps={train_step} eval_steps={eval_step}")
+    log0(f"\nPER-DEPTH BREAKDOWN (eval depth):")
     for d in sorted(depth_tokens.keys()):
         d_bpb = (depth_nll[d] / math.log(2.0)) / depth_bytes[d] if depth_bytes[d] > 0 else float("inf")
         log0(f"  depth={d}: bpb={d_bpb:.6f} tokens={depth_tokens[d]}")
