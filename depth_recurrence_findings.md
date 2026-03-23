@@ -408,6 +408,80 @@ Late QAT at step 3017. EMA applied.
 - dim=640: fits at int8 (18.6MB) but not int6 (16.6MB zlib). Gets 4085 steps but int6 penalty is large.
 - Need a dim between 640-768, OR fix int6 penalty, OR use int8 on recurrent + int6 on entry/exit (original plan)
 
+## Run 12: TTT Baseline + Depth Extension Experiments (2026-03-23)
+
+### Training (Run 12)
+
+**Config:** Same as Run 7b — 2 entry (4x MLP) + 2 recurrent (3x MLP, ×N) + 2 exit (4x MLP). dim=640, 10 heads, 5 KV heads. Log-normal Poisson(mean=5, σ=0.5). Geiping-style input injection. EMA, late QAT. Seed 1337.
+
+**Training:** 4056 steps, 1200s wallclock, ~296ms/step avg. 27.2M params. Matches Run 7b trajectory (same seed).
+
+| Step | Val BPB | Step Avg |
+|------|---------|----------|
+| 1000 | 1.3541  | 299ms    |
+| 2000 | 1.2859  | 298ms    |
+| 3000 | 1.2329  | 297ms    |
+| 4000 | 1.1733  | 296ms    |
+| 4056 | 1.1718  | 296ms    |
+
+**Depth sweep (int6+zlib quantized):**
+| Depth | BPB     |
+|-------|---------|
+| 2     | 1.2125  |
+| 3     | 1.1957  |
+| 4     | 1.1901  |
+| 5     | 1.1889  |
+| 6     | 1.1883  |
+| 7     | 1.1880  |
+| 8     | 1.1879  |
+
+Classic fixed-point plateau: depth 5→8 gains only 0.001 BPB. Sliding window (depth 5, stride 64): **1.1642 BPB**.
+
+### TTT Experiment A: Decayed Input Injection + Full Recurrent Block TTT
+
+**Approach (Path B):** At eval time, decay input injection strength at iterations beyond the training mean (depth 5). Iterations 0-4 get full injection (α=1.0). Iterations 5-9 get linearly decaying injection (α from 1.0→0.2). This breaks the fixed point, and gradient updates on the val tokens teach the recurrent block what to do in the newly opened depth range.
+
+**Safety:** Score-then-train per chunk. Each token's BPB is recorded BEFORE the model trains on that chunk. Only the inline BPB is a valid competition metric.
+
+**TTT Run 1:** Freeze entry/exit/embeddings, train recurrent + inject_adapter only (8.2M trainable = 30%). lr=1e-4, AdamW. 1893 steps over 62M val tokens at batch_size=4 seqs.
+
+**TTT Run 2:** Same but unfreezing exit blocks. lr=5e-5.
+
+**Inline BPB results (the only valid metric):**
+
+| Phase | Depth | TTT Run 1 | TTT Run 2 | Baseline (no TTT) |
+|-------|-------|-----------|-----------|-------------------|
+| Warmup | 5 | 1.179 | 1.175 | 1.173 |
+| Ramp | 6-9 | 1.217 | 1.216 | — |
+| Steady | 10 | 1.230 | 1.233 | — |
+| **Overall** | **mixed** | **1.225** | **1.230** | **1.173** |
+
+**Conclusion: Depth extension TTT FAILED.**
+
+The inline BPB at the warmup phase (depth 5) roughly matches baseline (~1.175-1.179), confirming the score-then-train procedure works correctly. But the moment depth increases beyond 5, performance degrades monotonically. TTT gradient updates on 62M tokens (1893 steps) are nowhere near sufficient to teach the recurrent block productive behavior at higher depths.
+
+### Root Cause Analysis
+
+1. **Contraction mapping is deeply baked.** The model was trained on 3.2B tokens with input injection creating a contraction map to a fixed point by depth ~5. 62M tokens of TTT (1/50th of training data) cannot overcome this. The recurrent block's weights are optimized to produce near-identity transforms after the fixed point — TTT would need to fundamentally restructure the weight matrices.
+
+2. **Injection decay creates noise, not signal.** Decaying injection doesn't "unlock" productive computation. It removes the stabilizing anchor, causing representations to drift into regions the model was never trained on. The recurrent blocks literally don't know what to do without injection — they were never asked to during training.
+
+3. **Exit block mismatch is secondary.** Unfreezing exit blocks (Run 2) barely changed results (+0.005 BPB difference). The problem is upstream: the recurrent block itself can't produce useful representations at depth >5 regardless of how the exit block decodes them.
+
+4. **The fixed point is a feature, not a bug.** Input injection was designed (Geiping et al. 2025) to prevent drift and ensure stability. It works perfectly — too perfectly for depth extension. The model converges by design, and any attempt to extend beyond convergence fights the architecture.
+
+### Implications for Future Work
+
+**Path B (decayed injection TTT) is a dead end** for this architecture. The hypothesis that we could "break the fixed point and teach new behavior" fails because:
+- The recurrent block has no latent capacity for deeper computation — it was trained to converge, not to refine
+- TTT on 62M tokens is 1-2 orders of magnitude too little data to restructure learned dynamics
+
+**Path A (train without injection) may still work** but requires a new training run and faces the fundamental problem from the earlier analysis: without injection, depth degrades gently (Run 2: +0.024 from depth 8→20) but absolute performance is much worse (1.22 vs 1.17 BPB).
+
+**The most promising remaining direction for depth recurrence + TTT would be:**
+- Train with a **learned/adaptive injection scale** (per-iteration, conditioned on iteration index via adaLN, as in LoopFormer) so the model learns when to use injection and when to compute freely
+- Or abandon depth extension TTT entirely and use standard TTT (LoRA adaptation to val distribution at fixed depth) which has proven ~0.01-0.03 BPB gains in the competition
+
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
 - **1.1248 BPB** (target to beat)

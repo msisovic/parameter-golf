@@ -856,6 +856,8 @@ class GPT(nn.Module):
 
         # Number of recurrent iterations (set externally before each forward)
         self.n_recurrent_iters = 4
+        # Injection decay scales (None = full injection; list of floats for TTT depth extension)
+        self.inject_scales: list[float] | None = None
 
         self._init_weights()
 
@@ -892,15 +894,30 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def _run_recurrence(self, x: Tensor, e: Tensor) -> Tensor:
-        """Run recurrent block group with input injection and truncated backprop."""
+        """Run recurrent block group with input injection and truncated backprop.
+
+        When self.inject_scales is set (list of floats, one per iteration),
+        injection is blended: x = alpha * inject(cat(x,e)) + (1-alpha) * x.
+        Used for TTT depth extension where alpha < 1 at iterations beyond the
+        training mean to break the fixed point.
+        """
         k = self.truncated_backprop_k
         n = self.n_recurrent_iters
+        scales = self.inject_scales  # None during training (torch.compile traces this branch)
         for i in range(n):
             # Truncated backprop: detach before the last k iterations
             if i == n - k and n > k:
                 x = x.detach()
-            # Input injection: concat state with entry encoding, project down
-            x = self.inject_adapter(torch.cat([x, e], dim=-1))
+            # Input injection (with optional decay for TTT depth extension)
+            if scales is None:
+                x = self.inject_adapter(torch.cat([x, e], dim=-1))
+            else:
+                injected = self.inject_adapter(torch.cat([x, e], dim=-1))
+                alpha = scales[i]
+                if alpha >= 1.0:
+                    x = injected
+                else:
+                    x = alpha * injected + (1.0 - alpha) * x
             # Run all recurrent blocks in the group
             for block in self.recurrent_blocks:
                 x = block(x)
@@ -1477,6 +1494,26 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
+
+        # Save TTT-ready checkpoint with config for eval_ttt.py
+        ttt_config = {
+            "vocab_size": args.vocab_size, "model_dim": args.model_dim,
+            "num_heads": args.num_heads, "num_kv_heads": args.num_kv_heads,
+            "mlp_mult": args.mlp_mult, "tie_embeddings": args.tie_embeddings,
+            "tied_embed_init_std": args.tied_embed_init_std,
+            "logit_softcap": args.logit_softcap, "rope_base": args.rope_base,
+            "qk_gain_init": args.qk_gain_init,
+            "bigram_vocab_size": args.bigram_vocab_size, "bigram_dim": args.bigram_dim,
+            "rope_dims": args.rope_dims, "mean_depth": args.recurrent_mean_depth,
+            "num_entry_blocks": args.num_entry_blocks,
+            "num_exit_blocks": args.num_exit_blocks,
+            "num_recurrent_blocks": args.num_recurrent_blocks,
+            "entry_mlp_mult": args.entry_mlp_mult, "exit_mlp_mult": args.exit_mlp_mult,
+            "eval_recurrent_depth": args.eval_recurrent_depth,
+            "eval_seq_len": effective_eval_seq_len, "eval_stride": args.eval_stride,
+        }
+        torch.save({"model_state_dict": export_sd, "config": ttt_config}, "ttt_checkpoint.pt")
+        log0(f"Saved TTT checkpoint: ttt_checkpoint.pt")
 
     # Mixed quantization: int6 for entry/exit blocks, int8 for recurrent + embeddings
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
