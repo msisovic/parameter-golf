@@ -1,6 +1,8 @@
 """
-train_gpt_submit.py — Submission v2: wider MLP + STE int6 QAT + MTP + seq2048 + NTK RoPE +
-fp16 embed + late-K passthrough + sliding window eval.
+train_gpt_submit.py — Recurrent U-Net: 1 entry + 2 encoder (×N) + 2 decoder (×N) + 1 exit.
+Encoder-decoder recurrence with U-net skip connections. Weight-shared within each group.
+Keeps: attn_scale, mlp_scale, resid_mix/x0, XSA, EMA, late QAT, Muon, partial RoPE,
+sliding window eval, relu² MLP, QK RMSNorm, logit softcap, SmearGate, BigramHash.
 """
 
 from __future__ import annotations
@@ -69,14 +71,28 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 640))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Recurrent U-Net structure: 1 entry + 2 encoder (×N) + 2 decoder (×N) + 1 exit
+    num_entry_blocks = int(os.environ.get("NUM_ENTRY_BLOCKS", 1))
+    num_encoder_recurrent = int(os.environ.get("NUM_ENCODER_RECURRENT", 2))
+    num_decoder_recurrent = int(os.environ.get("NUM_DECODER_RECURRENT", 2))
+    num_exit_blocks = int(os.environ.get("NUM_EXIT_BLOCKS", 1))
+
+    # Depth recurrence (log-normal Poisson sampling)
+    recurrent_mean_depth = int(os.environ.get("RECURRENT_MEAN_DEPTH", 3))
+    recurrent_min_depth = int(os.environ.get("RECURRENT_MIN_DEPTH", 1))
+    recurrent_max_depth = int(os.environ.get("RECURRENT_MAX_DEPTH", 12))
+    recurrent_depth_sigma = float(os.environ.get("RECURRENT_DEPTH_SIGMA", 0.5))
+    eval_recurrent_depth = int(os.environ.get("EVAL_RECURRENT_DEPTH", 3))
+    truncated_backprop_k = int(os.environ.get("TRUNCATED_BACKPROP_K", 8))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -725,8 +741,6 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         rope_dims: int = 0,
-        layer_idx: int = 0,
-        ln_scale: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -736,15 +750,13 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        s = self.ln_scale_factor
-        attn_out = self.attn(self.attn_norm(x) * s)
+        attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -752,7 +764,7 @@ class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        num_layers: int,
+        num_layers: int,  # kept for compat but ignored; structure set by block counts
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -768,7 +780,12 @@ class GPT(nn.Module):
         bigram_dim: int = 128,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
-        ln_scale: bool = False,
+        num_entry_blocks: int = 1,
+        num_encoder_recurrent: int = 2,
+        num_decoder_recurrent: int = 2,
+        num_exit_blocks: int = 1,
+        mean_depth: int = 3,
+        truncated_backprop_k: int = 8,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -778,29 +795,30 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
+        self.mean_depth = mean_depth
+        self.truncated_backprop_k = truncated_backprop_k
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                    rope_dims=rope_dims,
-                    layer_idx=i,
-                    ln_scale=ln_scale,
-                )
-                for i in range(num_layers)
-            ]
-        )
+
+        block_args = dict(dim=model_dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                          mlp_mult=mlp_mult, rope_base=rope_base, qk_gain_init=qk_gain_init,
+                          rope_dims=rope_dims)
+
+        # 1 entry + 2 encoder_recurrent (×N) + 2 decoder_recurrent (×N) + 1 exit
+        self.entry_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_entry_blocks)])
+        self.encoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_encoder_recurrent)])
+        self.decoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_decoder_recurrent)])
+        self.exit_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_exit_blocks)])
+
+        # U-net skip weight: single learned per-dim weight for skip connections
+        self.skip_weight = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+
+        # XSA on exit blocks
+        if xsa_last_n > 0:
+            for block in self.exit_blocks[-xsa_last_n:]:
+                block.attn.use_xsa = True
+
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -810,15 +828,18 @@ class GPT(nn.Module):
         )
         for head in self.mtp_heads:
             head._zero_init = True
-        if xsa_last_n > 0:
-            for i in range(max(0, num_layers - xsa_last_n), num_layers):
-                self.blocks[i].attn.use_xsa = True
+
+        # Number of recurrent iterations (set externally before each forward)
+        self.n_recurrent_iters = mean_depth
+
         self._init_weights()
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        num_layers = len(self.blocks)
+        # Effective layer count for proj scaling
+        n_eff = (len(self.entry_blocks) + len(self.encoder_blocks) * self.mean_depth
+                 + len(self.decoder_blocks) * self.mean_depth + len(self.exit_blocks))
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -827,7 +848,39 @@ class GPT(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=1.0)
                     if ".proj." in name or name.endswith(".proj"):
                         with torch.no_grad():
-                            module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
+                            module.weight.mul_(1.0 / math.sqrt(2 * n_eff))
+
+    def _run_body(self, x: Tensor, x0: Tensor) -> Tensor:
+        """Entry → Encoder recurrence → Decoder recurrence with U-net skips → Exit."""
+        # Entry
+        for block in self.entry_blocks:
+            x = block(x, x0)
+
+        # Encoder recurrence: N iterations of encoder_blocks, save states for skips
+        n = self.n_recurrent_iters
+        k = self.truncated_backprop_k
+        encoder_states: list[Tensor] = []
+        for i in range(n):
+            if i == n - k and n > k:
+                x = x.detach()
+            for block in self.encoder_blocks:
+                x = block(x, x0)
+            encoder_states.append(x)
+
+        # Decoder recurrence: N iterations of decoder_blocks with U-net skip from mirror encoder
+        sw = self.skip_weight.to(dtype=x.dtype)[None, None, :]
+        for i in range(n):
+            if i == n - k and n > k:
+                x = x.detach()
+            skip = encoder_states[n - 1 - i]
+            x = x + sw * skip
+            for block in self.decoder_blocks:
+                x = block(x, x0)
+
+        # Exit
+        for block in self.exit_blocks:
+            x = block(x, x0)
+        return x
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -836,15 +889,8 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        skips: list[Tensor] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self._run_body(x, x0)
 
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -885,14 +931,7 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self._run_body(x, x0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1014,12 +1053,6 @@ def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     return q, scale
 
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
-    num_layers_total = max(
-        (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
-        default=0,
-    ) + 1
-    late_k_layers = set(range(num_layers_total - 2, num_layers_total))
-
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -1189,7 +1222,12 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
-        ln_scale=args.ln_scale,
+        num_entry_blocks=args.num_entry_blocks,
+        num_encoder_recurrent=args.num_encoder_recurrent,
+        num_decoder_recurrent=args.num_decoder_recurrent,
+        num_exit_blocks=args.num_exit_blocks,
+        mean_depth=args.recurrent_mean_depth,
+        truncated_backprop_k=args.truncated_backprop_k,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1203,7 +1241,11 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    all_block_groups = [base_model.entry_blocks, base_model.encoder_blocks,
+                        base_model.decoder_blocks, base_model.exit_blocks]
+    block_named_params = []
+    for group in all_block_groups:
+        block_named_params.extend(list(group.named_parameters()))
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1216,8 +1258,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    scalar_params.append(base_model.skip_weight)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
@@ -1278,6 +1319,16 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"recurrent_unet: entry={args.num_entry_blocks} enc={args.num_encoder_recurrent}×N "
+         f"dec={args.num_decoder_recurrent}×N exit={args.num_exit_blocks} "
+         f"mean_depth={args.recurrent_mean_depth} eval_depth={args.eval_recurrent_depth}")
+
+    # Depth sampling: log-normal Poisson (Geiping et al. 2025)
+    def sample_depth() -> int:
+        log_mean = math.log(max(args.recurrent_mean_depth, 1))
+        lam = math.exp(random.gauss(log_mean, args.recurrent_depth_sigma))
+        d = max(1, int(random.gauss(lam, math.sqrt(lam)) + 0.5))  # Poisson approx via Gaussian
+        return max(args.recurrent_min_depth, min(d, args.recurrent_max_depth))
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1302,13 +1353,22 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    # Pre-compile all depth variants to avoid lazy recompilation during training
+    all_depths = list(range(args.recurrent_min_depth, args.recurrent_max_depth + 1))
+    torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, len(all_depths) + 10)
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        depth_idx = 0
         for warmup_step in range(args.warmup_steps):
+            # Cycle through different depths to pre-compile each variant
+            d = all_depths[depth_idx % len(all_depths)]
+            base_model.n_recurrent_iters = d
+            depth_idx += 1
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -1321,7 +1381,9 @@ def main() -> None:
                 opt.step()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps} depth:{d}")
+        log0(f"warmup:compiled {len(all_depths)} depth variants (depths {all_depths})")
+        base_model.n_recurrent_iters = args.eval_recurrent_depth
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1352,6 +1414,7 @@ def main() -> None:
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
+            base_model.n_recurrent_iters = args.eval_recurrent_depth
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
@@ -1387,6 +1450,9 @@ def main() -> None:
         if args.late_qat and scale < qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+        # Sample random depth for this training step
+        train_depth = sample_depth()
+        base_model.n_recurrent_iters = train_depth
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1521,13 +1587,19 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
-        ln_scale=args.ln_scale,
+        num_entry_blocks=args.num_entry_blocks,
+        num_encoder_recurrent=args.num_encoder_recurrent,
+        num_decoder_recurrent=args.num_decoder_recurrent,
+        num_exit_blocks=args.num_exit_blocks,
+        mean_depth=args.recurrent_mean_depth,
+        truncated_backprop_k=args.truncated_backprop_k,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
+    eval_model.n_recurrent_iters = args.eval_recurrent_depth
     compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
 
     # Standard non-overlapping eval (sanity check)
