@@ -1555,6 +1555,22 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
 
+    # Pre-quant sliding window eval (to measure quantization penalty)
+    base_model.n_recurrent_iters = args.eval_recurrent_depth
+    sw_seq_len = effective_eval_seq_len
+    if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+        torch.cuda.synchronize()
+        t_prequant = time.perf_counter()
+        pq_val_loss, pq_val_bpb = eval_val_sliding(
+            args, base_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride, eval_seq_len=sw_seq_len,
+        )
+        torch.cuda.synchronize()
+        log0(f"final_prequant_sliding_window val_loss:{pq_val_loss:.4f} val_bpb:{pq_val_bpb:.4f} "
+             f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_prequant):.0f}ms")
+        log0(f"final_prequant_sliding_window_exact val_loss:{pq_val_loss:.8f} val_bpb:{pq_val_bpb:.8f}")
+
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
     quant_buf = io.BytesIO()
