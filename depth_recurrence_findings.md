@@ -482,6 +482,61 @@ The inline BPB at the warmup phase (depth 5) roughly matches baseline (~1.175-1.
 - Train with a **learned/adaptive injection scale** (per-iteration, conditioned on iteration index via adaLN, as in LoopFormer) so the model learns when to use injection and when to compute freely
 - Or abandon depth extension TTT entirely and use standard TTT (LoRA adaptation to val distribution at fixed depth) which has proven ~0.01-0.03 BPB gains in the competition
 
+## Run 13: No-injection dim=768 + Fused TTT (2024-03-23)
+
+**Architecture:** 1 entry + 1 recurrent (x0 residual, NO input injection) + 1 exit, dim=768, 12 heads, 6 KV heads. 17.1M params. Log-normal Poisson depth sampling (mean=8, σ=0.5). EMA, late QAT, Muon.
+
+**Training:** 4084 steps in 1200s on 4xH100 (~294ms/step). Seed 1337.
+
+**Training trajectory:**
+| Step | Val BPB | Train Time |
+|------|---------|------------|
+| 1000 | 1.3625  | 376s       |
+| 2000 | 1.2984  | 647s       |
+| 3000 | 1.2570  | 910s       |
+| 4000 | 1.2145  | 1179s      |
+| 4084 | **1.2128** | 1200s   |
+
+Int8 roundtrip: 1.2144 BPB. Submission size: 13.75MB (well under 16MB).
+
+**Depth sweep (no TTT):**
+| Depth | BPB    | Delta vs 8 |
+|-------|--------|------------|
+| 2     | 1.2888 | +0.0744    |
+| 4     | 1.2297 | +0.0153    |
+| 6     | 1.2171 | +0.0027    |
+| 8     | 1.2144 | baseline   |
+| 10    | 1.2142 | -0.0002    |
+| 12    | 1.2153 | +0.0009    |
+| 16    | 1.2197 | +0.0053    |
+| 20    | 1.2261 | +0.0117    |
+
+Peak at depth 10. Very flat from 6-12. Gentle degradation beyond, much better than injection model.
+
+### Fused TTT Experiment
+
+**Config:** LR=1e-4, stride=256, batch_seqs=8, depth_probe_every=50, warmup=100 steps. Freeze entry/exit/embeddings, train only recurrent block (31.1% of params = 5.3M). AdamW optimizer.
+
+**Results:** ~7550 steps, ~35 min on 4xH100.
+- Baseline (depth 8, no TTT): **1.2144 BPB**
+- Fused TTT (adaptive depth): **~1.2057 BPB**
+- **Improvement: -0.0087 BPB (0.7%)**
+
+**Adaptive depth progression:** 8 → 10 (step ~100) → 12 (step ~400) → 14 (step ~5000). Probes to 16 consistently failed.
+
+**Analysis:**
+1. TTT works on no-injection model — consistent 0.009 BPB improvement
+2. Adaptive depth climbs to 14 (1.75× base depth), confirming TTT can teach productive computation at higher depths
+3. But the improvement is modest (0.009 vs the 0.02-0.03 reported for standard LoRA TTT)
+4. Runtime is problematic: ~35 min far exceeds the 20-min competition budget
+5. The depth probing overhead adds ~25% to step time (extra forward pass every 50 steps)
+
+### Key Insight
+
+The fundamental problem is that **TTT on the recurrent block trains one shared weight matrix that must work at ALL depths simultaneously**. When you optimize for depth 14, you may slightly hurt depth 8 performance. This "interference" between depths limits the gains. Standard TTT (LoRA at fixed depth) avoids this by not changing depth semantics.
+
+**Verdict: Depth-recurrence TTT gives real but small gains (0.009 BPB) at high cost (35 min). Not competitive with standard LoRA TTT (0.02-0.03 BPB in ~10 min) for competition purposes.** The no-injection architecture is interesting for parameter efficiency (13.75MB for 1.2144 BPB) but the TTT angle doesn't justify the complexity.
+
 ## Reference: Baseline
 - 9 specialized layers, U-net skips, int6 quantization
 - **1.1248 BPB** (target to beat)
