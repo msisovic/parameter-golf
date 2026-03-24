@@ -415,6 +415,47 @@ fewer entry/exit blocks. 10 effective layers (vs 12 in Run 11).
 | U-Net Run 11 (2+2s+2 d=2 dim=704) | 1.1376 | 1.1469 | 0.009 | 16.2MB | 4012 | 300 |
 | U-Net Run 12 (1+4s+1 d=1 dim=704) | 1.1361 | 1.1448 | 0.009 | ~16MB | 4770 | 252 |
 
+## Run 13: Flat U-net 1+3×3+1 dim=768 depth=3, 1200s
+
+**Config:** Flat U-net architecture: 1 entry + 3 shared blocks × 3 iterations + 1 exit = 11 effective layers.
+dim=768, 5 unique blocks. Per-application control params (9 sets). U-net skips at block-application
+level: 4 encoder + 1 bottleneck + 4 decoder. XSA on shared blocks. 28M total params (but only
+~10M unique due to sharing). FLAT_UNET=1, SHARED_RECURRENT=1.
+
+**Training:**
+| Step | Val BPB | Run 11 (300ms) | Run 12 (252ms) |
+|------|---------|----------------|----------------|
+| 1000 | 1.2915  | 1.2977         | 1.2980         |
+| 2000 | 1.2424  | 1.2451         | 1.2475         |
+| 3000 | 1.2269  | 1.2207         | 1.2327         |
+| 4000 | 1.1657  | 1.1588         | 1.2038         |
+| 4208 | 1.1553  | -              | -              |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1351** (stride 64)
+- Int6 roundtrip BPB: **1.1694** (standard eval)
+- Int6 sliding window BPB: **1.1464** (stride 64)
+- **Quant penalty: 0.034** (1.1351 → 1.1694 roundtrip, 0.011 sliding window)
+- Step avg: 285ms, 4208 steps in 1200s
+- Model size: **16.09MB** int6+zlib (16.18MB with code) — barely over 16MB budget
+
+**Observations:**
+1. **Flat U-net works well pre-quant** — 1.1351 is the second-best pre-quant result after Run 9 (1.1289).
+2. **Quantization penalty is severe (0.034 roundtrip)** — depth=3 shared blocks mean each weight error is amplified 3×. This is the worst quant penalty across all runs.
+3. **Per-step convergence is strong** — beats Run 11 and Run 12 at steps 1000-2000, falls behind Run 11 at step 3000 (11 vs 12 effective layers).
+4. **dim=768 with 5 unique blocks nearly fits budget** at 16.09MB. Could use zstd (currently zlib) or trim dim slightly.
+5. **Architecture validated** — fine-grained U-net skips at block-application level work well.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Quant Δ | Size | Steps | ms/step |
+|---|---|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~0.007 | ~16MB | ~6000+ | ~100 |
+| **U-Net Run 9 (2+2+2+2 d=2)** | **1.1289** | **1.1368** | **0.008** | **18.1MB** | 4739 | 253 |
+| U-Net Run 10 (2+1+1+2 d=4 dim=704) | 1.1422 | 1.1527 | 0.011 | ~18MB | 4068 | 295 |
+| U-Net Run 11 (2+2s+2 d=2 dim=704) | 1.1376 | 1.1469 | 0.009 | 16.2MB | 4012 | 300 |
+| U-Net Run 12 (1+4s+1 d=1 dim=704) | 1.1361 | 1.1448 | 0.009 | ~16MB | 4770 | 252 |
+| Flat Run 13 (1+3×3+1 d=3 dim=768) | 1.1351 | 1.1464 | 0.034 | 16.1MB | 4208 | 285 |
+
 ## Key Insights
 
 1. **U-Net skips work well in recurrent setting.** The encoder-decoder structure with skip connections gives depth-dependent information flow without the fixed-point problem of input injection.
@@ -439,9 +480,13 @@ fewer entry/exit blocks. 10 effective layers (vs 12 in Run 11).
 
 11. **Effective layer count matters.** Run 12 (10 layers, 252ms) couldn't match Run 9 (12 layers, 253ms) despite identical speed. 12 effective layers at depth=2 is the sweet spot for this architecture.
 
+12. **Flat U-net architecture is promising but quant-limited.** Run 13's fine-grained block-level skips work well pre-quant (1.1351, second-best), but depth=3 shared weights amplify quant error 3× (0.034 penalty). Width (dim=768) helps pre-quant but doesn't offset the quant penalty vs shallower depth.
+
+13. **Depth vs width tradeoff.** More effective layers (depth) beats wider layers for per-step convergence. Run 11 (12 layers, dim=704) beats Run 13 (11 layers, dim=768) at step 3000+. But depth amplifies quant penalty.
+
 ## Next Steps to Consider
 
-- **Shared recurrent at dim=640 depth=2**: same speed as Run 9 (253ms), 12 effective layers, smaller model (~14MB, room to grow dim). The definitive test of sharing.
-- **Reduce model size**: Run 9 is 18.1MB, need 16MB. Shared blocks at dim=640 naturally fit. Or mixed int8/int6.
-- **GPTQ**: smarter post-training quantization to reduce quant penalty
-- **LoRA TTT to patch quant error**: small LoRA at eval time on the quantized model
+- **Flat U-net at depth=2**: 1+3×2+1 = 9 layers, reduces quant penalty from 3× to 2×. Or 1+4×2+1 = 11 layers at depth=2 to match layer count.
+- **Flat U-net with more blocks, less depth**: e.g., 1+5×2+1 = 13 layers at depth=2, dim=680-700. More layers, lower quant penalty, fits budget.
+- **GPTQ or better quantization**: the pre-quant results are strong — reducing quant penalty is the highest-leverage improvement.
+- **Reduce model size**: zstd instead of zlib, or trim dim slightly to fit 16MB.

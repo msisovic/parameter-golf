@@ -128,6 +128,7 @@ class Hyperparameters:
     ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     xsa_decoder = bool(int(os.environ.get("XSA_DECODER", "0")))
     shared_recurrent = bool(int(os.environ.get("SHARED_RECURRENT", "0")))
+    flat_unet = bool(int(os.environ.get("FLAT_UNET", "0")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -797,6 +798,7 @@ class GPT(nn.Module):
         ln_scale: bool = False,
         xsa_decoder: bool = False,
         shared_recurrent: bool = False,
+        flat_unet: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -808,6 +810,7 @@ class GPT(nn.Module):
         self.mtp_loss_weight = mtp_loss_weight
         self.mean_depth = mean_depth
         self.truncated_backprop_k = truncated_backprop_k
+        self.flat_unet = flat_unet
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
@@ -834,27 +837,43 @@ class GPT(nn.Module):
         self.num_entry_exit_skips = min(num_entry_blocks, num_exit_blocks)
         self.entry_skip_weight = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
 
-        # Per-iteration control params for recurrent blocks
-        # Shape: (mean_depth, num_blocks, ...) — indexed by [iteration, block_idx]
-        n_enc = num_encoder_recurrent
-        n_dec = num_encoder_recurrent if shared_recurrent else num_decoder_recurrent
-        d = mean_depth
-        self.enc_iter_attn_scale = nn.Parameter(torch.ones(d, n_enc, model_dim, dtype=torch.float32))
-        self.enc_iter_mlp_scale = nn.Parameter(torch.ones(d, n_enc, model_dim, dtype=torch.float32))
-        self.enc_iter_resid_mix = nn.Parameter(
-            torch.stack([torch.stack([torch.ones(model_dim), torch.zeros(model_dim)])
-                         for _ in range(d * n_enc)]).reshape(d, n_enc, 2, model_dim).float())
-        self.enc_iter_q_gain = nn.Parameter(torch.full((d, n_enc, num_heads), qk_gain_init, dtype=torch.float32))
+        # Per-application control params for recurrent blocks
+        if flat_unet:
+            # Flat U-net: single sequence of n_iters × n_blocks applications
+            # 4 encoder + 1 bottleneck + 4 decoder (for 3×3)
+            total_apps = mean_depth * num_encoder_recurrent
+            self.total_recurrent_apps = total_apps
+            n_skips = (total_apps - 1) // 2  # encoder apps = decoder apps
+            self.n_flat_skips = n_skips
+            self.body_attn_scale = nn.Parameter(torch.ones(total_apps, model_dim, dtype=torch.float32))
+            self.body_mlp_scale = nn.Parameter(torch.ones(total_apps, model_dim, dtype=torch.float32))
+            self.body_resid_mix = nn.Parameter(
+                torch.stack([torch.stack([torch.ones(model_dim), torch.zeros(model_dim)])
+                             for _ in range(total_apps)]).reshape(total_apps, 2, model_dim).float())
+            self.body_q_gain = nn.Parameter(torch.full((total_apps, num_heads), qk_gain_init, dtype=torch.float32))
+            self.body_skip_weight = nn.Parameter(torch.ones(n_skips, model_dim, dtype=torch.float32))
+        else:
+            # Original: separate encoder/decoder iteration params
+            # Shape: (mean_depth, num_blocks, ...) — indexed by [iteration, block_idx]
+            n_enc = num_encoder_recurrent
+            n_dec = num_encoder_recurrent if shared_recurrent else num_decoder_recurrent
+            d = mean_depth
+            self.enc_iter_attn_scale = nn.Parameter(torch.ones(d, n_enc, model_dim, dtype=torch.float32))
+            self.enc_iter_mlp_scale = nn.Parameter(torch.ones(d, n_enc, model_dim, dtype=torch.float32))
+            self.enc_iter_resid_mix = nn.Parameter(
+                torch.stack([torch.stack([torch.ones(model_dim), torch.zeros(model_dim)])
+                             for _ in range(d * n_enc)]).reshape(d, n_enc, 2, model_dim).float())
+            self.enc_iter_q_gain = nn.Parameter(torch.full((d, n_enc, num_heads), qk_gain_init, dtype=torch.float32))
 
-        self.dec_iter_attn_scale = nn.Parameter(torch.ones(d, n_dec, model_dim, dtype=torch.float32))
-        self.dec_iter_mlp_scale = nn.Parameter(torch.ones(d, n_dec, model_dim, dtype=torch.float32))
-        self.dec_iter_resid_mix = nn.Parameter(
-            torch.stack([torch.stack([torch.ones(model_dim), torch.zeros(model_dim)])
-                         for _ in range(d * n_dec)]).reshape(d, n_dec, 2, model_dim).float())
-        self.dec_iter_q_gain = nn.Parameter(torch.full((d, n_dec, num_heads), qk_gain_init, dtype=torch.float32))
+            self.dec_iter_attn_scale = nn.Parameter(torch.ones(d, n_dec, model_dim, dtype=torch.float32))
+            self.dec_iter_mlp_scale = nn.Parameter(torch.ones(d, n_dec, model_dim, dtype=torch.float32))
+            self.dec_iter_resid_mix = nn.Parameter(
+                torch.stack([torch.stack([torch.ones(model_dim), torch.zeros(model_dim)])
+                             for _ in range(d * n_dec)]).reshape(d, n_dec, 2, model_dim).float())
+            self.dec_iter_q_gain = nn.Parameter(torch.full((d, n_dec, num_heads), qk_gain_init, dtype=torch.float32))
 
-        # Per-iteration skip weight for decoder recurrence
-        self.dec_iter_skip_weight = nn.Parameter(torch.ones(d, model_dim, dtype=torch.float32))
+            # Per-iteration skip weight for decoder recurrence
+            self.dec_iter_skip_weight = nn.Parameter(torch.ones(d, model_dim, dtype=torch.float32))
 
         # ln_scale: depth-dependent norm scaling — 1/sqrt(effective_layer_idx + 1)
         self.ln_scale = ln_scale
@@ -906,6 +925,61 @@ class GPT(nn.Module):
         return 1.0 / math.sqrt(layer_idx + 1) if self.ln_scale else 1.0
 
     def _run_body(self, x: Tensor, x0: Tensor) -> Tensor:
+        if self.flat_unet:
+            return self._run_body_flat(x, x0)
+        return self._run_body_iterative(x, x0)
+
+    def _run_body_flat(self, x: Tensor, x0: Tensor) -> Tensor:
+        """Flat U-net: Entry → [enc...bottleneck...dec] → Exit with skips at application level."""
+        n_blocks = len(self.encoder_blocks)
+        total_apps = self.total_recurrent_apps
+        n_skips = self.n_flat_skips  # encoder apps = decoder apps
+
+        # Entry: save states for entry→exit skips
+        entry_states: list[Tensor] = []
+        for idx, block in enumerate(self.entry_blocks):
+            x = block(x, x0, block.attn_scale, block.mlp_scale, block.resid_mix, block.attn.q_gain,
+                      self._ln_sf(idx))
+            entry_states.append(x)
+
+        # Flat recurrent body: encoder apps save state, decoder apps inject skips
+        layer_offset = len(self.entry_blocks)
+        encoder_states: list[Tensor] = []
+        for app_idx in range(total_apps):
+            block = self.encoder_blocks[app_idx % n_blocks]
+
+            # Decoder apps get skip connections from matching encoder app
+            dec_idx = app_idx - n_skips - 1  # decoder app index (0-based), -1 for bottleneck
+            if dec_idx >= 0:
+                skip = encoder_states[n_skips - 1 - dec_idx]
+                sw = self.body_skip_weight[dec_idx].to(dtype=x.dtype)[None, None, :]
+                x = x + sw * skip
+
+            eff_idx = layer_offset + app_idx
+            x = block(x, x0,
+                      self.body_attn_scale[app_idx],
+                      self.body_mlp_scale[app_idx],
+                      self.body_resid_mix[app_idx],
+                      self.body_q_gain[app_idx],
+                      self._ln_sf(eff_idx))
+
+            # Save encoder states
+            if app_idx < n_skips:
+                encoder_states.append(x)
+
+        # Exit with entry→exit skips (mirror order)
+        exit_offset = layer_offset + total_apps
+        esw = self.entry_skip_weight.to(dtype=x.dtype)[None, None, :]
+        n_entry_skips = self.num_entry_exit_skips
+        for i, block in enumerate(self.exit_blocks):
+            skip_idx = n_entry_skips - 1 - i
+            if 0 <= skip_idx < len(entry_states):
+                x = x + esw * entry_states[skip_idx]
+            x = block(x, x0, block.attn_scale, block.mlp_scale, block.resid_mix, block.attn.q_gain,
+                      self._ln_sf(exit_offset + i))
+        return x
+
+    def _run_body_iterative(self, x: Tensor, x0: Tensor) -> Tensor:
         """Entry → Encoder recurrence → Decoder recurrence with U-net skips → Exit with entry skips."""
         n_enc_blocks = len(self.encoder_blocks)
         decode_blocks = self.encoder_blocks if self.shared_recurrent else self.decoder_blocks
@@ -1314,6 +1388,7 @@ def main() -> None:
         ln_scale=args.ln_scale,
         xsa_decoder=args.xsa_decoder,
         shared_recurrent=args.shared_recurrent,
+        flat_unet=args.flat_unet,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1345,16 +1420,23 @@ def main() -> None:
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params.append(base_model.entry_skip_weight)
-    # Per-iteration control params for recurrent blocks
-    scalar_params.append(base_model.enc_iter_attn_scale)
-    scalar_params.append(base_model.enc_iter_mlp_scale)
-    scalar_params.append(base_model.enc_iter_resid_mix)
-    scalar_params.append(base_model.enc_iter_q_gain)
-    scalar_params.append(base_model.dec_iter_attn_scale)
-    scalar_params.append(base_model.dec_iter_mlp_scale)
-    scalar_params.append(base_model.dec_iter_resid_mix)
-    scalar_params.append(base_model.dec_iter_q_gain)
-    scalar_params.append(base_model.dec_iter_skip_weight)
+    # Per-application/iteration control params for recurrent blocks
+    if args.flat_unet:
+        scalar_params.append(base_model.body_attn_scale)
+        scalar_params.append(base_model.body_mlp_scale)
+        scalar_params.append(base_model.body_resid_mix)
+        scalar_params.append(base_model.body_q_gain)
+        scalar_params.append(base_model.body_skip_weight)
+    else:
+        scalar_params.append(base_model.enc_iter_attn_scale)
+        scalar_params.append(base_model.enc_iter_mlp_scale)
+        scalar_params.append(base_model.enc_iter_resid_mix)
+        scalar_params.append(base_model.enc_iter_q_gain)
+        scalar_params.append(base_model.dec_iter_attn_scale)
+        scalar_params.append(base_model.dec_iter_mlp_scale)
+        scalar_params.append(base_model.dec_iter_resid_mix)
+        scalar_params.append(base_model.dec_iter_q_gain)
+        scalar_params.append(base_model.dec_iter_skip_weight)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
@@ -1416,10 +1498,17 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
     use_fixed_depth = args.fixed_train_depth > 0
-    log0(f"recurrent_unet: entry={args.num_entry_blocks} enc={args.num_encoder_recurrent}×N "
-         f"dec={'shared' if args.shared_recurrent else str(args.num_decoder_recurrent)}×N exit={args.num_exit_blocks} "
-         f"train_depth={'fixed=' + str(args.fixed_train_depth) if use_fixed_depth else 'random(mean=' + str(args.recurrent_mean_depth) + ')'} "
-         f"eval_depth={args.eval_recurrent_depth}")
+    if args.flat_unet:
+        total_apps = args.fixed_train_depth * args.num_encoder_recurrent
+        n_skips = (total_apps - 1) // 2
+        log0(f"flat_unet: entry={args.num_entry_blocks} body={args.num_encoder_recurrent}×{args.fixed_train_depth}={total_apps}apps "
+             f"({n_skips}enc+1bottle+{n_skips}dec) exit={args.num_exit_blocks} "
+             f"total={args.num_entry_blocks + total_apps + args.num_exit_blocks} layers")
+    else:
+        log0(f"recurrent_unet: entry={args.num_entry_blocks} enc={args.num_encoder_recurrent}×N "
+             f"dec={'shared' if args.shared_recurrent else str(args.num_decoder_recurrent)}×N exit={args.num_exit_blocks} "
+             f"train_depth={'fixed=' + str(args.fixed_train_depth) if use_fixed_depth else 'random(mean=' + str(args.recurrent_mean_depth) + ')'} "
+             f"eval_depth={args.eval_recurrent_depth}")
 
     # Depth sampling: log-normal Poisson (Geiping et al. 2025) — only used when not fixed
     def sample_depth() -> int:
@@ -1715,6 +1804,7 @@ def main() -> None:
         ln_scale=args.ln_scale,
         xsa_decoder=args.xsa_decoder,
         shared_recurrent=args.shared_recurrent,
+        flat_unet=args.flat_unet,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
