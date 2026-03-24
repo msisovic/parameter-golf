@@ -484,9 +484,55 @@ level: 4 encoder + 1 bottleneck + 4 decoder. XSA on shared blocks. 28M total par
 
 13. **Depth vs width tradeoff.** More effective layers (depth) beats wider layers for per-step convergence. Run 11 (12 layers, dim=704) beats Run 13 (11 layers, dim=768) at step 3000+.
 
+14. **Per-application LoRA doesn't help on a 2-block base.** Run 14 (LoRA rank=32 on 2 shared blocks × 5 iterations) was 0.037 BPB worse than Run 13 (3 blocks × 3 iterations, no LoRA). Block diversity (number of unique attention/MLP blocks) matters far more than low-rank adapter differentiation. LoRA may still help on a 3+ block base where it augments already-diverse blocks.
+
+## Run 14: Flat U-net 1+2×5+1 dim=768 depth=5 + LoRA rank=32, 1200s
+
+**Config:** Flat U-net: 1 entry + 2 shared blocks × 5 iterations + 1 exit = 12 effective layers.
+dim=768, 4 unique blocks. Per-application control params (10 sets). LoRA rank=32 per application
+(stored at fp16 to avoid quant amplification). U-net skips: 5 encoder + 5 decoder.
+XSA_DECODER=1, LN_SCALE=0, SHARED_RECURRENT=1, FLAT_UNET=1, LORA_RANK=32.
+23.2M params. LoRA stored as ParameterList of 2D tensors (torch.compile fix).
+
+**Training:**
+| Step | Val BPB | Run 13 (285ms) | Run 12 (252ms) |
+|------|---------|----------------|----------------|
+| 1000 | 1.3385  | 1.2915         | 1.2980         |
+| 2000 | 1.2832  | 1.2424         | 1.2475         |
+| 3000 | 1.2365  | 1.2269         | 1.2327         |
+| 3706 | 1.1898  | -              | -              |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1729** (stride 64)
+- Int6 roundtrip BPB: **1.2066** (standard eval)
+- Int6 sliding window BPB: **1.1837** (stride 64)
+- **Quant penalty: 0.011** (SW vs SW: 1.1729 → 1.1837)
+- Model size: **13.9MB** int6+zlib (well under budget)
+- Step avg: 324ms, 3706 steps in 1200s
+
+**Observations:**
+1. **Significantly worse than Run 13** — 1.1729 vs 1.1351 pre-quant, 1.1837 vs 1.1464 int6 SW. A 0.037 BPB regression.
+2. **Only 2 unique recurrent blocks is the bottleneck.** LoRA rank=32 (~49K params per application) cannot compensate for having 2 vs 3 fundamentally different attention/MLP blocks.
+3. **Per-step convergence is poor** — 1.3385 at step 1000 vs Run 13's 1.2915 (0.047 worse). Even worse per-step than Run 12 (1.2980 with 4 blocks at dim=704).
+4. **LoRA didn't help.** Curves show no benefit from per-application LoRA adapters. Zero-initialized adapter_up means they start as identity — 3706 steps isn't enough for meaningful divergence.
+5. **Quant penalty identical** to Run 13 (0.011), confirming fp16 passthrough for LoRA works correctly.
+6. **13.9MB well under budget** — room for much larger base model. The 2-block architecture is just too parameter-efficient.
+7. **Slower than Run 13** (324ms vs 285ms) despite similar effective layer count (12 vs 11), likely due to LoRA overhead and deeper sequential recurrence.
+
+**Conclusion:** Per-application LoRA on a 2-block base is not viable. Block diversity (number of unique blocks) matters more than adapter differentiation. Future LoRA experiments should use a 3+ block base.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Quant Δ | Size | Steps | ms/step |
+|---|---|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~0.007 | ~16MB | ~6000+ | ~100 |
+| **U-Net Run 9 (2+2+2+2 d=2)** | **1.1289** | **1.1368** | **0.008** | **18.1MB** | 4739 | 253 |
+| U-Net Run 11 (2+2s+2 d=2 dim=704) | 1.1376 | 1.1469 | 0.009 | 16.2MB | 4012 | 300 |
+| Flat Run 13 (1+3×3+1 d=3 dim=768) | 1.1351 | 1.1464 | 0.011 | 16.1MB | 4208 | 285 |
+| Flat Run 14 (1+2×5+1 d=5 dim=768 LoRA32) | 1.1729 | 1.1837 | 0.011 | 13.9MB | 3706 | 324 |
+
 ## Next Steps to Consider
 
-- **Flat U-net at depth=2**: 1+3×2+1 = 9 layers, reduces quant penalty from 3× to 2×. Or 1+4×2+1 = 11 layers at depth=2 to match layer count.
-- **Flat U-net with more blocks, less depth**: e.g., 1+5×2+1 = 13 layers at depth=2, dim=680-700. More layers, lower quant penalty, fits budget.
-- **GPTQ or better quantization**: the pre-quant results are strong — reducing quant penalty is the highest-leverage improvement.
-- **Reduce model size**: zstd instead of zlib, or trim dim slightly to fit 16MB.
+- **LoRA on 3+ block base**: Run 14 showed 2 unique blocks is insufficient. Try LoRA rank=32 on Run 13's 1+3×3+1 config where the stronger 3-block base might benefit from adapter differentiation.
+- **Flat U-net with more blocks, less depth**: e.g., 1+4×2+1 = 11 layers at depth=2, dim=700-720. More unique blocks, lower quant penalty.
+- **GPTQ or better quantization**: pre-quant results are strong — reducing quant penalty is the highest-leverage improvement.
+- **Drop LoRA, invest in base model**: Run 14's 13.9MB shows LoRA savings are wasted. Better to use params for more/wider unique blocks.

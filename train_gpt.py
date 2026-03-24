@@ -129,6 +129,7 @@ class Hyperparameters:
     xsa_decoder = bool(int(os.environ.get("XSA_DECODER", "0")))
     shared_recurrent = bool(int(os.environ.get("SHARED_RECURRENT", "0")))
     flat_unet = bool(int(os.environ.get("FLAT_UNET", "0")))
+    lora_rank = int(os.environ.get("LORA_RANK", 0))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -799,6 +800,7 @@ class GPT(nn.Module):
         xsa_decoder: bool = False,
         shared_recurrent: bool = False,
         flat_unet: bool = False,
+        lora_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -838,12 +840,13 @@ class GPT(nn.Module):
         self.entry_skip_weight = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
 
         # Per-application control params for recurrent blocks
+        self.lora_rank = lora_rank
         if flat_unet:
             # Flat U-net: single sequence of n_iters × n_blocks applications
-            # 4 encoder + 1 bottleneck + 4 decoder (for 3×3)
+            # First half = encoder, second half = decoder, skips pair mirror positions
             total_apps = mean_depth * num_encoder_recurrent
             self.total_recurrent_apps = total_apps
-            n_skips = (total_apps - 1) // 2  # encoder apps = decoder apps
+            n_skips = total_apps // 2  # encoder apps = decoder apps
             self.n_flat_skips = n_skips
             self.body_attn_scale = nn.Parameter(torch.ones(total_apps, model_dim, dtype=torch.float32))
             self.body_mlp_scale = nn.Parameter(torch.ones(total_apps, model_dim, dtype=torch.float32))
@@ -852,6 +855,17 @@ class GPT(nn.Module):
                              for _ in range(total_apps)]).reshape(total_apps, 2, model_dim).float())
             self.body_q_gain = nn.Parameter(torch.full((total_apps, num_heads), qk_gain_init, dtype=torch.float32))
             self.body_skip_weight = nn.Parameter(torch.ones(n_skips, model_dim, dtype=torch.float32))
+
+            # Per-application LoRA adapter: x = x + x @ adapter_down[app] @ adapter_up[app]
+            if lora_rank > 0:
+                self.adapter_down = nn.ParameterList([
+                    nn.Parameter(torch.randn(model_dim, lora_rank, dtype=torch.float32) * (1.0 / math.sqrt(model_dim)))
+                    for _ in range(total_apps)
+                ])
+                self.adapter_up = nn.ParameterList([
+                    nn.Parameter(torch.zeros(lora_rank, model_dim, dtype=torch.float32))
+                    for _ in range(total_apps)
+                ])
         else:
             # Original: separate encoder/decoder iteration params
             # Shape: (mean_depth, num_blocks, ...) — indexed by [iteration, block_idx]
@@ -930,10 +944,11 @@ class GPT(nn.Module):
         return self._run_body_iterative(x, x0)
 
     def _run_body_flat(self, x: Tensor, x0: Tensor) -> Tensor:
-        """Flat U-net: Entry → [enc...bottleneck...dec] → Exit with skips at application level."""
+        """Flat U-net: Entry → [enc...dec] → Exit with skips at application level."""
         n_blocks = len(self.encoder_blocks)
         total_apps = self.total_recurrent_apps
-        n_skips = self.n_flat_skips  # encoder apps = decoder apps
+        n_skips = self.n_flat_skips  # first half = encoder, second half = decoder
+        dec_start = total_apps - n_skips  # decoder starts here
 
         # Entry: save states for entry→exit skips
         entry_states: list[Tensor] = []
@@ -942,15 +957,15 @@ class GPT(nn.Module):
                       self._ln_sf(idx))
             entry_states.append(x)
 
-        # Flat recurrent body: encoder apps save state, decoder apps inject skips
+        # Flat recurrent body: first half saves encoder states, second half injects skips
         layer_offset = len(self.entry_blocks)
         encoder_states: list[Tensor] = []
         for app_idx in range(total_apps):
             block = self.encoder_blocks[app_idx % n_blocks]
 
-            # Decoder apps get skip connections from matching encoder app
-            dec_idx = app_idx - n_skips - 1  # decoder app index (0-based), -1 for bottleneck
-            if dec_idx >= 0:
+            # Decoder apps get skip connections from mirror encoder app
+            if app_idx >= dec_start:
+                dec_idx = app_idx - dec_start
                 skip = encoder_states[n_skips - 1 - dec_idx]
                 sw = self.body_skip_weight[dec_idx].to(dtype=x.dtype)[None, None, :]
                 x = x + sw * skip
@@ -962,6 +977,10 @@ class GPT(nn.Module):
                       self.body_resid_mix[app_idx],
                       self.body_q_gain[app_idx],
                       self._ln_sf(eff_idx))
+
+            # Per-application LoRA adapter
+            if self.lora_rank > 0:
+                x = x + (x @ self.adapter_down[app_idx]) @ self.adapter_up[app_idx]
 
             # Save encoder states
             if app_idx < n_skips:
@@ -1223,6 +1242,10 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
+        if "adapter_down" in name or "adapter_up" in name:
+            result[name] = t.to(torch.float16)
+            meta[name] = "passthrough_fp16"
+            continue
         # tok_emb.weight falls through to int8 via "embed" category
         if cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
@@ -1389,6 +1412,7 @@ def main() -> None:
         xsa_decoder=args.xsa_decoder,
         shared_recurrent=args.shared_recurrent,
         flat_unet=args.flat_unet,
+        lora_rank=args.lora_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1427,6 +1451,9 @@ def main() -> None:
         scalar_params.append(base_model.body_resid_mix)
         scalar_params.append(base_model.body_q_gain)
         scalar_params.append(base_model.body_skip_weight)
+        if args.lora_rank > 0:
+            matrix_params.extend(base_model.adapter_down)
+            matrix_params.extend(base_model.adapter_up)
     else:
         scalar_params.append(base_model.enc_iter_attn_scale)
         scalar_params.append(base_model.enc_iter_mlp_scale)
@@ -1500,10 +1527,11 @@ def main() -> None:
     use_fixed_depth = args.fixed_train_depth > 0
     if args.flat_unet:
         total_apps = args.fixed_train_depth * args.num_encoder_recurrent
-        n_skips = (total_apps - 1) // 2
+        n_skips = total_apps // 2
+        lora_str = f" lora_rank={args.lora_rank}" if args.lora_rank > 0 else ""
         log0(f"flat_unet: entry={args.num_entry_blocks} body={args.num_encoder_recurrent}×{args.fixed_train_depth}={total_apps}apps "
-             f"({n_skips}enc+1bottle+{n_skips}dec) exit={args.num_exit_blocks} "
-             f"total={args.num_entry_blocks + total_apps + args.num_exit_blocks} layers")
+             f"({n_skips}enc+{total_apps - 2*n_skips}mid+{n_skips}dec) exit={args.num_exit_blocks} "
+             f"total={args.num_entry_blocks + total_apps + args.num_exit_blocks} layers{lora_str}")
     else:
         log0(f"recurrent_unet: entry={args.num_entry_blocks} enc={args.num_encoder_recurrent}×N "
              f"dec={'shared' if args.shared_recurrent else str(args.num_decoder_recurrent)}×N exit={args.num_exit_blocks} "
@@ -1805,6 +1833,7 @@ def main() -> None:
         xsa_decoder=args.xsa_decoder,
         shared_recurrent=args.shared_recurrent,
         flat_unet=args.flat_unet,
+        lora_rank=args.lora_rank,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
