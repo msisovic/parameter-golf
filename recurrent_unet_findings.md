@@ -435,13 +435,13 @@ level: 4 encoder + 1 bottleneck + 4 decoder. XSA on shared blocks. 28M total par
 - Pre-quant sliding window BPB: **1.1351** (stride 64)
 - Int6 roundtrip BPB: **1.1694** (standard eval)
 - Int6 sliding window BPB: **1.1464** (stride 64)
-- **Quant penalty: 0.034** (1.1351 → 1.1694 roundtrip, 0.011 sliding window)
+- **Quant penalty: 0.011** (SW vs SW: 1.1351 → 1.1464)
 - Step avg: 285ms, 4208 steps in 1200s
 - Model size: **16.09MB** int6+zlib (16.18MB with code) — barely over 16MB budget
 
 **Observations:**
 1. **Flat U-net works well pre-quant** — 1.1351 is the second-best pre-quant result after Run 9 (1.1289).
-2. **Quantization penalty is severe (0.034 roundtrip)** — depth=3 shared blocks mean each weight error is amplified 3×. This is the worst quant penalty across all runs.
+2. **Quantization penalty is 0.011 (SW vs SW)** — comparable to other runs. The 0.034 roundtrip figure was misleading (comparing SW pre-quant to non-SW int6).
 3. **Per-step convergence is strong** — beats Run 11 and Run 12 at steps 1000-2000, falls behind Run 11 at step 3000 (11 vs 12 effective layers).
 4. **dim=768 with 5 unique blocks nearly fits budget** at 16.09MB. Could use zstd (currently zlib) or trim dim slightly.
 5. **Architecture validated** — fine-grained U-net skips at block-application level work well.
@@ -454,7 +454,7 @@ level: 4 encoder + 1 bottleneck + 4 decoder. XSA on shared blocks. 28M total par
 | U-Net Run 10 (2+1+1+2 d=4 dim=704) | 1.1422 | 1.1527 | 0.011 | ~18MB | 4068 | 295 |
 | U-Net Run 11 (2+2s+2 d=2 dim=704) | 1.1376 | 1.1469 | 0.009 | 16.2MB | 4012 | 300 |
 | U-Net Run 12 (1+4s+1 d=1 dim=704) | 1.1361 | 1.1448 | 0.009 | ~16MB | 4770 | 252 |
-| Flat Run 13 (1+3×3+1 d=3 dim=768) | 1.1351 | 1.1464 | 0.034 | 16.1MB | 4208 | 285 |
+| Flat Run 13 (1+3×3+1 d=3 dim=768) | 1.1351 | 1.1464 | 0.011 | 16.1MB | 4208 | 285 |
 
 ## Key Insights
 
@@ -480,9 +480,9 @@ level: 4 encoder + 1 bottleneck + 4 decoder. XSA on shared blocks. 28M total par
 
 11. **Effective layer count matters.** Run 12 (10 layers, 252ms) couldn't match Run 9 (12 layers, 253ms) despite identical speed. 12 effective layers at depth=2 is the sweet spot for this architecture.
 
-12. **Flat U-net architecture is promising but quant-limited.** Run 13's fine-grained block-level skips work well pre-quant (1.1351, second-best), but depth=3 shared weights amplify quant error 3× (0.034 penalty). Width (dim=768) helps pre-quant but doesn't offset the quant penalty vs shallower depth.
+12. **Flat U-net architecture works well.** Run 13's fine-grained block-level skips give strong pre-quant results (1.1351, second-best). Quant penalty (0.011 SW→SW) is reasonable despite depth=3 sharing. Nearly fits 16MB budget at dim=768.
 
-13. **Depth vs width tradeoff.** More effective layers (depth) beats wider layers for per-step convergence. Run 11 (12 layers, dim=704) beats Run 13 (11 layers, dim=768) at step 3000+. But depth amplifies quant penalty.
+13. **Depth vs width tradeoff.** More effective layers (depth) beats wider layers for per-step convergence. Run 11 (12 layers, dim=704) beats Run 13 (11 layers, dim=768) at step 3000+.
 
 ## Next Steps to Consider
 
