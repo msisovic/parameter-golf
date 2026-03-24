@@ -352,6 +352,69 @@ XSA_DECODER=1, LN_SCALE=0. Fewer recurrent blocks, reinvested params into larger
 | **U-Net Run 9 (+ XSA dec only)** | **1.1289** | **1.1368** | **0.008** | **18.1MB** | 4739 | 1200s |
 | U-Net Run 10 (2+1+1+2 d=4 dim=704) | 1.1422 | 1.1527 | 0.011 | ~18MB | 4068 | 1200s |
 
+## Run 11: Shared recurrent 2+2s+2 dim=704 depth=2, 1200s
+
+**Config:** 2+2shared+2, dim=704, fixed depth=2. Encoder and decoder reuse same 2 blocks,
+differentiated by per-iteration control params. XSA on shared blocks (both phases).
+
+**Training:**
+| Step | Val BPB | Run 9 (253ms) | Run 10 (295ms) |
+|------|---------|---------------|----------------|
+| 1000 | 1.2977  | 1.2995        | 1.3077         |
+| 2000 | 1.2451  | 1.2463        | 1.2542         |
+| 3000 | 1.2207  | 1.2281        | 1.2297         |
+| 4000 | 1.1588  | 1.1958        | 1.1651         |
+| 4012 | 1.1586  | -             | -              |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1376** (stride 64)
+- Int6 roundtrip BPB: **1.1697** (standard eval)
+- Int6 sliding window BPB: **1.1469** (stride 64)
+- **Quant penalty: 0.009** (1.1376 → 1.1469)
+- Model size: **16.2MB** int6+zlib (nearly within 16MB budget!)
+- Step avg: 300ms, 4012 steps in 1200s
+
+**Observations:**
+1. **Best per-step convergence** — 0.037 better than Run 9 at step 4000. Shared blocks + dim=704 learn very efficiently.
+2. **But 727 fewer steps** (4012 vs 4739) from dim=704 slowdown (300ms vs 253ms) erases the per-step advantage.
+3. **Model size nearly fits budget** at 16.2MB — shared blocks saved ~2MB vs Run 9's 18.1MB.
+4. **Quant penalty 0.009** — good, same as depth=2 non-shared.
+
+## Run 12: Shared recurrent 1+4s+1 dim=704 depth=1, 1200s
+
+**Config:** 1+4shared+1, dim=704, fixed depth=1. Complexity shifted to recurrent body,
+fewer entry/exit blocks. 10 effective layers (vs 12 in Run 11).
+
+**Training:**
+| Step | Val BPB | Run 9 (253ms) | Run 11 (300ms) |
+|------|---------|---------------|----------------|
+| 1000 | 1.2980  | 1.2995        | 1.2977         |
+| 2000 | 1.2475  | 1.2463        | 1.2451         |
+| 3000 | 1.2327  | 1.2281        | 1.2207         |
+| 4000 | 1.2038  | 1.1958        | 1.1588         |
+| 4770 | 1.1505  | -             | -              |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1361** (stride 64)
+- Int6 roundtrip BPB: **1.1673** (standard eval)
+- Int6 sliding window BPB: **1.1448** (stride 64)
+- **Quant penalty: 0.009** (1.1361 → 1.1448)
+- Step avg: 252ms, 4770 steps in 1200s
+
+**Observations:**
+1. **Depth=1 recovered step speed** (252ms, matching Run 9) but 10 effective layers isn't enough — falls behind Run 9 by 0.008 per-step at step 4000.
+2. **Beats Run 11** on final BPB (1.1448 vs 1.1469) because 758 more steps compensate for 2 fewer effective layers.
+3. **Doesn't beat Run 9** (1.1448 vs 1.1368). The 2 fewer effective layers cost ~0.008 BPB at the same step speed.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Quant Δ | Size | Steps | ms/step |
+|---|---|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~0.007 | ~16MB | ~6000+ | ~100 |
+| **U-Net Run 9 (2+2+2+2 d=2)** | **1.1289** | **1.1368** | **0.008** | **18.1MB** | 4739 | 253 |
+| U-Net Run 10 (2+1+1+2 d=4 dim=704) | 1.1422 | 1.1527 | 0.011 | ~18MB | 4068 | 295 |
+| U-Net Run 11 (2+2s+2 d=2 dim=704) | 1.1376 | 1.1469 | 0.009 | 16.2MB | 4012 | 300 |
+| U-Net Run 12 (1+4s+1 d=1 dim=704) | 1.1361 | 1.1448 | 0.009 | ~16MB | 4770 | 252 |
+
 ## Key Insights
 
 1. **U-Net skips work well in recurrent setting.** The encoder-decoder structure with skip connections gives depth-dependent information flow without the fixed-point problem of input injection.
@@ -372,9 +435,13 @@ XSA_DECODER=1, LN_SCALE=0. Fewer recurrent blocks, reinvested params into larger
 
 9. **ln_scale is harmful with per-iteration control params.** Fixed 1/sqrt(idx) attenuation fights the learned per-iter attn_scale/mlp_scale. The model can already learn its own signal regulation — imposing a fixed schedule hurts.
 
+10. **Shared recurrent blocks work well per-step** but dim=704 makes them too slow. Run 11 (shared, dim=704) had 0.037 better BPB than Run 9 at step 4000, but 727 fewer steps from the speed penalty. Per-iteration control params successfully differentiate encoder vs decoder behavior on shared weights.
+
+11. **Effective layer count matters.** Run 12 (10 layers, 252ms) couldn't match Run 9 (12 layers, 253ms) despite identical speed. 12 effective layers at depth=2 is the sweet spot for this architecture.
+
 ## Next Steps to Consider
 
-- **Reduce model size**: dim=640 is over budget at 18.1MB. Try dim=576 or mixed int8 for recurrent + int6 for entry/exit
-- **2+1+1+2 at depth=2**: fewer recurrent blocks → faster steps, potentially unlock larger dim
+- **Shared recurrent at dim=640 depth=2**: same speed as Run 9 (253ms), 12 effective layers, smaller model (~14MB, room to grow dim). The definitive test of sharing.
+- **Reduce model size**: Run 9 is 18.1MB, need 16MB. Shared blocks at dim=640 naturally fit. Or mixed int8/int6.
 - **GPTQ**: smarter post-training quantization to reduce quant penalty
 - **LoRA TTT to patch quant error**: small LoRA at eval time on the quantized model
