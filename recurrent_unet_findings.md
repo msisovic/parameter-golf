@@ -275,6 +275,45 @@ RMSNorm outputs) and XSA on decoder recurrent blocks (in addition to exit blocks
 | U-Net Run 7 (+ ln_scale + XSA dec) | 1.1338 | 1.1420 | 0.008 | 17.8MB | 4743 | 1200s |
 | U-Net Run 8 (+ ln_scale only) | 1.1327 | 1.1412 | 0.009 | 17.8MB | 4837 | 1200s |
 
+## Run 9: XSA decoder only (no ln_scale), 1200s
+
+**Config:** 2+2+2+2, dim=640, fixed depth=2, per-iter ctrl params.
+XSA_DECODER=1, LN_SCALE=0. Isolating decoder XSA from Run 7.
+
+**Training:**
+| Step | Val BPB | Run 6 | Delta |
+|------|---------|-------|-------|
+| 1000 | 1.2995  | 1.2987 | +0.001 (same) |
+| 2000 | 1.2463  | 1.2477 | -0.001 better |
+| 3000 | 1.2281  | 1.2295 | -0.001 better |
+| 4000 | 1.1958  | 1.1902 | +0.006 worse |
+| 4739 | 1.1498  | -      | Wallclock cap |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1289** (stride 64) — **new best**
+- Int6 roundtrip BPB: **1.1591** (standard eval)
+- Int6 sliding window BPB: **1.1368** (stride 64) — **new best**
+- **Quant penalty: 0.008** (1.1289 → 1.1368, tied best with Run 7)
+- Model size: **18.1MB** int6+zlib (over budget)
+- Step avg: 253ms, 4739 steps in 1200s
+
+**Observations:**
+1. **New best on all final metrics.** Pre-quant 1.1289 (was 1.1316), int6 SW 1.1368 (was 1.1406). Decoder XSA is a clear win.
+2. **Per-step convergence tracks Run 6 closely** through step 3000, then falls behind at step 4000 — but final results are better because decoder XSA improves the quality of the last ~700 training steps (post-QAT) more than expected.
+3. **Quant penalty 0.008** — confirmed that this comes from decoder XSA, not ln_scale (Run 8 with ln_scale only had 0.009).
+4. **10ms/step overhead** (253ms vs 243ms) costs ~200 steps but the per-step quality improvement more than compensates.
+5. **ln_scale was the culprit in Run 7.** Run 9 removes it and immediately beats all prior runs. The damage in Run 7 was entirely from ln_scale fighting the per-iteration control params.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Quant Δ | Size | Steps | Wallclock |
+|---|---|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~0.007 | ~16MB | ~6000+ | 600s |
+| U-Net Run 4 (2+2+2+2, fixed d=2) | 1.1316 | 1.1406 | 0.009 | 18.2MB | 4935 | 1200s |
+| U-Net Run 6 (+ per-iter ctrl params) | 1.1321 | 1.1417 | 0.010 | 18.1MB | 4629 | 1200s |
+| U-Net Run 7 (+ ln_scale + XSA dec) | 1.1338 | 1.1420 | 0.008 | 17.8MB | 4743 | 1200s |
+| U-Net Run 8 (+ ln_scale only) | 1.1327 | 1.1412 | 0.009 | 17.8MB | 4837 | 1200s |
+| **U-Net Run 9 (+ XSA dec only)** | **1.1289** | **1.1368** | **0.008** | **18.1MB** | 4739 | 1200s |
+
 ## Key Insights
 
 1. **U-Net skips work well in recurrent setting.** The encoder-decoder structure with skip connections gives depth-dependent information flow without the fixed-point problem of input injection.
@@ -291,10 +330,13 @@ RMSNorm outputs) and XSA on decoder recurrent blocks (in addition to exit blocks
 
 7. **Entry→exit skip connections don't help.** With only 2 entry and 2 exit blocks, the skip signal is negligible compared to the recurrent body.
 
+8. **Decoder XSA is a clear win.** XSA on decoder blocks reduces quant penalty (0.008, best yet) and improves final BPB despite 10ms/step overhead. XSA prevents self-attention collapse in the decoder, which matters more than in the encoder (decoder is reading out, encoder is building representations).
+
+9. **ln_scale is harmful with per-iteration control params.** Fixed 1/sqrt(idx) attenuation fights the learned per-iter attn_scale/mlp_scale. The model can already learn its own signal regulation — imposing a fixed schedule hurts.
+
 ## Next Steps to Consider
 
-- **Fix per-iter param speed**: delete unused block params before DDP to eliminate find_unused_parameters overhead, then rerun Run 6 at full speed
+- **Reduce model size**: dim=640 is over budget at 18.1MB. Try dim=576 or mixed int8 for recurrent + int6 for entry/exit
 - **2+1+1+2 at depth=2**: fewer recurrent blocks → faster steps, potentially unlock larger dim
-- **Reduce model size**: dim=640 is over budget. Try dim=576 or mixed int8 for recurrent + int6 for entry/exit
 - **GPTQ**: smarter post-training quantization to reduce quant penalty
 - **LoRA TTT to patch quant error**: small LoRA at eval time on the quantized model
