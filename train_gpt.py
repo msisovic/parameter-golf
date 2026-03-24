@@ -127,6 +127,7 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     xsa_decoder = bool(int(os.environ.get("XSA_DECODER", "0")))
+    shared_recurrent = bool(int(os.environ.get("SHARED_RECURRENT", "0")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -795,6 +796,7 @@ class GPT(nn.Module):
         truncated_backprop_k: int = 8,
         ln_scale: bool = False,
         xsa_decoder: bool = False,
+        shared_recurrent: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -814,10 +816,14 @@ class GPT(nn.Module):
                           mlp_mult=mlp_mult, rope_base=rope_base, qk_gain_init=qk_gain_init,
                           rope_dims=rope_dims)
 
-        # 1 entry + 2 encoder_recurrent (×N) + 2 decoder_recurrent (×N) + 1 exit
+        # Entry + recurrent (encoder×N + decoder×N) + exit
+        self.shared_recurrent = shared_recurrent
         self.entry_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_entry_blocks)])
         self.encoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_encoder_recurrent)])
-        self.decoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_decoder_recurrent)])
+        if shared_recurrent:
+            self.decoder_blocks = nn.ModuleList()  # empty — encoder_blocks used for both phases
+        else:
+            self.decoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_decoder_recurrent)])
         self.exit_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_exit_blocks)])
 
         # Delete control params from recurrent blocks — replaced by per-iteration params below
@@ -831,7 +837,7 @@ class GPT(nn.Module):
         # Per-iteration control params for recurrent blocks
         # Shape: (mean_depth, num_blocks, ...) — indexed by [iteration, block_idx]
         n_enc = num_encoder_recurrent
-        n_dec = num_decoder_recurrent
+        n_dec = num_encoder_recurrent if shared_recurrent else num_decoder_recurrent
         d = mean_depth
         self.enc_iter_attn_scale = nn.Parameter(torch.ones(d, n_enc, model_dim, dtype=torch.float32))
         self.enc_iter_mlp_scale = nn.Parameter(torch.ones(d, n_enc, model_dim, dtype=torch.float32))
@@ -854,8 +860,10 @@ class GPT(nn.Module):
         self.ln_scale = ln_scale
 
         # XSA on decoder recurrent blocks + exit blocks
+        # When shared_recurrent, encoder_blocks are used for decode phase too, so XSA applies to both phases
         if xsa_decoder:
-            for block in self.decoder_blocks:
+            decode_blocks = self.encoder_blocks if shared_recurrent else self.decoder_blocks
+            for block in decode_blocks:
                 block.attn.use_xsa = True
         if xsa_last_n > 0:
             for block in self.exit_blocks[-xsa_last_n:]:
@@ -880,8 +888,9 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         # Effective layer count for proj scaling
+        n_dec_blocks = len(self.encoder_blocks) if self.shared_recurrent else len(self.decoder_blocks)
         n_eff = (len(self.entry_blocks) + len(self.encoder_blocks) * self.mean_depth
-                 + len(self.decoder_blocks) * self.mean_depth + len(self.exit_blocks))
+                 + n_dec_blocks * self.mean_depth + len(self.exit_blocks))
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -899,7 +908,8 @@ class GPT(nn.Module):
     def _run_body(self, x: Tensor, x0: Tensor) -> Tensor:
         """Entry → Encoder recurrence → Decoder recurrence with U-net skips → Exit with entry skips."""
         n_enc_blocks = len(self.encoder_blocks)
-        n_dec_blocks = len(self.decoder_blocks)
+        decode_blocks = self.encoder_blocks if self.shared_recurrent else self.decoder_blocks
+        n_dec_blocks = len(decode_blocks)
 
         # Entry: save states for entry→exit skips
         entry_states: list[Tensor] = []
@@ -934,7 +944,7 @@ class GPT(nn.Module):
             skip = encoder_states[n - 1 - i]
             sw = self.dec_iter_skip_weight[i].to(dtype=x.dtype)[None, None, :]
             x = x + sw * skip
-            for j, block in enumerate(self.decoder_blocks):
+            for j, block in enumerate(decode_blocks):
                 eff_idx = dec_offset + i * n_dec_blocks + j
                 x = block(x, x0,
                           self.dec_iter_attn_scale[i, j],
@@ -1303,6 +1313,7 @@ def main() -> None:
         truncated_backprop_k=args.truncated_backprop_k,
         ln_scale=args.ln_scale,
         xsa_decoder=args.xsa_decoder,
+        shared_recurrent=args.shared_recurrent,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1406,7 +1417,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     use_fixed_depth = args.fixed_train_depth > 0
     log0(f"recurrent_unet: entry={args.num_entry_blocks} enc={args.num_encoder_recurrent}×N "
-         f"dec={args.num_decoder_recurrent}×N exit={args.num_exit_blocks} "
+         f"dec={'shared' if args.shared_recurrent else str(args.num_decoder_recurrent)}×N exit={args.num_exit_blocks} "
          f"train_depth={'fixed=' + str(args.fixed_train_depth) if use_fixed_depth else 'random(mean=' + str(args.recurrent_mean_depth) + ')'} "
          f"eval_depth={args.eval_recurrent_depth}")
 
@@ -1703,6 +1714,7 @@ def main() -> None:
         truncated_backprop_k=args.truncated_backprop_k,
         ln_scale=args.ln_scale,
         xsa_decoder=args.xsa_decoder,
+        shared_recurrent=args.shared_recurrent,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):

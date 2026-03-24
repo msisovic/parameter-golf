@@ -314,6 +314,44 @@ XSA_DECODER=1, LN_SCALE=0. Isolating decoder XSA from Run 7.
 | U-Net Run 8 (+ ln_scale only) | 1.1327 | 1.1412 | 0.009 | 17.8MB | 4837 | 1200s |
 | **U-Net Run 9 (+ XSA dec only)** | **1.1289** | **1.1368** | **0.008** | **18.1MB** | 4739 | 1200s |
 
+## Run 10: 2+1+1+2 dim=704 depth=4, 1200s
+
+**Config:** 2+1+1+2, dim=704, fixed depth=4 (so 2 + 4×1 + 4×1 + 2 = 12 effective layers).
+XSA_DECODER=1, LN_SCALE=0. Fewer recurrent blocks, reinvested params into larger dim.
+
+**Training:**
+| Step | Val BPB | Run 9 | Delta |
+|------|---------|-------|-------|
+| 1000 | 1.3077  | 1.2995 | +0.008 worse |
+| 2000 | 1.2542  | 1.2463 | +0.008 worse |
+| 3000 | 1.2297  | 1.2281 | +0.002 worse |
+| 4000 | 1.1651  | 1.1958 | -0.031 better (but Run 9 at step 4000 had more remaining) |
+| 4068 | 1.1627  | -      | Wallclock cap |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1422** (stride 64)
+- Int6 roundtrip BPB: **1.1752** (standard eval)
+- Int6 sliding window BPB: **1.1527** (stride 64)
+- **Quant penalty: 0.011** (1.1422 → 1.1527, worst since depth=3)
+- Model size: ~18MB int6+zlib (over budget)
+- Step avg: 295ms, 4068 steps in 1200s
+
+**Observations:**
+1. **Worse than Run 9 on all final metrics.** Pre-quant 1.1422 vs 1.1289, int6 SW 1.1527 vs 1.1368.
+2. **Depth=4 with 1 block is slower** (295ms vs 253ms) due to more sequential recurrence iterations — less parallelism within each step.
+3. **Quant penalty regressed** to 0.011 — 4 recurrence iterations amplify quantization error more than 2.
+4. **dim=704 didn't compensate** for losing block parallelism and gaining quant penalty.
+
+**Conclusion:** 2+2+2+2 at depth=2 remains superior to 2+1+1+2 at depth=4. More blocks with fewer iterations beats fewer blocks with more iterations in wallclock-limited regime.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Quant Δ | Size | Steps | Wallclock |
+|---|---|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~0.007 | ~16MB | ~6000+ | 600s |
+| U-Net Run 4 (2+2+2+2, fixed d=2) | 1.1316 | 1.1406 | 0.009 | 18.2MB | 4935 | 1200s |
+| **U-Net Run 9 (+ XSA dec only)** | **1.1289** | **1.1368** | **0.008** | **18.1MB** | 4739 | 1200s |
+| U-Net Run 10 (2+1+1+2 d=4 dim=704) | 1.1422 | 1.1527 | 0.011 | ~18MB | 4068 | 1200s |
+
 ## Key Insights
 
 1. **U-Net skips work well in recurrent setting.** The encoder-decoder structure with skip connections gives depth-dependent information flow without the fixed-point problem of input injection.
