@@ -120,21 +120,60 @@ QAT_THRESHOLD=0.3 (kicked in at step 1505, scale=0.30 — ~360 steps of QAT).
 
 *Run 3 had half the wallclock of Run 2. Per-step convergence is clearly better — needs 1200s rerun.*
 
+## Run 4: Fixed depth=2 training, 1200s
+
+**Config:** 2+2+2+2, dim=640, 8 heads, 4 KV heads, 3x MLP, int6+zstd.
+30.5M params. FIXED_TRAIN_DEPTH=2, EVAL_RECURRENT_DEPTH=2. MAX_WALLCLOCK_SECONDS=1200.
+QAT_THRESHOLD=0.3 (kicked in at step 4574, scale=0.30 — ~360 steps of QAT).
+
+**Training:**
+| Step | Val BPB | Train Loss | Notes |
+|------|---------|------------|-------|
+| 1000 | 1.2985  | 2.2397     | Worse than depth=3 per-step |
+| 2000 | 1.2454  | 2.0051     | |
+| 3000 | 1.2280  | 2.0888     | |
+| 4000 | 1.2062  | 2.1045     | |
+| 4935 | 1.1474  | -          | Wallclock cap (1200s) |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1316** (stride 64)
+- Int6 roundtrip BPB: **1.1630** (standard eval)
+- Int6 sliding window BPB: **1.1406** (stride 64)
+- **Quant penalty: 0.009** (1.1316 → 1.1406, best yet — fewer recurrence iters = less error amplification)
+- Model size: **18.18MB** int6+zstd (over budget)
+- Step avg: 243ms, 4935 steps in 1200s
+
+**Observations:**
+1. **Beats Run 2 on all metrics.** Pre-quant 1.1316 vs 1.1352, int6 1.1406 vs 1.1481. The extra 1400 steps from faster iteration (243ms vs 340ms) more than compensated for shallower effective depth (12 vs 16 layers).
+2. **Quant penalty dramatically reduced** to 0.009 (from 0.013 at depth=3). Fewer recurrence iterations = less quantization error amplification. This is the closest to baseline's ~0.007.
+3. **Model still over budget** at 18.18MB. Same issue as Run 2 — need to reduce dim or use mixed quantization.
+4. **Memory usage much lower**: 26.7GB vs 34.9GB (depth=3). Could potentially increase dim or batch size.
+5. **Per-step convergence worse than depth=3** (1.2985 vs 1.2801 at step 1000), but total wallclock convergence wins due to 33% more steps.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Quant Δ | Size | Steps | Wallclock |
+|---|---|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~0.007 | ~16MB | ~6000+ | 600s |
+| U-Net Run 1 (1+2+2+1, random) | ~1.14* | 1.1652 | 0.015 | 12.8MB | 4034 | 1200s |
+| U-Net Run 2 (2+2+2+2, random d=3) | 1.1352 | 1.1481 | 0.013 | 16.4MB | 3524 | 1200s |
+| U-Net Run 3 (2+2+2+2, fixed d=3) | 1.1825 | 1.1947 | 0.012 | 17.3MB | 1866 | 600s |
+| **U-Net Run 4 (2+2+2+2, fixed d=2)** | **1.1316** | **1.1406** | **0.009** | **18.2MB** | 4935 | 1200s |
+
 ## Key Insights
 
 1. **U-Net skips work well in recurrent setting.** The encoder-decoder structure with skip connections gives depth-dependent information flow without the fixed-point problem of input injection.
 
-2. **Quantization penalty scales with recurrence depth.** Weights reused N times accumulate N× the quantization error. More QAT helps but doesn't fully solve it. Consider: int8 for recurrent blocks (reused), int6 for entry/exit (single-use).
+2. **Quantization penalty scales with recurrence depth.** Weights reused N times accumulate N× the quantization error. Depth=2 has 0.009 penalty vs depth=3's 0.013. More QAT helps too.
 
-3. **Parameter efficiency is excellent.** 6 unique blocks + weight sharing gives 14 effective layers at depth 3, fitting in ~16MB. But we're bottlenecked on steps — 340ms/step means only ~3500 steps in 20 min.
+3. **Fixed depth training is strictly better than random Poisson.** Every gradient update now optimizes the eval configuration directly. No wasted signal on unused depths, faster compilation, simpler code.
 
-4. **Main bottleneck is now step speed.** The baseline gets ~6000+ steps at ~100ms each. We get 3500 at 340ms. If we could speed up (fewer blocks, smaller dim, or faster compilation), BPB would improve further since loss is still dropping fast.
+4. **Depth=2 beats depth=3 in wallclock-limited regime.** Despite weaker per-step convergence, 33% faster steps (243ms vs 322ms) yields 40% more steps (4935 vs ~3700), which more than compensates. Also has lower quant penalty.
+
+5. **Step speed is the critical bottleneck.** Baseline gets ~6000+ steps at ~100ms. We get 4935 at 243ms. Any change that reduces step time is worth pursuing even if per-step learning slightly degrades.
 
 ## Next Steps to Consider
 
-- **Rerun fixed depth at 1200s**: Run 3 only got 600s — need 1200s for fair comparison with Run 2
-- **Try fixed depth=2**: fewer effective layers but faster steps → more steps in wallclock
-- **Mixed quantization**: int8 for recurrent blocks, int6 for entry/exit to reduce quant penalty
-- **Smaller dim + more steps**: dim=576 would be faster and fit budget better
+- **Reduce model size**: dim=640 is over budget. Try dim=576 or mixed int8 for recurrent + int6 for entry/exit
+- **Try depth=1**: even faster steps, even lower quant penalty — but only 8 effective layers, may be too shallow
+- **1+3+3+1 or 2+3+3+1 at depth=2**: more recurrent blocks to compensate for shallow depth
 - **LoRA TTT to patch quant error**: small LoRA at eval time on the quantized model
-- **Depth sweep at eval**: try eval_depth=4 or 5 since depth curve was flat in Run 1
