@@ -209,6 +209,72 @@ Used find_unused_parameters=True in DDP (adds ~7% step overhead: 259ms vs 243ms)
 
 *Run 6 had 7% step overhead from find_unused_parameters. With del fix, expect ~4935 steps and better final BPB.*
 
+## Run 7: ln_scale + XSA decoder, 1200s
+
+**Config:** 2+2+2+2, dim=640, fixed depth=2. Added ln_scale (1/sqrt(effective_layer_idx+1) on
+RMSNorm outputs) and XSA on decoder recurrent blocks (in addition to exit blocks).
+
+**Training:**
+| Step | Val BPB | Run 6 | Delta |
+|------|---------|-------|-------|
+| 1000 | 1.3061  | 1.2987 | +0.007 worse |
+| 2000 | 1.2539  | 1.2477 | +0.006 worse |
+| 3000 | 1.2329  | 1.2295 | +0.003 worse |
+| 4000 | 1.2005  | 1.1902 | +0.010 worse |
+| 4743 | 1.1546  | -      | Wallclock cap |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1338** (stride 64)
+- Int6 roundtrip BPB: **1.1644** (standard eval)
+- Int6 sliding window BPB: **1.1420** (stride 64)
+- **Quant penalty: 0.008** (1.1338 → 1.1420, best yet)
+- Model size: **17.8MB** int6+zlib (over budget)
+- Step avg: 253ms, 4743 steps in 1200s
+
+**Observations:**
+1. **Per-step convergence consistently worse** than Run 6 across all checkpoints.
+2. **Best quant penalty yet** (0.008 vs Run 4's 0.009) — ln_scale may improve quantization friendliness.
+3. **10ms/step overhead** from decoder XSA (253ms vs 243ms), costing ~200 steps.
+4. **Late crossover vs Run 4** at step 4000 (1.2005 vs 1.2062) but not vs Run 6 (1.1902).
+
+## Run 8: ln_scale only (no decoder XSA), 1200s
+
+**Config:** Same as Run 7 but XSA_DECODER=0. Isolating ln_scale contribution.
+
+**Training:**
+| Step | Val BPB | Run 6 | Delta |
+|------|---------|-------|-------|
+| 1000 | 1.3078  | 1.2987 | +0.009 worse |
+| 2000 | 1.2535  | 1.2477 | +0.006 worse |
+| 3000 | 1.2350  | 1.2295 | +0.006 worse |
+| 4000 | 1.2060  | 1.1902 | +0.016 worse |
+| 4837 | 1.1533  | -      | Wallclock cap |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1327** (stride 64)
+- Int6 roundtrip BPB: **1.1636** (standard eval)
+- Int6 sliding window BPB: **1.1412** (stride 64)
+- **Quant penalty: 0.009** (1.1327 → 1.1412)
+- Model size: **17.8MB** int6+zlib (over budget)
+- Step avg: 248ms, 4837 steps in 1200s
+
+**Observations:**
+1. **ln_scale hurts per-step convergence** — gap vs Run 6 widens from +0.009 to +0.016 at step 4000.
+2. **Step speed recovered** to 248ms (vs Run 7's 253ms), confirming decoder XSA was the overhead source.
+3. **Final pre-quant 1.1327 slightly worse than Run 4's 1.1316** despite more steps (4837 vs 4935). ln_scale is a net negative for training quality.
+4. **Quant penalty 0.009** — same as Run 4, so the 0.008 in Run 7 was from decoder XSA, not ln_scale.
+
+**Conclusion:** ln_scale is harmful. The fixed 1/sqrt(idx) attenuation fights the learned per-iteration attn_scale/mlp_scale params. The baseline's ln_scale worked because layer indices were fixed; with recurrence + per-iter control params, the model can already learn its own signal regulation.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Quant Δ | Size | Steps | Wallclock |
+|---|---|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~0.007 | ~16MB | ~6000+ | 600s |
+| U-Net Run 4 (2+2+2+2, fixed d=2) | 1.1316 | 1.1406 | 0.009 | 18.2MB | 4935 | 1200s |
+| U-Net Run 6 (+ per-iter ctrl params) | 1.1321 | 1.1417 | 0.010 | 18.1MB | 4629 | 1200s |
+| U-Net Run 7 (+ ln_scale + XSA dec) | 1.1338 | 1.1420 | 0.008 | 17.8MB | 4743 | 1200s |
+| U-Net Run 8 (+ ln_scale only) | 1.1327 | 1.1412 | 0.009 | 17.8MB | 4837 | 1200s |
+
 ## Key Insights
 
 1. **U-Net skips work well in recurrent setting.** The encoder-decoder structure with skip connections gives depth-dependent information flow without the fixed-point problem of input injection.
