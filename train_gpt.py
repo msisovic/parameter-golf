@@ -666,7 +666,7 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, q_gain: Tensor = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -676,7 +676,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        q = q * q_gain.to(dtype=q.dtype)[None, None, :, None]
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
@@ -754,12 +754,14 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
+    def forward(self, x: Tensor, x0: Tensor,
+                attn_scale: Tensor, mlp_scale: Tensor,
+                resid_mix: Tensor, q_gain: Tensor) -> Tensor:
+        mix = resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        attn_out = self.attn(self.attn_norm(x), q_gain=q_gain)
+        x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -814,8 +816,35 @@ class GPT(nn.Module):
         self.decoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_decoder_recurrent)])
         self.exit_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_exit_blocks)])
 
-        # U-net skip weight: single learned per-dim weight for skip connections
-        self.skip_weight = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+        # Delete control params from recurrent blocks — replaced by per-iteration params below
+        for block in list(self.encoder_blocks) + list(self.decoder_blocks):
+            del block.attn_scale, block.mlp_scale, block.resid_mix, block.attn.q_gain
+
+        # U-net skip weights: entry→exit skips
+        self.num_entry_exit_skips = min(num_entry_blocks, num_exit_blocks)
+        self.entry_skip_weight = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+
+        # Per-iteration control params for recurrent blocks
+        # Shape: (mean_depth, num_blocks, ...) — indexed by [iteration, block_idx]
+        n_enc = num_encoder_recurrent
+        n_dec = num_decoder_recurrent
+        d = mean_depth
+        self.enc_iter_attn_scale = nn.Parameter(torch.ones(d, n_enc, model_dim, dtype=torch.float32))
+        self.enc_iter_mlp_scale = nn.Parameter(torch.ones(d, n_enc, model_dim, dtype=torch.float32))
+        self.enc_iter_resid_mix = nn.Parameter(
+            torch.stack([torch.stack([torch.ones(model_dim), torch.zeros(model_dim)])
+                         for _ in range(d * n_enc)]).reshape(d, n_enc, 2, model_dim).float())
+        self.enc_iter_q_gain = nn.Parameter(torch.full((d, n_enc, num_heads), qk_gain_init, dtype=torch.float32))
+
+        self.dec_iter_attn_scale = nn.Parameter(torch.ones(d, n_dec, model_dim, dtype=torch.float32))
+        self.dec_iter_mlp_scale = nn.Parameter(torch.ones(d, n_dec, model_dim, dtype=torch.float32))
+        self.dec_iter_resid_mix = nn.Parameter(
+            torch.stack([torch.stack([torch.ones(model_dim), torch.zeros(model_dim)])
+                         for _ in range(d * n_dec)]).reshape(d, n_dec, 2, model_dim).float())
+        self.dec_iter_q_gain = nn.Parameter(torch.full((d, n_dec, num_heads), qk_gain_init, dtype=torch.float32))
+
+        # Per-iteration skip weight for decoder recurrence
+        self.dec_iter_skip_weight = nn.Parameter(torch.ones(d, model_dim, dtype=torch.float32))
 
         # XSA on exit blocks
         if xsa_last_n > 0:
@@ -854,35 +883,50 @@ class GPT(nn.Module):
                             module.weight.mul_(1.0 / math.sqrt(2 * n_eff))
 
     def _run_body(self, x: Tensor, x0: Tensor) -> Tensor:
-        """Entry → Encoder recurrence → Decoder recurrence with U-net skips → Exit."""
-        # Entry
+        """Entry → Encoder recurrence → Decoder recurrence with U-net skips → Exit with entry skips."""
+        # Entry: save states for entry→exit skips
+        entry_states: list[Tensor] = []
         for block in self.entry_blocks:
-            x = block(x, x0)
+            x = block(x, x0, block.attn_scale, block.mlp_scale, block.resid_mix, block.attn.q_gain)
+            entry_states.append(x)
 
-        # Encoder recurrence: N iterations of encoder_blocks, save states for skips
+        # Encoder recurrence with per-iteration control params
         n = self.n_recurrent_iters
         k = self.truncated_backprop_k
         encoder_states: list[Tensor] = []
         for i in range(n):
             if i == n - k and n > k:
                 x = x.detach()
-            for block in self.encoder_blocks:
-                x = block(x, x0)
+            for j, block in enumerate(self.encoder_blocks):
+                x = block(x, x0,
+                          self.enc_iter_attn_scale[i, j],
+                          self.enc_iter_mlp_scale[i, j],
+                          self.enc_iter_resid_mix[i, j],
+                          self.enc_iter_q_gain[i, j])
             encoder_states.append(x)
 
-        # Decoder recurrence: N iterations of decoder_blocks with U-net skip from mirror encoder
-        sw = self.skip_weight.to(dtype=x.dtype)[None, None, :]
+        # Decoder recurrence with per-iteration control params and U-net skips
         for i in range(n):
             if i == n - k and n > k:
                 x = x.detach()
             skip = encoder_states[n - 1 - i]
+            sw = self.dec_iter_skip_weight[i].to(dtype=x.dtype)[None, None, :]
             x = x + sw * skip
-            for block in self.decoder_blocks:
-                x = block(x, x0)
+            for j, block in enumerate(self.decoder_blocks):
+                x = block(x, x0,
+                          self.dec_iter_attn_scale[i, j],
+                          self.dec_iter_mlp_scale[i, j],
+                          self.dec_iter_resid_mix[i, j],
+                          self.dec_iter_q_gain[i, j])
 
-        # Exit
-        for block in self.exit_blocks:
-            x = block(x, x0)
+        # Exit with entry→exit skips (mirror order)
+        esw = self.entry_skip_weight.to(dtype=x.dtype)[None, None, :]
+        n_skips = self.num_entry_exit_skips
+        for i, block in enumerate(self.exit_blocks):
+            skip_idx = n_skips - 1 - i
+            if 0 <= skip_idx < len(entry_states):
+                x = x + esw * entry_states[skip_idx]
+            x = block(x, x0, block.attn_scale, block.mlp_scale, block.resid_mix, block.attn.q_gain)
         return x
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1229,7 +1273,7 @@ def main() -> None:
         num_encoder_recurrent=args.num_encoder_recurrent,
         num_decoder_recurrent=args.num_decoder_recurrent,
         num_exit_blocks=args.num_exit_blocks,
-        mean_depth=args.recurrent_mean_depth,
+        mean_depth=args.fixed_train_depth if args.fixed_train_depth > 0 else args.recurrent_mean_depth,
         truncated_backprop_k=args.truncated_backprop_k,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -1261,7 +1305,17 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params.append(base_model.skip_weight)
+    scalar_params.append(base_model.entry_skip_weight)
+    # Per-iteration control params for recurrent blocks
+    scalar_params.append(base_model.enc_iter_attn_scale)
+    scalar_params.append(base_model.enc_iter_mlp_scale)
+    scalar_params.append(base_model.enc_iter_resid_mix)
+    scalar_params.append(base_model.enc_iter_q_gain)
+    scalar_params.append(base_model.dec_iter_attn_scale)
+    scalar_params.append(base_model.dec_iter_mlp_scale)
+    scalar_params.append(base_model.dec_iter_resid_mix)
+    scalar_params.append(base_model.dec_iter_q_gain)
+    scalar_params.append(base_model.dec_iter_skip_weight)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
@@ -1617,7 +1671,7 @@ def main() -> None:
         num_encoder_recurrent=args.num_encoder_recurrent,
         num_decoder_recurrent=args.num_decoder_recurrent,
         num_exit_blocks=args.num_exit_blocks,
-        mean_depth=args.recurrent_mean_depth,
+        mean_depth=args.fixed_train_depth if args.fixed_train_depth > 0 else args.recurrent_mean_depth,
         truncated_backprop_k=args.truncated_backprop_k,
     ).to(device).bfloat16()
     for m in eval_model.modules():

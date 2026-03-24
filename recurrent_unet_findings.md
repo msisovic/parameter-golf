@@ -159,6 +159,56 @@ QAT_THRESHOLD=0.3 (kicked in at step 4574, scale=0.30 — ~360 steps of QAT).
 | U-Net Run 3 (2+2+2+2, fixed d=3) | 1.1825 | 1.1947 | 0.012 | 17.3MB | 1866 | 600s |
 | **U-Net Run 4 (2+2+2+2, fixed d=2)** | **1.1316** | **1.1406** | **0.009** | **18.2MB** | 4935 | 1200s |
 
+## Run 5: Entry→exit skip connections (killed early)
+
+**Config:** Same as Run 4 + entry→exit U-net skip connections (mirror pattern matching baseline).
+Killed at ~step 2600 — no measurable improvement.
+
+- Step 1000: 1.2999 (Run 4: 1.2985)
+- Step 2000: 1.2471 (Run 4: 1.2454)
+
+**Conclusion:** Entry→exit skips don't help with only 2 entry and 2 exit blocks. The recurrent body dominates.
+
+## Run 6: Per-iteration control params, 1200s
+
+**Config:** 2+2+2+2, dim=640, fixed depth=2. Each recurrence iteration gets its own
+attn_scale, mlp_scale, resid_mix, q_gain, skip_weight (~22K extra params).
+Used find_unused_parameters=True in DDP (adds ~7% step overhead: 259ms vs 243ms).
+
+**Training:**
+| Step | Val BPB | Train Loss | Notes |
+|------|---------|------------|-------|
+| 1000 | 1.2987  | 2.2411     | Same as Run 4 (1.2985) |
+| 2000 | 1.2477  | 2.0054     | Slightly worse than Run 4 (1.2454) |
+| 3000 | 1.2295  | 2.0931     | Run 4: 1.2280 |
+| 4000 | 1.1902  | 2.0779     | **Run 4: 1.2062 — 0.016 better!** |
+| 4629 | 1.1509  | -          | Wallclock cap (1200s) |
+
+**Final results:**
+- Pre-quant sliding window BPB: **1.1321** (stride 64)
+- Int6 roundtrip BPB: **1.1642** (standard eval)
+- Int6 sliding window BPB: **1.1417** (stride 64)
+- **Quant penalty: 0.010** (1.1321 → 1.1417)
+- Model size: **18.07MB** int6+zstd (over budget)
+- Step avg: 259ms, 4629 steps in 1200s
+
+**Observations:**
+1. **Per-iteration params help in later training.** At step 1000-2000 they show no benefit, but by step 4000 they're 0.016 better than Run 4. The model learns to use different control params per iteration as training progresses.
+2. **Speed penalty from find_unused_parameters** (259ms vs 243ms) cost ~300 steps. Fix: delete unused block params before DDP wrapping to avoid the overhead.
+3. **With the speed fix, this would likely beat Run 4.** At 243ms we'd get ~4935 steps, and the per-step advantage at step 4000+ would carry through to the final result.
+4. **Final int6 SW 1.1417 vs Run 4's 1.1406** — slightly worse due to fewer steps, but per-step convergence is clearly better.
+
+**Updated comparison:**
+| Architecture | Pre-quant SW | Int6 SW | Quant Δ | Size | Steps | Wallclock |
+|---|---|---|---|---|---|---|
+| Baseline (11 unique) | - | 1.1248 | ~0.007 | ~16MB | ~6000+ | 600s |
+| U-Net Run 2 (2+2+2+2, random d=3) | 1.1352 | 1.1481 | 0.013 | 16.4MB | 3524 | 1200s |
+| U-Net Run 4 (2+2+2+2, fixed d=2) | 1.1316 | 1.1406 | 0.009 | 18.2MB | 4935 | 1200s |
+| U-Net Run 5 (+ entry/exit skips) | - | - | - | - | killed | - |
+| **U-Net Run 6 (+ per-iter ctrl params)** | **1.1321** | **1.1417** | **0.010** | **18.1MB** | 4629 | 1200s |
+
+*Run 6 had 7% step overhead from find_unused_parameters. With del fix, expect ~4935 steps and better final BPB.*
+
 ## Key Insights
 
 1. **U-Net skips work well in recurrent setting.** The encoder-decoder structure with skip connections gives depth-dependent information flow without the fixed-point problem of input injection.
@@ -171,9 +221,14 @@ QAT_THRESHOLD=0.3 (kicked in at step 4574, scale=0.30 — ~360 steps of QAT).
 
 5. **Step speed is the critical bottleneck.** Baseline gets ~6000+ steps at ~100ms. We get 4935 at 243ms. Any change that reduces step time is worth pursuing even if per-step learning slightly degrades.
 
+6. **Per-iteration control params help in late training.** Giving each recurrence iteration its own attn_scale, mlp_scale, resid_mix, q_gain, skip_weight (~22K extra params) shows no benefit early but 0.016 BPB improvement by step 4000. The model learns to differentiate iteration behavior as it matures.
+
+7. **Entry→exit skip connections don't help.** With only 2 entry and 2 exit blocks, the skip signal is negligible compared to the recurrent body.
+
 ## Next Steps to Consider
 
+- **Fix per-iter param speed**: delete unused block params before DDP to eliminate find_unused_parameters overhead, then rerun Run 6 at full speed
+- **2+1+1+2 at depth=2**: fewer recurrent blocks → faster steps, potentially unlock larger dim
 - **Reduce model size**: dim=640 is over budget. Try dim=576 or mixed int8 for recurrent + int6 for entry/exit
-- **Try depth=1**: even faster steps, even lower quant penalty — but only 8 effective layers, may be too shallow
-- **1+3+3+1 or 2+3+3+1 at depth=2**: more recurrent blocks to compensate for shallow depth
+- **GPTQ**: smarter post-training quantization to reduce quant penalty
 - **LoRA TTT to patch quant error**: small LoRA at eval time on the quantized model
