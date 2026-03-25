@@ -162,3 +162,29 @@ Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11
 - Gap to full independent 12-layer (1.1126) is 0.0037 — weight sharing costs more with 2 repeated layers.
 - Step time increased to ~188ms (from 174ms), resulting in ~500 fewer steps in the wallclock budget.
 - The extra virtual depth helps despite fewer training steps.
+
+---
+
+## Experiment 6: RECUR_LAYERS=4,5,6 + tied TTT (triple recurrence, 11 physical → 14 virtual layers)
+
+- **Date**: 2026-03-25
+- **Hardware**: 4xH100 80GB
+- **Key changes**: RECUR_LAYERS=4,5,6, TTT_ENABLED=1, TTT_UNTIE=0
+- **model_params**: 27,000,948 (~27M)
+- **Steps completed**: 5,977 / 9000 (wallclock capped at 1200s)
+- **Step avg**: ~201ms
+- **TTT time**: 700s (tied)
+- **Submission size**: 15,921,244 bytes (~15.9 MB)
+
+### Results
+| Metric | Value |
+|--------|-------|
+| Post-EMA val_bpb | 1.1365 |
+| Final int6 sliding window val_bpb | 1.1217 |
+| **Post-TTT sliding window val_bpb** | **1.1190** |
+
+### Notes
+- Triple recurrence (1.1190) is worse than dual (1.1163) despite more virtual depth (14 vs 13).
+- Lost ~400 steps vs dual due to slower step time (201ms vs 188ms).
+- Per-step learning was slightly better, but not enough to overcome fewer total steps.
+- **Conclusion: dual recurrence at layers 4,5 is the sweet spot for this wallclock budget.**
