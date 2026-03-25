@@ -100,7 +100,7 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "0")))
     gptq_start_step = int(os.environ.get("GPTQ_START_STEP", 5700))
-    gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
+    gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 64))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
     recur_layer = int(os.environ.get("RECUR_LAYER", -1))  # single layer compat
     recur_layers_str = os.environ.get("RECUR_LAYERS", "")  # comma-separated, e.g. "4,5"
