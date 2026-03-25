@@ -1978,29 +1978,13 @@ def main() -> None:
             current_state = base_model.state_dict()
             avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
             base_model.load_state_dict(avg_state, strict=True)
-        torch.cuda.synchronize()
-        t_diag = time.perf_counter()
-        diag_val_loss, diag_val_bpb = eval_val(
-            args, compiled_model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
-        )
         full_state_dict = base_model.state_dict()
         export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
         excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
         if excluded_mtp > 0:
             log0(f"export_excluding_mtp_params:{excluded_mtp}")
-        if master_process:
-            torch.save(export_sd, "final_model.pt")
-            model_bytes = os.path.getsize("final_model.pt")
-            code_bytes = len(code.encode("utf-8"))
-            log0(f"Serialized model: {model_bytes} bytes")
-            log0(f"Code size: {code_bytes} bytes")
         # GPTQ: collect Hessians using training data (within training time budget)
+        # Runs immediately after EMA, before diagnostic eval, to maximize time budget
         gptq_hessians = None
         if args.gptq_enabled:
             log0("gptq:starting hessian collection")
@@ -2013,6 +1997,24 @@ def main() -> None:
             )
             log0(f"gptq:hessian collection took {time.perf_counter() - t_gptq:.1f}s")
         # Unbank 3D tensors into individual 2D tensors for quantization
+        # Diagnostic eval + model save (after GPTQ, outside time budget)
+        torch.cuda.synchronize()
+        t_diag = time.perf_counter()
+        diag_val_loss, diag_val_bpb = eval_val(
+            args, compiled_model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
+        )
+        if master_process:
+            torch.save(export_sd, "final_model.pt")
+            model_bytes = os.path.getsize("final_model.pt")
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model: {model_bytes} bytes")
+            log0(f"Code size: {code_bytes} bytes")
         sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
         unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
         quant_result, quant_meta = mixed_quantize_int6(
@@ -2023,7 +2025,7 @@ def main() -> None:
         quant_buf = io.BytesIO()
         torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
         quant_raw = quant_buf.getvalue()
-        quant_blob = lzma.compress(quant_raw, preset=8)
+        quant_blob = lzma.compress(quant_raw, preset=9)
         if master_process:
             with open("final_model.int6.ptz", "wb") as f:
                 f.write(quant_blob)
