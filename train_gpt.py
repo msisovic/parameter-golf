@@ -1448,9 +1448,8 @@ def collect_hessians(model, train_loader, args, device: torch.device,
     for h in hooks:
         h.remove()
     model.train()
-    # Normalize
-    for name in hessians:
-        hessians[name] /= n_batches
+    # Normalize (clone to escape inference mode tensors)
+    hessians = {k: v.clone() / n_batches for k, v in hessians.items()}
     log0(f"gptq:collected hessians for {len(hessians)} layers over {n_batches} batches")
     return {k: v.cpu() for k, v in hessians.items()}
 
