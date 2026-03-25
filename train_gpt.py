@@ -99,7 +99,8 @@ class Hyperparameters:
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "0")))
-    gptq_start_step = int(os.environ.get("GPTQ_START_STEP", 5700))
+    gptq_start_step = int(os.environ.get("GPTQ_START_STEP", 0))  # 0 = use time-based cutoff
+    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 10.0))
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 64))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
     recur_layer = int(os.environ.get("RECUR_LAYER", -1))  # single layer compat
@@ -1795,7 +1796,10 @@ def main() -> None:
         )
         log0(f"seed:{args.seed}")
         if args.gptq_enabled:
-            log0(f"gptq:enabled start_step:{args.gptq_start_step} calib_batches:{args.gptq_calib_batches} block_size:{args.gptq_block_size}")
+            if args.gptq_start_step > 0:
+                log0(f"gptq:enabled start_step:{args.gptq_start_step} calib_batches:{args.gptq_calib_batches} block_size:{args.gptq_block_size}")
+            else:
+                log0(f"gptq:enabled reserve_seconds:{args.gptq_reserve_seconds} calib_batches:{args.gptq_calib_batches} block_size:{args.gptq_block_size}")
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
         def zero_grad_all() -> None:
             for opt in optimizers:
@@ -1948,9 +1952,14 @@ def main() -> None:
                     f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 )
             reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
-            # GPTQ: stop training early at fixed step to leave time for calibration
-            if args.gptq_enabled and step >= args.gptq_start_step:
-                reached_cap = True
+            # GPTQ: stop training early to leave time for calibration
+            if args.gptq_enabled and not reached_cap:
+                if args.gptq_start_step > 0 and step >= args.gptq_start_step:
+                    reached_cap = True
+                elif args.gptq_start_step == 0 and max_wallclock_ms is not None:
+                    gptq_cutoff_ms = max_wallclock_ms - args.gptq_reserve_seconds * 1000.0
+                    if approx_training_time_ms >= gptq_cutoff_ms:
+                        reached_cap = True
             if distributed and max_wallclock_ms is not None:
                 reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
                 dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
