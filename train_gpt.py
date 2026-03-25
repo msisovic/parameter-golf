@@ -101,6 +101,7 @@ class Hyperparameters:
     recur_layer = int(os.environ.get("RECUR_LAYER", -1))  # single layer compat
     recur_layers_str = os.environ.get("RECUR_LAYERS", "")  # comma-separated, e.g. "4,5"
     eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
+    eval_bottleneck_reps = int(os.environ.get("EVAL_BOTTLENECK_REPS", 0))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -890,6 +891,8 @@ class GPT(nn.Module):
         )
         for head in self.mtp_heads:
             head._zero_init = True
+        self.bottleneck_blocks = nn.ModuleList()
+        self.bottleneck_bank_indices: list[int] = []
         if xsa_last_n > 0:
             for i in range(max(0, virtual_num_layers - xsa_last_n), virtual_num_layers):
                 self.blocks[i].attn.use_xsa = True
@@ -948,6 +951,11 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+        for block, pi in zip(self.bottleneck_blocks, self.bottleneck_bank_indices):
+            x, _ = block(x, x0,
+                self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
+                self.qo_bank[n + pi], self.mlp_up_bank[pi], self.mlp_down_bank[pi],
+                v_embed=None, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             pi = v2p[bi]
@@ -1009,6 +1017,11 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+        for block, pi in zip(self.bottleneck_blocks, self.bottleneck_bank_indices):
+            x, _ = block(x, x0,
+                self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
+                self.qo_bank[n + pi], self.mlp_up_bank[pi], self.mlp_down_bank[pi],
+                v_embed=None, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             pi = v2p[bi]
@@ -1064,6 +1077,25 @@ class GPT(nn.Module):
         self.num_physical_layers = new_n
         self.v2p = list(range(new_n))
         self.recur_layers = []
+
+    def add_eval_bottleneck(self, reps: int = 1):
+        """Add extra repetitions of recur_layers as bottleneck between encoder/decoder.
+        Does not change encoder/decoder split or skip connections."""
+        import copy
+        if not self.recur_layers:
+            return
+        rl = sorted(self.recur_layers)
+        # Source blocks: the second pass of each recur layer (decoder side)
+        cutoff = max(rl) + 1
+        new_blocks = nn.ModuleList()
+        new_bank_indices = []
+        for _ in range(reps):
+            for r in rl:
+                source_vi = cutoff + rl.index(r)  # virtual index of the 2nd pass
+                new_blocks.append(copy.deepcopy(self.blocks[source_vi]))
+                new_bank_indices.append(r)
+        self.bottleneck_blocks = new_blocks
+        self.bottleneck_bank_indices = new_bank_indices
 
 # --- Sliding window evaluation ---
 
@@ -1911,6 +1943,9 @@ def main() -> None:
     # Re-bank the dequantized tensors
     deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, template_sd)
     eval_model.load_state_dict(deq_state, strict=True)
+    if args.eval_bottleneck_reps > 0 and eval_model.recur_layers:
+        eval_model.add_eval_bottleneck(args.eval_bottleneck_reps)
+        log0(f"eval_bottleneck:reps={args.eval_bottleneck_reps} layers={eval_model.bottleneck_bank_indices} extra_blocks={len(eval_model.bottleneck_blocks)}")
     compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()

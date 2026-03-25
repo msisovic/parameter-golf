@@ -188,3 +188,41 @@ Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11
 - Lost ~400 steps vs dual due to slower step time (201ms vs 188ms).
 - Per-step learning was slightly better, but not enough to overcome fewer total steps.
 - **Conclusion: dual recurrence at layers 4,5 is the sweet spot for this wallclock budget.**
+
+---
+
+## Experiment 5b: Untied TTT on dual recurrence (RECUR_LAYERS=4,5)
+
+- **Date**: 2026-03-25
+- **Same checkpoint as Exp 5**, only TTT_UNTIE=1 differs
+- **Post-TTT sliding window val_bpb**: **1.1163** (identical to tied 1.1163)
+- **Conclusion**: Untying doesn't help for dual recurrence either, matching the single-recurrence finding (Exp 4b). Tied TTT is sufficient.
+
+---
+
+## Experiment 7: Eval-time bottleneck (RECUR_LAYERS=4,5, EVAL_BOTTLENECK_REPS=1)
+
+- **Date**: 2026-03-25
+- **Hardware**: 4xH100 80GB
+- **Key changes**: EVAL_ONLY=1, EVAL_BOTTLENECK_REPS=1 (adds 2 extra virtual layers between encoder/decoder at eval time)
+- **Same checkpoint as Exp 5** (RECUR_LAYERS=4,5 trained model)
+- **Virtual depth at eval**: 15 (13 trained + 2 bottleneck)
+- **TTT time**: 724s (tied)
+
+### Results
+| Metric | Value |
+|--------|-------|
+| Final int6 sliding window val_bpb (with bottleneck) | 1.1472 |
+| **Post-TTT sliding window val_bpb** | **1.1219** |
+
+### Comparison to no-bottleneck (Exp 5)
+| Metric | No bottleneck (Exp 5) | +1 bottleneck rep (Exp 7) | Delta |
+|--------|----------------------|--------------------------|-------|
+| Pre-TTT sliding window | 1.1187 | 1.1472 | +0.0285 |
+| Post-TTT sliding window | 1.1163 | 1.1219 | +0.0056 |
+
+### Notes
+- The extra untrained bottleneck blocks start far from useful (1.1472 vs 1.1187 pre-TTT).
+- TTT recovers most of the gap but not all — final result is 0.0056 worse than without bottleneck.
+- **Conclusion: Eval-time bottleneck with deepcopy of trained blocks does not help.** The copied blocks need to be trained to integrate into the forward pass. 3-epoch TTT is insufficient to close the gap.
+- Possible improvement: initialize bottleneck blocks as identity/near-identity rather than copies of mid-network blocks.
