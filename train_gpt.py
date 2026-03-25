@@ -100,7 +100,7 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "0")))
     gptq_start_step = int(os.environ.get("GPTQ_START_STEP", 0))  # 0 = use time-based cutoff
-    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 10.0))
+    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 20.0))
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 64))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
     recur_layer = int(os.environ.get("RECUR_LAYER", -1))  # single layer compat
