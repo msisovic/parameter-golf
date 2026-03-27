@@ -226,3 +226,36 @@ Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11
 - TTT recovers most of the gap but not all — final result is 0.0056 worse than without bottleneck.
 - **Conclusion: Eval-time bottleneck with deepcopy of trained blocks does not help.** The copied blocks need to be trained to integrate into the forward pass. 3-epoch TTT is insufficient to close the gap.
 - Possible improvement: initialize bottleneck blocks as identity/near-identity rather than copies of mid-network blocks.
+
+---
+
+## Experiment 8: Dual recurrence layer placement sweep (no TTT)
+
+- **Date**: 2026-03-26
+- **Hardware**: 4xH100 80GB
+- **Key changes**: Swept RECUR_LAYERS across 6 pairs to find optimal placement, no TTT
+- **Other params**: ITERATIONS=9000, MODEL_DIM=512, NUM_LAYERS=11 (physical), all else defaults
+- **model_params**: 26,998,380 (~27M) for all runs
+- **Virtual depth**: 13 (11 physical + 2 recurrent) for all runs
+- **Step avg**: ~189ms across all runs
+- **Wallclock**: 1200s (all runs hit cap)
+
+### Results
+
+| RECUR_LAYERS | Steps | Post-EMA val_bpb | Int6 val_bpb | Int6 sliding window val_bpb | Submission size |
+|--------------|-------|-------------------|--------------|----------------------------|-----------------|
+| 0,1 | 6,309 | 1.1396 | 1.1479 | 1.1245 | 15.92 MB |
+| 2,3 | 6,332 | 1.1348 | 1.1431 | 1.1196 | 15.94 MB |
+| **4,5** | **6,335** | **1.1340** | **1.1424** | **1.1190** | **15.94 MB** |
+| 6,7 | 6,335 | 1.1361 | 1.1444 | 1.1208 | 15.95 MB |
+| 8,9 | 6,340 | 1.1414 | 1.1498 | 1.1263 | 16.03 MB |
+| 9,10 | 6,342 | 1.1419 | — (incomplete) | — (incomplete) | 15.95 MB |
+
+### Notes
+- **Best placement: layers 4,5** (1.1190 sliding window), confirming the choice in Exp 5.
+- Clear U-shaped curve: mid-network recurrence works best, with performance degrading toward both ends.
+- Early layers (0,1) are 0.0055 worse than (4,5) — early representations are too low-level to benefit from repetition.
+- Late layers (8,9) are 0.0073 worse than (4,5) — late recurrence hurts more, likely because these layers are more specialized.
+- The (2,3) and (6,7) placements are close runners-up at 1.1196 and 1.1208 respectively.
+- No TTT was run in this sweep; adding TTT to the (4,5) winner matches Exp 5's result of 1.1163.
+- The recur_9_10 run had an incomplete evaluation (log truncated after submission size).
