@@ -84,6 +84,46 @@ Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11
 
 ---
 
+## Experiment 3b: NUM_LAYERS=13 + TTT (dim=512, no recurrence)
+
+- **Date**: 2026-03-27
+- **Hardware**: 4xH100 80GB
+- **Key changes**: NUM_LAYERS=13 (independent layers, no recurrence), TTT_ENABLED=1, MAX_WALLCLOCK_SECONDS=1200
+- **Other params**: ITERATIONS=9000, MODEL_DIM=512, all other hyperparams at code defaults
+- **model_params**: 31,651,436 (~32M, well over budget)
+- **Steps completed**: 5,995 / 9000 (wallclock capped at 1200s)
+- **Step avg**: ~200ms
+- **Peak memory**: 25,474 MiB
+- **TTT time**: 696s (1893 chunks, 3 epochs each)
+- **Submission size**: 18,535,401 bytes (~18.5 MB)
+
+### Results
+| Metric | Value |
+|--------|-------|
+| Post-EMA val_bpb | 1.1297 |
+| Final int6 quantized val_bpb | 1.1374 |
+| Final int6 sliding window val_bpb | 1.1140 |
+| **Post-TTT sliding window val_bpb** | **1.1117** |
+
+### Comparison to 12-layer (Exp 3) and dual recurrence (Exp 5)
+| Metric | 12L (Exp 3) | 13L (Exp 3b) | Recur 4,5 (Exp 5) |
+|--------|-------------|--------------|---------------------|
+| Params | 29.4M | 31.7M | 27.0M |
+| Virtual depth | 12 | 13 | 13 |
+| Steps completed | 6,879 | 5,995 | 6,389 |
+| Step avg | ~174ms | ~200ms | ~188ms |
+| Sliding window val_bpb | 1.1151 | 1.1140 | 1.1187 |
+| Post-TTT val_bpb | 1.1126 | 1.1117 | 1.1163 |
+
+### Notes
+- 13L independent beats 12L by only 0.0009 BPB (1.1117 vs 1.1126) despite +2.3M params and same virtual depth +1.
+- Got ~900 fewer steps than 12L due to slower step time (200ms vs 174ms).
+- At matched virtual depth of 13: independent 13L (1.1117) beats dual recurrence (1.1163) by 0.0046 — but costs +4.7M params.
+- Diminishing returns from adding independent layers: 11→12 gave ~0.007 BPB gain, but 12→13 gives only ~0.001.
+- Well over param budget (~32M), not submittable.
+
+---
+
 ## Experiment 4: RECUR_LAYER=5 + TTT (depth recurrence, 11 physical → 12 virtual layers)
 
 - **Date**: 2026-03-25
@@ -262,3 +302,76 @@ Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11
 - The 4,5 sweet spot coincides with the U-Net encoder/decoder boundary (virtual layers 6/7 out of 13), placing recurrence exactly at the skip connection hinge point.
 - No TTT was run in this sweep; adding TTT to the (4,5) winner matches Exp 5's result of 1.1163.
 - The recur_9_10 run had an incomplete evaluation (log truncated after submission size).
+
+---
+
+## Experiment 9: Delayed recurrence (RECUR_LAYERS=4,5 activated at step 3000)
+
+- **Date**: 2026-03-27
+- **Hardware**: 4xH100 80GB
+- **Key changes**: RECUR_LAYERS=4,5, RECUR_START_STEP=3000 (train as 11L for 3k steps, then activate recurrence), TTT_ENABLED=1, TTT_UNTIE=0
+- **Other params**: ITERATIONS=9000, MODEL_DIM=512, NUM_LAYERS=11 (physical), all else defaults
+- **model_params**: 26,998,380 (~27M)
+- **Steps completed**: 6,345 / 9000 (wallclock capped at 1200s)
+- **Step avg**: ~161ms (steps 0-3000), ~189ms (steps 3000-6345), blended ~189ms
+- **Peak memory**: 25,386 MiB
+- **Submission size**: 16,094,569 bytes (~16.1 MB)
+
+### Results
+| Metric | Value |
+|--------|-------|
+| Post-EMA val_bpb | 1.1347 |
+| Final int6 quantized val_bpb | 1.1437 |
+| Final int6 sliding window val_bpb | 1.1201 |
+
+### Comparison to always-on recurrence (Exp 5)
+| Metric | Always-on (Exp 5) | Delayed 3k (Exp 9) | Delta |
+|--------|-------------------|---------------------|-------|
+| Steps completed | 6,389 | 6,345 | -44 |
+| Pre-3k step avg | 188ms | 161ms | -27ms |
+| Post-3k step avg | 188ms | 189ms | same |
+| Sliding window val_bpb | 1.1187 | 1.1201 | +0.0014 (worse) |
+
+### Notes
+- **Delayed recurrence is worse (1.1201 vs 1.1187)** despite saving ~80s of wallclock in the first 3k steps.
+- Only gained ~44 extra steps total — the fast 161ms phase saves 27ms/step × 3000 = ~80s, but that's only ~420 extra steps at 189ms, and the average over the full run is nearly the same.
+- The core problem: the shared weights weren't trained for dual-use during the critical first 3k steps. When recurrence activates, the recurrence blocks' scalars (attn_scale, mlp_scale, resid_mix) are at init values and the bank weights haven't learned to handle two passes. 3345 steps of recurrence training isn't enough to catch up.
+- **Conclusion (revised in Exp 9b):** The poor result was due to `torch._dynamo.reset()` at step 3000 causing a ~90s recompilation, eating all the wallclock savings and then some.
+
+---
+
+## Experiment 9b: Delayed recurrence with pre-warmed compilation
+
+- **Date**: 2026-03-27
+- **Hardware**: 4xH100 80GB
+- **Key changes**: Same as Exp 9, but pre-warm both torch.compile traces during warmup phase to avoid recompilation cost at step 3000
+- **Other params**: ITERATIONS=9000, RECUR_LAYERS=4,5, RECUR_START_STEP=3000, TTT_ENABLED=1, TTT_UNTIE=0
+- **model_params**: 26,998,380 (~27M)
+- **Steps completed**: 6,747 / 9000 (wallclock capped at 1200s)
+- **Step avg**: ~178ms blended (161ms pre-recurrence, ~189ms post-recurrence)
+- **Peak memory**: 25,385 MiB
+- **TTT time**: 687s
+- **Submission size**: 16,055,875 bytes (~16.1 MB)
+
+### Results
+| Metric | Value |
+|--------|-------|
+| Post-EMA val_bpb | 1.1329 |
+| Final int6 quantized val_bpb | 1.1414 |
+| Final int6 sliding window val_bpb | 1.1179 |
+| **Post-TTT sliding window val_bpb** | **1.1153** |
+
+### Comparison
+| Metric | Always-on (Exp 5) | Delayed no-prewarm (Exp 9) | Delayed prewarmed (Exp 9b) |
+|--------|-------------------|---------------------------|---------------------------|
+| Steps completed | 6,389 | 6,345 | **6,747** |
+| Avg step time | 188ms | 189ms | **178ms** |
+| Sliding window val_bpb | 1.1187 | 1.1201 | **1.1179** |
+| Post-TTT val_bpb | 1.1163 | — (crashed) | **1.1153** |
+
+### Notes
+- Pre-warming the torch.compile trace during warmup recovered the ~390 extra steps that recompilation stole in Exp 9.
+- **Beats always-on recurrence (1.1163) by 0.0010 BPB** with the same param count.
+- The 358 extra steps from the fast 161ms/step pre-recurrence phase more than compensate for the co-adaptation gap.
+- New best recurrence result: **1.1153 post-TTT** at 27M params.
+- Beats PR #549 baseline (1.1194) by **0.0041 BPB**.
