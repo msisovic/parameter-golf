@@ -375,3 +375,27 @@ Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11
 - The 358 extra steps from the fast 161ms/step pre-recurrence phase more than compensate for the co-adaptation gap.
 - New best recurrence result: **1.1153 post-TTT** at 27M params.
 - Beats PR #549 baseline (1.1194) by **0.0041 BPB**.
+
+---
+
+## Experiment 10: RECUR_START_STEP sweep (3000, 3500, 4000)
+
+- **Date**: 2026-03-27
+- **Hardware**: 4xH100 80GB
+- **Key changes**: Swept RECUR_START_STEP with pre-warmed compilation, RECUR_LAYERS=4,5, TTT_ENABLED=1, TTT_UNTIE=0
+- **model_params**: 26,998,380 (~27M) for all runs
+
+### Results
+
+| RECUR_START_STEP | Steps | Blended avg | Sliding window val_bpb | Post-TTT val_bpb |
+|------------------|-------|-------------|------------------------|------------------|
+| 0 (Exp 5) | 6,389 | 188ms | 1.1187 | 1.1163 |
+| **3000 (Exp 9b)** | **6,747** | **178ms** | **1.1179** | **1.1153** |
+| 3500 | 6,828 | 176ms | 1.1177 | 1.1154 |
+| 4000 | 6,895 | 174ms | 1.1180 | 1.1156 |
+
+### Notes
+- **3000 and 3500 are effectively tied** (1.1153 vs 1.1154 post-TTT), within noise.
+- 4000 is slightly worse (1.1156) — recurrence gets fewer training steps and the gains from more total steps plateau.
+- Later start = more total steps but diminishing returns: 3000→3500 gains 81 steps, 3500→4000 gains 67, but recurrence quality degrades.
+- The sweet spot appears to be around 3000. Earlier start steps (2000, 2500) may be better — sweeping next.
