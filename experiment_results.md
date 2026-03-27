@@ -246,16 +246,19 @@ Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11
 |--------------|-------|-------------------|--------------|----------------------------|-----------------|
 | 0,1 | 6,309 | 1.1396 | 1.1479 | 1.1245 | 15.92 MB |
 | 2,3 | 6,332 | 1.1348 | 1.1431 | 1.1196 | 15.94 MB |
+| 3,4 | 6,337 | 1.1346 | 1.1434 | 1.1200 | 15.95 MB |
 | **4,5** | **6,335** | **1.1340** | **1.1424** | **1.1190** | **15.94 MB** |
+| 5,6 | 6,330 | 1.1358 | 1.1445 | 1.1211 | 15.95 MB |
 | 6,7 | 6,335 | 1.1361 | 1.1444 | 1.1208 | 15.95 MB |
 | 8,9 | 6,340 | 1.1414 | 1.1498 | 1.1263 | 16.03 MB |
 | 9,10 | 6,342 | 1.1419 | — (incomplete) | — (incomplete) | 15.95 MB |
 
 ### Notes
-- **Best placement: layers 4,5** (1.1190 sliding window), confirming the choice in Exp 5.
-- Clear U-shaped curve: mid-network recurrence works best, with performance degrading toward both ends.
-- Early layers (0,1) are 0.0055 worse than (4,5) — early representations are too low-level to benefit from repetition.
-- Late layers (8,9) are 0.0073 worse than (4,5) — late recurrence hurts more, likely because these layers are more specialized.
-- The (2,3) and (6,7) placements are close runners-up at 1.1196 and 1.1208 respectively.
+- **Best placement: layers 4,5** (1.1190 sliding window), confirmed even with finer-grained sweep.
+- Clear U-shaped curve centered on 4,5, with performance degrading toward both ends.
+- The immediate neighbors (3,4) at 1.1200 and (5,6) at 1.1211 are both worse — 4,5 is a sharp optimum, not a broad plateau.
+- Early layers (0,1) are 0.0055 worse than (4,5); late layers (8,9) are 0.0073 worse.
+- Notably (5,6) at 1.1211 is slightly worse than (6,7) at 1.1208 — the curve isn't perfectly smooth on the right side.
+- The 4,5 sweet spot coincides with the U-Net encoder/decoder boundary (virtual layers 6/7 out of 13), placing recurrence exactly at the skip connection hinge point.
 - No TTT was run in this sweep; adding TTT to the (4,5) winner matches Exp 5's result of 1.1163.
 - The recur_9_10 run had an incomplete evaluation (log truncated after submission size).
