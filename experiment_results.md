@@ -390,12 +390,13 @@ Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11
 | RECUR_START_STEP | Steps | Blended avg | Sliding window val_bpb | Post-TTT val_bpb |
 |------------------|-------|-------------|------------------------|------------------|
 | 0 (Exp 5) | 6,389 | 188ms | 1.1187 | 1.1163 |
+| 2500 | 6,668 | 180ms | 1.1181 | 1.1154 |
 | **3000 (Exp 9b)** | **6,747** | **178ms** | **1.1179** | **1.1153** |
 | 3500 | 6,828 | 176ms | 1.1177 | 1.1154 |
 | 4000 | 6,895 | 174ms | 1.1180 | 1.1156 |
 
 ### Notes
-- **3000 and 3500 are effectively tied** (1.1153 vs 1.1154 post-TTT), within noise.
-- 4000 is slightly worse (1.1156) — recurrence gets fewer training steps and the gains from more total steps plateau.
-- Later start = more total steps but diminishing returns: 3000→3500 gains 81 steps, 3500→4000 gains 67, but recurrence quality degrades.
-- The sweet spot appears to be around 3000. Earlier start steps (2000, 2500) may be better — sweeping next.
+- **Remarkably flat from 2500-3500** — all within 0.0001 of each other (1.1153-1.1154 post-TTT).
+- 3000 is marginally best at 1.1153 but practically indistinguishable from 2500 and 3500.
+- 4000 shows the first clear degradation (1.1156) — too little recurrence training time.
+- **Conclusion: RECUR_START_STEP=3000 is the sweet spot.** The flat region 2500-3500 suggests the model is robust to this parameter, but 3000 gives the best balance of step budget vs recurrence training time.
