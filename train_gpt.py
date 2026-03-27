@@ -100,6 +100,7 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     recur_layer = int(os.environ.get("RECUR_LAYER", -1))  # single layer compat
     recur_layers_str = os.environ.get("RECUR_LAYERS", "")  # comma-separated, e.g. "4,5"
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", 0))  # delay recurrence activation
     eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
     eval_bottleneck_reps = int(os.environ.get("EVAL_BOTTLENECK_REPS", 0))
 
@@ -828,15 +829,25 @@ class GPT(nn.Module):
             for rl in self.recur_layers:
                 assert 0 <= rl < num_layers, f"recur_layer={rl} out of range [0, {num_layers})"
             cutoff = max(self.recur_layers) + 1
-            self.v2p = list(range(cutoff)) + self.recur_layers + list(range(cutoff, num_layers))
+            self._v2p_recur = list(range(cutoff)) + self.recur_layers + list(range(cutoff, num_layers))
             virtual_num_layers = num_layers + len(self.recur_layers)
         else:
             virtual_num_layers = num_layers
-            self.v2p = list(range(num_layers))
+            self._v2p_recur = list(range(num_layers))
+        self._v2p_no_recur = list(range(num_layers))
+        # Start with recurrence active (caller can deactivate via set_recurrence_active)
+        self._recurrence_active = bool(self.recur_layers)
+        self.v2p = self._v2p_recur if self._recurrence_active else self._v2p_no_recur
         self.virtual_num_layers = virtual_num_layers
+        # Always allocate for the full virtual depth so blocks/skip_weights exist
         self.num_encoder_layers = virtual_num_layers // 2
         self.num_decoder_layers = virtual_num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        # Store non-recurrence layout for set_recurrence_active
+        self._enc_no_recur = num_layers // 2
+        self._dec_no_recur = num_layers - self._enc_no_recur
+        self._enc_recur = self.num_encoder_layers
+        self._dec_recur = self.num_decoder_layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         # Parameter banks: contiguous 3D tensors for batched optimizer (physical layer count)
         head_dim = model_dim // num_heads
@@ -929,6 +940,19 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+    def set_recurrence_active(self, active: bool) -> None:
+        """Switch between recurrence and non-recurrence forward pass."""
+        if not self.recur_layers:
+            return
+        self._recurrence_active = active
+        if active:
+            self.v2p = self._v2p_recur
+            self.num_encoder_layers = self._enc_recur
+            self.num_decoder_layers = self._dec_recur
+        else:
+            self.v2p = self._v2p_no_recur
+            self.num_encoder_layers = self._enc_no_recur
+            self.num_decoder_layers = self._dec_no_recur
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         n = self.num_layers  # physical layer count for bank offset
         v2p = self.v2p
@@ -1592,6 +1616,8 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
+    if args.recur_start_step > 0 and base_model.recur_layers:
+        torch._dynamo.config.cache_size_limit = 16
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
 
@@ -1674,6 +1700,9 @@ def main() -> None:
         log0(f"model_params:{n_params}")
         if base_model.recur_layers:
             log0(f"recurrence:layers={base_model.recur_layers} physical_layers={args.num_layers} virtual_layers={base_model.virtual_num_layers}")
+            if args.recur_start_step > 0:
+                base_model.set_recurrence_active(False)
+                log0(f"recurrence:delayed start_step={args.recur_start_step}")
         log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
         xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
         log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
@@ -1727,6 +1756,17 @@ def main() -> None:
                 zero_grad_all()
                 if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                     log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            # Pre-warm torch.compile trace for recurrence variant (if delayed)
+            if args.recur_start_step > 0 and base_model.recur_layers:
+                base_model.set_recurrence_active(True)
+                zero_grad_all()
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    _warmup_loss = model(x, y)
+                (_warmup_loss * grad_scale).backward()
+                zero_grad_all()
+                base_model.set_recurrence_active(False)
+                log0("recurrence:pre-warmed compile trace for recurrence variant")
             base_model.load_state_dict(initial_model_state, strict=True)
             for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
                 opt.load_state_dict(state)
@@ -1779,6 +1819,9 @@ def main() -> None:
             if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
                 CastedLinear._qat_enabled = True
                 log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+            if args.recur_start_step > 0 and step == args.recur_start_step and not base_model._recurrence_active:
+                base_model.set_recurrence_active(True)
+                log0(f"recurrence:activated step:{step}")
             zero_grad_all()
             train_loss = torch.zeros((), device=device)
             for micro_step in range(grad_accum_steps):
