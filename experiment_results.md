@@ -400,3 +400,27 @@ Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11
 - 3000 is marginally best at 1.1153 but practically indistinguishable from 2500 and 3500.
 - 4000 shows the first clear degradation (1.1156) — too little recurrence training time.
 - **Conclusion: RECUR_START_STEP=3000 is the sweet spot.** The flat region 2500-3500 suggests the model is robust to this parameter, but 3000 gives the best balance of step budget vs recurrence training time.
+
+---
+
+## Experiment 11: WARMDOWN_ITERS sweep with delayed recurrence (RECUR_START_STEP=3000)
+
+- **Date**: 2026-03-27
+- **Hardware**: 4xH100 80GB
+- **Key changes**: Swept WARMDOWN_ITERS to give recurrence blocks more full-LR training time
+- **Other params**: RECUR_LAYERS=4,5, RECUR_START_STEP=3000, TTT_ENABLED=1, TTT_UNTIE=0
+
+### Results
+
+| WARMDOWN_ITERS | Steps | Post-EMA val_bpb | Sliding window val_bpb | Post-TTT val_bpb |
+|----------------|-------|------------------|------------------------|------------------|
+| **3500 (default)** | **6,747** | **1.1329** | **1.1179** | **1.1153** |
+| 2000 | 6,742 | 1.1367 | 1.1192 | 1.1171 |
+| 1000 | 6,741 | 1.1450 | 1.1258 | 1.1232 |
+
+### Notes
+- Shorter warmdown hurts across the board — the model needs the long cooldown to converge.
+- WARMDOWN_ITERS=1000 is catastrophic: +0.0079 BPB on post-TTT vs default.
+- Even 2000 loses 0.0018 BPB — not worth the extra full-LR steps for recurrence.
+- Step counts are nearly identical (~6,742) since warmdown doesn't affect step speed.
+- **Conclusion: default WARMDOWN_ITERS=3500 remains optimal.** The convergence benefit of a long warmdown outweighs the benefit of more full-LR steps for recurrence blocks.
