@@ -83,6 +83,11 @@ class Hyperparameters:
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
+    sandwich_norm = bool(int(os.environ.get("SANDWICH_NORM", "0")))
+    repeat_lora_rank = int(os.environ.get("REPEAT_LORA_RANK", "0"))
+    repeat_lora_alpha = float(os.environ.get("REPEAT_LORA_ALPHA", "0.0"))
+    repeat_lora_lr = float(os.environ.get("REPEAT_LORA_LR", 1e-3))
+    repeat_lora_wd = float(os.environ.get("REPEAT_LORA_WD", "0.0"))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
@@ -734,6 +739,23 @@ class MLP(nn.Module):
         x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
         return F.linear(x.square(), down_w.to(x.dtype))
 
+
+class LowRankAdapter(nn.Module):
+    def __init__(self, out_dim: int, in_dim: int, rank: int, alpha: float):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha if alpha > 0.0 else float(rank)
+        self.a = nn.Parameter(torch.empty(rank, in_dim, dtype=torch.float32))
+        self.b = nn.Parameter(torch.empty(out_dim, rank, dtype=torch.float32))
+        self.gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        nn.init.normal_(self.a, mean=0.0, std=1.0 / math.sqrt(in_dim))
+        nn.init.normal_(self.b, mean=0.0, std=1.0 / math.sqrt(out_dim))
+
+    def apply_to(self, base_w: Tensor) -> Tensor:
+        delta = torch.matmul(self.b, self.a).to(dtype=base_w.dtype)
+        scale = (self.alpha / self.rank) * self.gate.to(dtype=base_w.dtype)
+        return base_w + scale * delta
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -745,13 +767,16 @@ class Block(nn.Module):
         qk_gain_init: float,
         layer_idx: int = 0,
         ln_scale: bool = False,
+        sandwich_norm: bool = False,
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
+        self.attn_post_norm = RMSNorm() if sandwich_norm else nn.Identity()
         self.mlp_norm = RMSNorm()
+        self.mlp_post_norm = RMSNorm() if sandwich_norm else nn.Identity()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         gated_attention=gated_attention, value_residual=value_residual)
         self.mlp = MLP(dim, mlp_mult)
@@ -769,8 +794,11 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
+        attn_out = self.attn_post_norm(attn_out)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        mlp_out = self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        mlp_out = self.mlp_post_norm(mlp_out)
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -797,6 +825,9 @@ class GPT(nn.Module):
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
+        sandwich_norm: bool = False,
+        repeat_lora_rank: int = 0,
+        repeat_lora_alpha: float = 0.0,
         dtg: bool = False,
         ve_enabled: bool = False,
         ve_dim: int = 128,
@@ -824,11 +855,12 @@ class GPT(nn.Module):
         if recur_layers is None and recur_layer >= 0:
             recur_layers = [recur_layer]
         self.recur_layers = sorted(recur_layers) if recur_layers else []
+        self._recur_cutoff = max(self.recur_layers) + 1 if self.recur_layers else 0
         self.num_physical_layers = num_layers
         if self.recur_layers:
             for rl in self.recur_layers:
                 assert 0 <= rl < num_layers, f"recur_layer={rl} out of range [0, {num_layers})"
-            cutoff = max(self.recur_layers) + 1
+            cutoff = self._recur_cutoff
             self._v2p_recur = list(range(cutoff)) + self.recur_layers + list(range(cutoff, num_layers))
             virtual_num_layers = num_layers + len(self.recur_layers)
         else:
@@ -858,6 +890,15 @@ class GPT(nn.Module):
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.repeat_lora = nn.ModuleList()
+        if repeat_lora_rank > 0 and self.recur_layers:
+            for _ in self.recur_layers:
+                self.repeat_lora.append(nn.ModuleDict({
+                    "q": LowRankAdapter(model_dim, model_dim, repeat_lora_rank, repeat_lora_alpha),
+                    "o": LowRankAdapter(model_dim, model_dim, repeat_lora_rank, repeat_lora_alpha),
+                    "up": LowRankAdapter(mlp_dim, model_dim, repeat_lora_rank, repeat_lora_alpha),
+                    "down": LowRankAdapter(model_dim, mlp_dim, repeat_lora_rank, repeat_lora_alpha),
+                }))
         # Blocks: one per virtual layer (each has own scalar params)
         self.blocks = nn.ModuleList(
             [
@@ -870,6 +911,7 @@ class GPT(nn.Module):
                     qk_gain_init,
                     layer_idx=i,
                     ln_scale=ln_scale,
+                    sandwich_norm=sandwich_norm,
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
@@ -908,6 +950,29 @@ class GPT(nn.Module):
             for i in range(max(0, virtual_num_layers - xsa_last_n), virtual_num_layers):
                 self.blocks[i].attn.use_xsa = True
         self._init_weights()
+
+    def _is_repeated_virtual_index(self, vi: int) -> bool:
+        if not self._recurrence_active or not self.recur_layers:
+            return False
+        return self._recur_cutoff <= vi < self._recur_cutoff + len(self.recur_layers)
+
+    def _get_block_weights(self, vi: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        n = self.num_layers
+        pi = self.v2p[vi]
+        q_w = self.qo_bank[pi]
+        k_w = self.kv_bank[pi]
+        v_w = self.kv_bank[n + pi]
+        out_w = self.qo_bank[n + pi]
+        up_w = self.mlp_up_bank[pi]
+        down_w = self.mlp_down_bank[pi]
+        if self._is_repeated_virtual_index(vi):
+            repeated_idx = vi - self._recur_cutoff
+            adapters = self.repeat_lora[repeated_idx]
+            q_w = adapters["q"].apply_to(q_w)
+            out_w = adapters["o"].apply_to(out_w)
+            up_w = adapters["up"].apply_to(up_w)
+            down_w = adapters["down"].apply_to(down_w)
+        return q_w, k_w, v_w, out_w, up_w, down_w
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -954,8 +1019,7 @@ class GPT(nn.Module):
             self.num_encoder_layers = self._enc_no_recur
             self.num_decoder_layers = self._dec_no_recur
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        n = self.num_layers  # physical layer count for bank offset
-        v2p = self.v2p
+        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -966,11 +1030,10 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            pi = v2p[i]
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
-                self.qo_bank[n + pi], self.mlp_up_bank[pi], self.mlp_down_bank[pi],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -982,13 +1045,12 @@ class GPT(nn.Module):
                 v_embed=None, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
-            pi = v2p[bi]
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
-                self.qo_bank[n + pi], self.mlp_up_bank[pi], self.mlp_down_bank[pi],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -1020,8 +1082,7 @@ class GPT(nn.Module):
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
-        n = self.num_layers  # physical layer count for bank offset
-        v2p = self.v2p
+        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -1032,11 +1093,10 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            pi = v2p[i]
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
-                self.qo_bank[n + pi], self.mlp_up_bank[pi], self.mlp_down_bank[pi],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -1048,13 +1108,12 @@ class GPT(nn.Module):
                 v_embed=None, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
-            pi = v2p[bi]
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
-                self.qo_bank[n + pi], self.mlp_up_bank[pi], self.mlp_down_bank[pi],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1596,6 +1655,9 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
+        sandwich_norm=args.sandwich_norm,
+        repeat_lora_rank=args.repeat_lora_rank,
+        repeat_lora_alpha=args.repeat_lora_alpha,
         dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled,
         ve_dim=args.ve_dim,
@@ -1631,6 +1693,8 @@ def main() -> None:
             base_model.mlp_up_bank, base_model.mlp_down_bank,
         ]
         block_named_params = list(base_model.blocks.named_parameters())
+        repeat_lora_named_params = list(base_model.repeat_lora.named_parameters())
+        repeat_lora_params = [p for _, p in repeat_lora_named_params]
         scalar_params = [
             p
             for name, p in block_named_params
@@ -1677,11 +1741,21 @@ def main() -> None:
             weight_decay=args.adam_wd,
             fused=True,
         )
+        optimizer_repeat_lora = None
+        if repeat_lora_params:
+            optimizer_repeat_lora = torch.optim.AdamW(
+                [{"params": repeat_lora_params, "lr": args.repeat_lora_lr, "base_lr": args.repeat_lora_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                weight_decay=args.repeat_lora_wd,
+                fused=True,
+            )
         # Non-bank params that need manual all-reduce (replicated across GPUs)
         replicated_params = list(optimizer_tok.param_groups[0]["params"])
         for pg in optimizer_tok.param_groups[1:]:
             replicated_params.extend(pg["params"])
         replicated_params.extend(scalar_params)
+        replicated_params.extend(repeat_lora_params)
     
         optimizer_head = None
         if base_model.lm_head is not None:
@@ -1693,6 +1767,8 @@ def main() -> None:
             )
             replicated_params.append(base_model.lm_head.weight)
         optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+        if optimizer_repeat_lora is not None:
+            optimizers.append(optimizer_repeat_lora)
         if optimizer_head is not None:
             optimizers.append(optimizer_head)
         n_params = sum(p.numel() for p in base_model.parameters())
@@ -1703,12 +1779,18 @@ def main() -> None:
             if args.recur_start_step > 0:
                 base_model.set_recurrence_active(False)
                 log0(f"recurrence:delayed start_step={args.recur_start_step}")
+        repeat_lora_param_count = sum(p.numel() for p in base_model.repeat_lora.parameters())
         log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
         xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
         log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
         log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
         log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
         log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+        log0(f"sandwich_norm:{args.sandwich_norm}")
+        log0(
+            f"repeat_lora:rank={args.repeat_lora_rank} alpha={args.repeat_lora_alpha if args.repeat_lora_alpha > 0 else args.repeat_lora_rank} "
+            f"params={repeat_lora_param_count} lr={args.repeat_lora_lr} wd={args.repeat_lora_wd}"
+        )
         log0(
             f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
             f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1956,7 +2038,8 @@ def main() -> None:
         mtp_num_heads=0, mtp_loss_weight=0.0,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
-        rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+        rope_dims=args.rope_dims, ln_scale=args.ln_scale, sandwich_norm=args.sandwich_norm,
+        repeat_lora_rank=args.repeat_lora_rank, repeat_lora_alpha=args.repeat_lora_alpha, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
         recur_layer=args.recur_layer,
