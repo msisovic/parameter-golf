@@ -2,6 +2,21 @@
 
 Baseline reference: PR #549 — val_bpb 1.1194 (3-seed mean, 8xH100, dim=512, 11 layers)
 
+## Experiment 0: Latest baseline
+
+- **Date**: 2026-03-28
+- **Hardware**: 4xH100 80GB
+- **Steps completed**: 7,392 / 9,000
+
+### Results
+| Metric | Value |
+|--------|-------|
+| Post-EMA val_bpb | 1.1366 |
+| Final int6 sliding window val_bpb | 1.1214 |
+| **Post-TTT sliding window val_bpb** | **1.1191** |
+
+---
+
 ## Experiment 1: MODEL_DIM=576 (all else PR #549 defaults)
 
 - **Date**: 2026-03-24
