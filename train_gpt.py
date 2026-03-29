@@ -92,7 +92,11 @@ class Hyperparameters:
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
     disable_layer0_attn = bool(int(os.environ.get("DISABLE_LAYER0_ATTN", "1")))
+    recur_layers_str = os.environ.get("RECUR_LAYERS", "4,5")
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
     gptq_selective_prune = bool(int(os.environ.get("GPTQ_SELECTIVE_PRUNE", "0")))
+    post_gptq_eval_only = bool(int(os.environ.get("POST_GPTQ_EVAL_ONLY", "0")))
+    skip_post_gptq_eval = bool(int(os.environ.get("SKIP_POST_GPTQ_EVAL", "0")))
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
@@ -388,6 +392,81 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
+
+def _format_control_tensor_values(t: Tensor) -> str:
+    flat = t.detach().float().cpu().reshape(-1)
+    return "[" + ", ".join(f"{float(x):.6g}" for x in flat.tolist()) + "]"
+
+def _format_control_tensor_summary(t: Tensor) -> str:
+    flat = t.detach().float().cpu().reshape(-1)
+    if flat.numel() <= 8:
+        return f"shape={list(t.shape)} values={_format_control_tensor_values(t)}"
+    return (
+        f"shape={list(t.shape)} numel={flat.numel()} "
+        f"mean={flat.mean().item():.6g} absmean={flat.abs().mean().item():.6g} "
+        f"min={flat.min().item():.6g} max={flat.max().item():.6g}"
+    )
+
+def log_control_tensors(model: nn.Module, log0) -> None:
+    """Log learned control tensors before export/GPTQ."""
+    log0("control_tensors:begin")
+    if hasattr(model, "smear") and hasattr(model.smear, "gate"):
+        log0(f"control_tensor:smear.gate {_format_control_tensor_summary(model.smear.gate)}")
+    if hasattr(model, "skip_weights"):
+        flat = model.skip_weights.detach().float().cpu().reshape(-1)
+        log0(
+            f"control_tensor:skip_weights shape={list(model.skip_weights.shape)} "
+            f"mean={flat.mean().item():.6g} min={flat.min().item():.6g} max={flat.max().item():.6g}"
+        )
+    if hasattr(model, "ve_shared") and model.ve_shared is not None and hasattr(model.ve_shared, "scale"):
+        log0(f"control_tensor:ve_shared.scale {_format_control_tensor_summary(model.ve_shared.scale)}")
+    if hasattr(model, "ve_layer_scales"):
+        for i, scale in enumerate(model.ve_layer_scales):
+            log0(f"control_tensor:ve_layer_scales.{i} {_format_control_tensor_summary(scale)}")
+    if hasattr(model, "blocks"):
+        attn_scale_means = []
+        mlp_scale_means = []
+        resid_mix_x_means = []
+        resid_mix_x0_means = []
+        q_gain_means = []
+        dtg_biases = []
+        attn_gate_biases = []
+        vrl_alpha_raw = []
+        vrl_alpha_sigmoid = []
+        for block in model.blocks:
+            attn_scale = block.attn_scale.detach().float().cpu()
+            mlp_scale = block.mlp_scale.detach().float().cpu()
+            resid_mix = block.resid_mix.detach().float().cpu()
+            attn_scale_means.append(attn_scale.mean().item())
+            mlp_scale_means.append(mlp_scale.mean().item())
+            resid_mix_x_means.append(resid_mix[0].mean().item())
+            resid_mix_x0_means.append(resid_mix[1].mean().item())
+            if hasattr(block, "dtg_gate") and block.dtg_gate is not None:
+                dtg_biases.append(float(block.dtg_gate.bias.detach().float().cpu().item()))
+            if hasattr(block, "attn"):
+                attn = block.attn
+                if hasattr(attn, "q_gain"):
+                    q_gain_means.append(attn.q_gain.detach().float().cpu().mean().item())
+                if hasattr(attn, "attn_gate"):
+                    attn_gate_biases.append(float(attn.attn_gate.bias.detach().float().cpu().mean().item()))
+                if hasattr(attn, "vrl_alpha"):
+                    raw = attn.vrl_alpha.detach().float().cpu()
+                    vrl_alpha_raw.append(float(raw.mean().item()))
+                    vrl_alpha_sigmoid.append(float(torch.sigmoid(raw).mean().item()))
+        log0(f"control_tensor:attn_scale_mean_by_layer {_format_control_tensor_values(torch.tensor(attn_scale_means))}")
+        log0(f"control_tensor:mlp_scale_mean_by_layer {_format_control_tensor_values(torch.tensor(mlp_scale_means))}")
+        log0(f"control_tensor:resid_mix_x_mean_by_layer {_format_control_tensor_values(torch.tensor(resid_mix_x_means))}")
+        log0(f"control_tensor:resid_mix_x0_mean_by_layer {_format_control_tensor_values(torch.tensor(resid_mix_x0_means))}")
+        if q_gain_means:
+            log0(f"control_tensor:q_gain_mean_by_layer {_format_control_tensor_values(torch.tensor(q_gain_means))}")
+        if dtg_biases:
+            log0(f"control_tensor:dtg_gate_bias_by_layer {_format_control_tensor_values(torch.tensor(dtg_biases))}")
+        if attn_gate_biases:
+            log0(f"control_tensor:attn_gate_bias_mean_by_layer {_format_control_tensor_values(torch.tensor(attn_gate_biases))}")
+        if vrl_alpha_raw:
+            log0(f"control_tensor:vrl_alpha_raw_by_layer {_format_control_tensor_values(torch.tensor(vrl_alpha_raw))}")
+            log0(f"control_tensor:vrl_alpha_sigmoid_by_layer {_format_control_tensor_values(torch.tensor(vrl_alpha_sigmoid))}")
+    log0("control_tensors:end")
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -813,6 +892,8 @@ class GPT(nn.Module):
         gated_attention: bool = False,
         value_residual: bool = False,
         disable_layer0_attn: bool = False,
+        recur_layers: list[int] | None = None,
+        recurrence_active: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -827,8 +908,25 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.recur_layers = sorted(set(recur_layers or []))
+        for rl in self.recur_layers:
+            if not (0 <= rl < num_layers):
+                raise ValueError(f"recur layer {rl} out of range [0, {num_layers})")
+        if self.recur_layers:
+            cutoff = max(self.recur_layers) + 1
+            self._v2p_recur = list(range(cutoff)) + self.recur_layers + list(range(cutoff, num_layers))
+        else:
+            self._v2p_recur = list(range(num_layers))
+        self._v2p_no_recur = list(range(num_layers))
+        self.virtual_num_layers = len(self._v2p_recur)
+        self._enc_no_recur = num_layers // 2
+        self._dec_no_recur = num_layers - self._enc_no_recur
+        self._enc_recur = self.virtual_num_layers // 2
+        self._dec_recur = self.virtual_num_layers - self._enc_recur
+        self._recurrence_active = False
+        self.v2p = self._v2p_no_recur
+        self.num_encoder_layers = self._enc_recur
+        self.num_decoder_layers = self._dec_recur
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         # Parameter banks: contiguous 3D tensors for batched optimizer
@@ -856,7 +954,7 @@ class GPT(nn.Module):
                     value_residual=value_residual,
                     disable_attn=disable_layer0_attn and i == 0,
                 )
-                for i in range(num_layers)
+                for i in range(self.virtual_num_layers)
             ]
         )
         if rope_dims > 0:
@@ -885,8 +983,9 @@ class GPT(nn.Module):
         for head in self.mtp_heads:
             head._zero_init = True
         if xsa_last_n > 0:
-            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+            for i in range(max(0, self.virtual_num_layers - xsa_last_n), self.virtual_num_layers):
                 self.blocks[i].attn.use_xsa = True
+        self.set_recurrence_active(recurrence_active)
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -920,8 +1019,28 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def set_recurrence_active(self, active: bool) -> None:
+        self._recurrence_active = bool(active) and bool(self.recur_layers)
+        if self._recurrence_active:
+            self.v2p = self._v2p_recur
+            self.num_encoder_layers = self._enc_recur
+            self.num_decoder_layers = self._dec_recur
+        else:
+            self.v2p = self._v2p_no_recur
+            self.num_encoder_layers = self._enc_no_recur
+            self.num_decoder_layers = self._dec_no_recur
+    def _get_block_weights(self, virtual_idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         n = self.num_layers
+        physical_idx = self.v2p[virtual_idx]
+        return (
+            self.qo_bank[physical_idx],
+            self.kv_bank[physical_idx],
+            self.kv_bank[n + physical_idx],
+            self.qo_bank[n + physical_idx],
+            self.mlp_up_bank[physical_idx],
+            self.mlp_down_bank[physical_idx],
+        )
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -932,10 +1051,10 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -944,10 +1063,10 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -979,7 +1098,6 @@ class GPT(nn.Module):
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
-        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -990,10 +1108,10 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -1002,10 +1120,10 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1401,7 +1519,9 @@ class _HessianGPT(nn.Module):
                  bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
                  ve_enabled=False, ve_dim=128, ve_layers="9,10",
-                 disable_layer0_attn=False):
+                 disable_layer0_attn=False,
+                 recur_layers=None,
+                 recurrence_active=False):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1409,14 +1529,28 @@ class _HessianGPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.recur_layers = sorted(set(recur_layers or []))
+        if self.recur_layers:
+            cutoff = max(self.recur_layers) + 1
+            self._v2p_recur = list(range(cutoff)) + self.recur_layers + list(range(cutoff, num_layers))
+        else:
+            self._v2p_recur = list(range(num_layers))
+        self._v2p_no_recur = list(range(num_layers))
+        self.virtual_num_layers = len(self._v2p_recur)
+        self._enc_no_recur = num_layers // 2
+        self._dec_no_recur = num_layers - self._enc_no_recur
+        self._enc_recur = self.virtual_num_layers // 2
+        self._dec_recur = self.virtual_num_layers - self._enc_recur
+        self._recurrence_active = False
+        self.v2p = self._v2p_no_recur
+        self.num_encoder_layers = self._enc_recur
+        self.num_decoder_layers = self._dec_recur
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                           layer_idx=i, ln_scale=ln_scale, disable_attn=disable_layer0_attn and i == 0)
-            for i in range(num_layers)
+            for i in range(self.virtual_num_layers)
         ])
         if rope_dims > 0:
             head_dim = model_dim // num_heads
@@ -1424,7 +1558,7 @@ class _HessianGPT(nn.Module):
                 block.attn.rope_dims = rope_dims
                 block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
         if xsa_last_n > 0:
-            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+            for i in range(max(0, self.virtual_num_layers - xsa_last_n), self.virtual_num_layers):
                 self.blocks[i].attn.use_xsa = True
         kv_dim = num_kv_heads * (model_dim // num_heads)
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
@@ -1436,6 +1570,7 @@ class _HessianGPT(nn.Module):
             self.ve_layer_scales = nn.ParameterList()
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        self.set_recurrence_active(recurrence_active)
     def _get_ve(self, layer_idx, input_ids, ve_cache):
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
             return None
@@ -1443,6 +1578,40 @@ class _HessianGPT(nn.Module):
             ve_cache['ve'] = self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_cache['ve'] * self.ve_layer_scales[ve_idx].to(dtype=ve_cache['ve'].dtype)
+    def set_recurrence_active(self, active):
+        self._recurrence_active = bool(active) and bool(self.recur_layers)
+        if self._recurrence_active:
+            self.v2p = self._v2p_recur
+            self.num_encoder_layers = self._enc_recur
+            self.num_decoder_layers = self._dec_recur
+        else:
+            self.v2p = self._v2p_no_recur
+            self.num_encoder_layers = self._enc_no_recur
+            self.num_decoder_layers = self._dec_no_recur
+    def tie_recurrent_weights_(self):
+        if not self._recurrence_active:
+            return
+        with torch.no_grad():
+            sources = []
+            for physical_idx in range(self.num_layers):
+                src = self.blocks[physical_idx]
+                sources.append({
+                    "c_q": src.attn.c_q.weight.detach().clone(),
+                    "c_k": src.attn.c_k.weight.detach().clone(),
+                    "c_v": src.attn.c_v.weight.detach().clone(),
+                    "proj": src.attn.proj.weight.detach().clone(),
+                    "fc": src.mlp.fc.weight.detach().clone(),
+                    "mlp_proj": src.mlp.proj.weight.detach().clone(),
+                })
+            for virtual_idx, physical_idx in enumerate(self.v2p):
+                dst = self.blocks[virtual_idx]
+                src = sources[physical_idx]
+                dst.attn.c_q.weight.copy_(src["c_q"])
+                dst.attn.c_k.weight.copy_(src["c_k"])
+                dst.attn.c_v.weight.copy_(src["c_v"])
+                dst.attn.proj.weight.copy_(src["proj"])
+                dst.mlp.fc.weight.copy_(src["fc"])
+                dst.mlp.proj.weight.copy_(src["mlp_proj"])
     def forward(self, input_ids, target_ids):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -1635,6 +1804,44 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     CastedLinear._qat_enabled = args.qat_enabled
+    recur_layers = [int(x) for x in args.recur_layers_str.split(",") if x.strip()]
+    if args.post_gptq_eval_only:
+        log0("post_gptq_eval_only: enabled")
+        eval_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            mtp_num_heads=0, mtp_loss_weight=0.0, bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+            gated_attention=args.gated_attention, value_residual=args.value_residual,
+            disable_layer0_attn=args.disable_layer0_attn, recur_layers=recur_layers, recurrence_active=bool(recur_layers),
+        ).to(device).bfloat16()
+        eval_model.qo_bank.data = eval_model.qo_bank.data.float(); eval_model.kv_bank.data = eval_model.kv_bank.data.float()
+        eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float(); eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+        for m in eval_model.modules():
+            if isinstance(m, CastedLinear): m.float()
+        restore_low_dim_params_to_fp32(eval_model)
+        with open("final_model.int6.ptz", "rb") as f: quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
+        template_sd = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
+        template_unbanked = _unbank_state_dict(template_sd, args.num_layers)
+        deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], template_unbanked)
+        eval_model.load_state_dict(_rebank_state_dict(deq_unbanked, args.num_layers, template_sd), strict=True)
+        q_val_loss, q_val_bpb = eval_val(args, eval_model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, eval_seq_len=effective_eval_seq_len)
+        log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        sw_seq_len = effective_eval_seq_len
+        if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+            sw_val_loss, sw_val_bpb = eval_val_sliding(args, eval_model, rank, world_size, device, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, stride=args.eval_stride, eval_seq_len=sw_seq_len)
+            log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+            log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        if args.eval_stride != 64 and 64 < sw_seq_len:
+            sw64_val_loss, sw64_val_bpb = eval_val_sliding(args, eval_model, rank, world_size, device, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, stride=64, eval_seq_len=sw_seq_len)
+            log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+            log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+        if distributed: dist.destroy_process_group()
+        return
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1661,6 +1868,8 @@ def main() -> None:
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
         disable_layer0_attn=args.disable_layer0_attn,
+        recur_layers=recur_layers,
+        recurrence_active=False,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1759,6 +1968,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"recurrence:layers={recur_layers} start_step={args.recur_start_step} active={int(base_model._recurrence_active)}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1785,11 +1995,8 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-    if args.warmup_steps > 0:
-        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
-        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        model.train()
-        for warmup_step in range(args.warmup_steps):
+    def run_warmup_steps(num_steps: int, label: str) -> None:
+        for warmup_step in range(num_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
@@ -1804,12 +2011,23 @@ def main() -> None:
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            if num_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == num_steps:
+                log0(f"{label}_warmup_step:{warmup_step + 1}/{num_steps}")
+    if args.warmup_steps > 0:
+        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        model.train()
+        run_warmup_steps(args.warmup_steps, "base")
+        if recur_layers:
+            base_model.set_recurrence_active(True)
+            log0(f"recurrence:prewarm active={int(base_model._recurrence_active)} virtual_layers:{base_model.virtual_num_layers}")
+            run_warmup_steps(args.warmup_steps, "recur")
+            base_model.set_recurrence_active(False)
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
+        base_model.set_recurrence_active(False)
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
@@ -1823,6 +2041,9 @@ def main() -> None:
     t0 = time.perf_counter()
     step = 0
     while True:
+        if recur_layers and not base_model._recurrence_active and step >= args.recur_start_step:
+            base_model.set_recurrence_active(True)
+            log0(f"recurrence:activated step:{step} layers={recur_layers} virtual_layers:{base_model.virtual_num_layers}")
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
@@ -1956,6 +2177,8 @@ def main() -> None:
         f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
     )
+    if master_process:
+        log_control_tensors(base_model, log0)
     full_state_dict = base_model.state_dict()
     export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
@@ -1981,6 +2204,8 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         disable_layer0_attn=args.disable_layer0_attn,
+        recur_layers=recur_layers,
+        recurrence_active=base_model._recurrence_active,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
@@ -1991,6 +2216,7 @@ def main() -> None:
         {k: v.to(device) for k, v in unbanked_sd.items() if k in hessian_model.state_dict()},
         strict=False,
     )
+    hessian_model.tie_recurrent_weights_()
     # Autoregressive self-generated calibration (no external data)
     log0("gptq:generating autoregressive calibration data (64 seqs x 2048 tokens, temp=0.8)...")
     base_model.load_state_dict(export_sd, strict=False)
@@ -2068,6 +2294,11 @@ def main() -> None:
         log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
     if distributed:
         dist.barrier()
+    if args.skip_post_gptq_eval:
+        log0("skip_post_gptq_eval: enabled, stopping after GPTQ artifact write")
+        if distributed:
+            dist.destroy_process_group()
+        return
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(
@@ -2089,6 +2320,8 @@ def main() -> None:
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
         disable_layer0_attn=args.disable_layer0_attn,
+        recur_layers=recur_layers,
+        recurrence_active=base_model._recurrence_active,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
@@ -2099,7 +2332,7 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    compiled_eval = torch.compile(eval_model, dynamic=True, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
