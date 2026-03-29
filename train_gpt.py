@@ -94,6 +94,12 @@ class Hyperparameters:
     disable_layer0_attn = bool(int(os.environ.get("DISABLE_LAYER0_ATTN", "1")))
     recur_layers_str = os.environ.get("RECUR_LAYERS", "4,5")
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
+    repeat_lora_rank = int(os.environ.get("REPEAT_LORA_RANK", "0"))
+    repeat_lora_alpha = float(os.environ.get("REPEAT_LORA_ALPHA", "0.0"))
+    repeat_lora_lr = float(os.environ.get("REPEAT_LORA_LR", 1e-3))
+    repeat_lora_wd = float(os.environ.get("REPEAT_LORA_WD", "0.0"))
+    repeat_untie_mlp = os.environ.get("REPEAT_UNTIE_MLP", "none").strip().lower()
+    repeat_untie_mlp_layers = os.environ.get("REPEAT_UNTIE_MLP_LAYERS", "").strip()
     gptq_selective_prune = bool(int(os.environ.get("GPTQ_SELECTIVE_PRUNE", "0")))
     post_gptq_eval_only = bool(int(os.environ.get("POST_GPTQ_EVAL_ONLY", "0")))
     skip_post_gptq_eval = bool(int(os.environ.get("SKIP_POST_GPTQ_EVAL", "0")))
@@ -817,6 +823,28 @@ class MLP(nn.Module):
         x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
         return F.linear(x.square(), down_w.to(x.dtype))
 
+class LowRankAdapter(nn.Module):
+    def __init__(self, out_dim: int, in_dim: int, rank: int, alpha: float):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha if alpha > 0.0 else float(rank)
+        self.a = nn.Parameter(torch.empty(rank, in_dim, dtype=torch.float32))
+        self.b = nn.Parameter(torch.empty(out_dim, rank, dtype=torch.float32))
+        self.gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        nn.init.normal_(self.a, mean=0.0, std=1.0 / math.sqrt(in_dim))
+        nn.init.normal_(self.b, mean=0.0, std=1.0 / math.sqrt(out_dim))
+    def apply_to(self, base_w: Tensor) -> Tensor:
+        delta = torch.matmul(self.b, self.a).to(dtype=base_w.dtype)
+        scale = (self.alpha / self.rank) * self.gate.to(dtype=base_w.dtype)
+        return base_w + scale * delta
+
+class RepeatMLPWeights(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int, mode: str):
+        super().__init__()
+        mlp_dim = int(mlp_mult * dim)
+        self.fc = CastedLinear(dim, mlp_dim, bias=False) if mode == "full" else None
+        self.proj = CastedLinear(mlp_dim, dim, bias=False) if mode in ("full", "down") else None
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -894,6 +922,10 @@ class GPT(nn.Module):
         disable_layer0_attn: bool = False,
         recur_layers: list[int] | None = None,
         recurrence_active: bool = False,
+        repeat_lora_rank: int = 0,
+        repeat_lora_alpha: float = 0.0,
+        repeat_untie_mlp: str = "none",
+        repeat_untie_mlp_layers: list[int] | None = None,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -909,9 +941,22 @@ class GPT(nn.Module):
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
         self.recur_layers = sorted(set(recur_layers or []))
+        self.repeat_untie_mlp = repeat_untie_mlp
+        if self.repeat_untie_mlp not in {"none", "down", "full"}:
+            raise ValueError(f"repeat untie mlp mode must be one of none/down/full, got {self.repeat_untie_mlp}")
+        requested_repeat_untie_layers = sorted(set(repeat_untie_mlp_layers or []))
         for rl in self.recur_layers:
             if not (0 <= rl < num_layers):
                 raise ValueError(f"recur layer {rl} out of range [0, {num_layers})")
+        invalid_repeat_untie_layers = [rl for rl in requested_repeat_untie_layers if rl not in self.recur_layers]
+        if invalid_repeat_untie_layers:
+            raise ValueError(f"repeat untie mlp layers must be a subset of recur_layers, got {invalid_repeat_untie_layers}")
+        if self.repeat_untie_mlp == "none":
+            self.repeat_untie_mlp_layers = []
+        elif requested_repeat_untie_layers:
+            self.repeat_untie_mlp_layers = requested_repeat_untie_layers
+        else:
+            self.repeat_untie_mlp_layers = list(self.recur_layers)
         if self.recur_layers:
             cutoff = max(self.recur_layers) + 1
             self._v2p_recur = list(range(cutoff)) + self.recur_layers + list(range(cutoff, num_layers))
@@ -938,6 +983,20 @@ class GPT(nn.Module):
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.repeat_lora = nn.ModuleList()
+        if repeat_lora_rank > 0 and self.recur_layers:
+            for _ in self.recur_layers:
+                self.repeat_lora.append(nn.ModuleDict({
+                    "q": LowRankAdapter(model_dim, model_dim, repeat_lora_rank, repeat_lora_alpha),
+                    "o": LowRankAdapter(model_dim, model_dim, repeat_lora_rank, repeat_lora_alpha),
+                    "up": LowRankAdapter(mlp_dim, model_dim, repeat_lora_rank, repeat_lora_alpha),
+                    "down": LowRankAdapter(model_dim, mlp_dim, repeat_lora_rank, repeat_lora_alpha),
+                }))
+        self.repeat_mlp = nn.ModuleList()
+        if self.repeat_untie_mlp != "none" and self.recur_layers:
+            for physical_idx in self.recur_layers:
+                mode = self.repeat_untie_mlp if physical_idx in self.repeat_untie_mlp_layers else "none"
+                self.repeat_mlp.append(RepeatMLPWeights(model_dim, mlp_mult, mode))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1003,6 +1062,11 @@ class GPT(nn.Module):
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
             self.qo_bank.data[n + i].mul_(proj_scale)
             self.mlp_down_bank.data[i].mul_(proj_scale)
+        for repeat_mlp in self.repeat_mlp:
+            if repeat_mlp.fc is not None:
+                nn.init.zeros_(repeat_mlp.fc.weight)
+            if repeat_mlp.proj is not None:
+                nn.init.zeros_(repeat_mlp.proj.weight)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
@@ -1020,6 +1084,7 @@ class GPT(nn.Module):
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def set_recurrence_active(self, active: bool) -> None:
+        was_active = self._recurrence_active
         self._recurrence_active = bool(active) and bool(self.recur_layers)
         if self._recurrence_active:
             self.v2p = self._v2p_recur
@@ -1029,17 +1094,44 @@ class GPT(nn.Module):
             self.v2p = self._v2p_no_recur
             self.num_encoder_layers = self._enc_no_recur
             self.num_decoder_layers = self._dec_no_recur
+        if self._recurrence_active and not was_active and self.repeat_mlp:
+            self._sync_repeat_mlp_from_base()
+    def _sync_repeat_mlp_from_base(self) -> None:
+        with torch.no_grad():
+            for repeat_idx, physical_idx in enumerate(self.recur_layers):
+                repeat_mlp = self.repeat_mlp[repeat_idx]
+                if repeat_mlp.fc is not None:
+                    repeat_mlp.fc.weight.copy_(self.mlp_up_bank[physical_idx])
+                if repeat_mlp.proj is not None:
+                    repeat_mlp.proj.weight.copy_(self.mlp_down_bank[physical_idx])
+    def _is_repeated_virtual_index(self, virtual_idx: int) -> bool:
+        if not self._recurrence_active or not self.recur_layers:
+            return False
+        return self._enc_recur <= virtual_idx < self._enc_recur + len(self.recur_layers)
     def _get_block_weights(self, virtual_idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         n = self.num_layers
         physical_idx = self.v2p[virtual_idx]
-        return (
-            self.qo_bank[physical_idx],
-            self.kv_bank[physical_idx],
-            self.kv_bank[n + physical_idx],
-            self.qo_bank[n + physical_idx],
-            self.mlp_up_bank[physical_idx],
-            self.mlp_down_bank[physical_idx],
-        )
+        q_w = self.qo_bank[physical_idx]
+        k_w = self.kv_bank[physical_idx]
+        v_w = self.kv_bank[n + physical_idx]
+        out_w = self.qo_bank[n + physical_idx]
+        up_w = self.mlp_up_bank[physical_idx]
+        down_w = self.mlp_down_bank[physical_idx]
+        if self._is_repeated_virtual_index(virtual_idx):
+            repeated_idx = virtual_idx - self._enc_recur
+            if self.repeat_mlp:
+                repeat_mlp = self.repeat_mlp[repeated_idx]
+                if repeat_mlp.fc is not None:
+                    up_w = repeat_mlp.fc.weight
+                if repeat_mlp.proj is not None:
+                    down_w = repeat_mlp.proj.weight
+            if self.repeat_lora:
+                adapters = self.repeat_lora[repeated_idx]
+                q_w = adapters["q"].apply_to(q_w)
+                out_w = adapters["o"].apply_to(out_w)
+                up_w = adapters["up"].apply_to(up_w)
+                down_w = adapters["down"].apply_to(down_w)
+        return q_w, k_w, v_w, out_w, up_w, down_w
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -1161,7 +1253,7 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    compiled_logits = base_model.forward_logits
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1269,11 +1361,14 @@ def collect_hessians_from_tokens(hessian_model, token_seqs, device):
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if ".mlp." in name:
+    if ".mlp." in name or name.startswith("repeat_mlp."):
         return "mlp"
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
     return "other"
+
+def _parse_layer_list(layers_str: str) -> list[int]:
+    return [int(x) for x in layers_str.split(",") if x.strip()]
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -1521,7 +1616,9 @@ class _HessianGPT(nn.Module):
                  ve_enabled=False, ve_dim=128, ve_layers="9,10",
                  disable_layer0_attn=False,
                  recur_layers=None,
-                 recurrence_active=False):
+                 recurrence_active=False,
+                 repeat_untie_mlp="none",
+                 repeat_untie_mlp_layers=None):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1530,6 +1627,19 @@ class _HessianGPT(nn.Module):
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
         self.recur_layers = sorted(set(recur_layers or []))
+        self.repeat_untie_mlp = repeat_untie_mlp
+        if self.repeat_untie_mlp not in {"none", "down", "full"}:
+            raise ValueError(f"repeat untie mlp mode must be one of none/down/full, got {self.repeat_untie_mlp}")
+        requested_repeat_untie_layers = sorted(set(repeat_untie_mlp_layers or []))
+        invalid_repeat_untie_layers = [rl for rl in requested_repeat_untie_layers if rl not in self.recur_layers]
+        if invalid_repeat_untie_layers:
+            raise ValueError(f"repeat untie mlp layers must be a subset of recur_layers, got {invalid_repeat_untie_layers}")
+        if self.repeat_untie_mlp == "none":
+            self.repeat_untie_mlp_layers = []
+        elif requested_repeat_untie_layers:
+            self.repeat_untie_mlp_layers = requested_repeat_untie_layers
+        else:
+            self.repeat_untie_mlp_layers = list(self.recur_layers)
         if self.recur_layers:
             cutoff = max(self.recur_layers) + 1
             self._v2p_recur = list(range(cutoff)) + self.recur_layers + list(range(cutoff, num_layers))
@@ -1547,6 +1657,11 @@ class _HessianGPT(nn.Module):
         self.num_decoder_layers = self._dec_recur
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.repeat_mlp = nn.ModuleList()
+        if self.repeat_untie_mlp != "none" and self.recur_layers:
+            for physical_idx in self.recur_layers:
+                mode = self.repeat_untie_mlp if physical_idx in self.repeat_untie_mlp_layers else "none"
+                self.repeat_mlp.append(RepeatMLPWeights(model_dim, mlp_mult, mode))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                           layer_idx=i, ln_scale=ln_scale, disable_attn=disable_layer0_attn and i == 0)
@@ -1623,14 +1738,56 @@ class _HessianGPT(nn.Module):
         ve_cache = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
+            if self._recurrence_active and self.repeat_mlp and self._enc_recur <= i < self._enc_recur + len(self.recur_layers):
+                repeat_idx = i - self._enc_recur
+                block = self.blocks[i]
+                mix = block.resid_mix.to(dtype=x.dtype)
+                x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+                x_out = x_in
+                if not block.disable_attn:
+                    attn_out = block.attn(block.attn_norm(x_in) * block.ln_scale_factor, v_embed=ve)
+                    x_out = x_out + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+                mlp_in = block.mlp_norm(x_out) * block.ln_scale_factor
+                repeat_mlp = self.repeat_mlp[repeat_idx]
+                if repeat_mlp.fc is not None:
+                    mlp_hidden = F.leaky_relu(repeat_mlp.fc(mlp_in), negative_slope=0.5)
+                else:
+                    mlp_hidden = F.leaky_relu(block.mlp.fc(mlp_in), negative_slope=0.5)
+                if repeat_mlp.proj is not None:
+                    mlp_out = repeat_mlp.proj(mlp_hidden.square())
+                else:
+                    mlp_out = block.mlp.proj(mlp_hidden.square())
+                x = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+            else:
+                x = self.blocks[i](x, x0, v_embed=ve)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            if self._recurrence_active and self.repeat_mlp and self._enc_recur <= bi < self._enc_recur + len(self.recur_layers):
+                repeat_idx = bi - self._enc_recur
+                block = self.blocks[bi]
+                mix = block.resid_mix.to(dtype=x.dtype)
+                x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+                x_out = x_in
+                if not block.disable_attn:
+                    attn_out = block.attn(block.attn_norm(x_in) * block.ln_scale_factor, v_embed=ve)
+                    x_out = x_out + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+                mlp_in = block.mlp_norm(x_out) * block.ln_scale_factor
+                repeat_mlp = self.repeat_mlp[repeat_idx]
+                if repeat_mlp.fc is not None:
+                    mlp_hidden = F.leaky_relu(repeat_mlp.fc(mlp_in), negative_slope=0.5)
+                else:
+                    mlp_hidden = F.leaky_relu(block.mlp.fc(mlp_in), negative_slope=0.5)
+                if repeat_mlp.proj is not None:
+                    mlp_out = repeat_mlp.proj(mlp_hidden.square())
+                else:
+                    mlp_out = block.mlp.proj(mlp_hidden.square())
+                x = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+            else:
+                x = self.blocks[bi](x, x0, v_embed=ve)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1804,7 +1961,8 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     CastedLinear._qat_enabled = args.qat_enabled
-    recur_layers = [int(x) for x in args.recur_layers_str.split(",") if x.strip()]
+    recur_layers = _parse_layer_list(args.recur_layers_str)
+    repeat_untie_mlp_layers = _parse_layer_list(args.repeat_untie_mlp_layers)
     if args.post_gptq_eval_only:
         log0("post_gptq_eval_only: enabled")
         eval_model = GPT(
@@ -1817,6 +1975,8 @@ def main() -> None:
             ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
             gated_attention=args.gated_attention, value_residual=args.value_residual,
             disable_layer0_attn=args.disable_layer0_attn, recur_layers=recur_layers, recurrence_active=bool(recur_layers),
+            repeat_lora_rank=args.repeat_lora_rank, repeat_lora_alpha=args.repeat_lora_alpha,
+            repeat_untie_mlp=args.repeat_untie_mlp, repeat_untie_mlp_layers=repeat_untie_mlp_layers,
         ).to(device).bfloat16()
         eval_model.qo_bank.data = eval_model.qo_bank.data.float(); eval_model.kv_bank.data = eval_model.kv_bank.data.float()
         eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float(); eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
@@ -1870,6 +2030,10 @@ def main() -> None:
         disable_layer0_attn=args.disable_layer0_attn,
         recur_layers=recur_layers,
         recurrence_active=False,
+        repeat_lora_rank=args.repeat_lora_rank,
+        repeat_lora_alpha=args.repeat_lora_alpha,
+        repeat_untie_mlp=args.repeat_untie_mlp,
+        repeat_untie_mlp_layers=repeat_untie_mlp_layers,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1894,6 +2058,7 @@ def main() -> None:
         base_model.qo_bank, base_model.kv_bank,
         base_model.mlp_up_bank, base_model.mlp_down_bank,
     ]
+    matrix_params.extend(p for p in base_model.repeat_mlp.parameters())
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
         p
@@ -1941,11 +2106,22 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
+    repeat_lora_params = list(base_model.repeat_lora.parameters())
+    optimizer_repeat_lora = None
+    if repeat_lora_params:
+        optimizer_repeat_lora = torch.optim.AdamW(
+            [{"params": repeat_lora_params, "lr": args.repeat_lora_lr, "base_lr": args.repeat_lora_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.repeat_lora_wd,
+            fused=True,
+        )
     # Non-bank params that need manual all-reduce (replicated across GPUs)
     replicated_params = list(optimizer_tok.param_groups[0]["params"])
     for pg in optimizer_tok.param_groups[1:]:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
+    replicated_params.extend(repeat_lora_params)
 
     optimizer_head = None
     if base_model.lm_head is not None:
@@ -1957,6 +2133,8 @@ def main() -> None:
         )
         replicated_params.append(base_model.lm_head.weight)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if optimizer_repeat_lora is not None:
+        optimizers.append(optimizer_repeat_lora)
     if optimizer_head is not None:
         optimizers.append(optimizer_head)
     n_params = sum(p.numel() for p in base_model.parameters())
@@ -1969,6 +2147,8 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"recurrence:layers={recur_layers} start_step={args.recur_start_step} active={int(base_model._recurrence_active)}")
+    log0(f"repeat_lora:rank={args.repeat_lora_rank} alpha={args.repeat_lora_alpha if args.repeat_lora_alpha > 0 else args.repeat_lora_rank} params={sum(p.numel() for p in repeat_lora_params)} lr={args.repeat_lora_lr} wd={args.repeat_lora_wd}")
+    log0(f"repeat_untie_mlp:mode={args.repeat_untie_mlp} layers={repeat_untie_mlp_layers if repeat_untie_mlp_layers else recur_layers if args.repeat_untie_mlp != 'none' else []} params={sum(p.numel() for p in base_model.repeat_mlp.parameters())}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -2206,6 +2386,8 @@ def main() -> None:
         disable_layer0_attn=args.disable_layer0_attn,
         recur_layers=recur_layers,
         recurrence_active=base_model._recurrence_active,
+        repeat_untie_mlp=args.repeat_untie_mlp,
+        repeat_untie_mlp_layers=repeat_untie_mlp_layers,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
@@ -2322,6 +2504,10 @@ def main() -> None:
         disable_layer0_attn=args.disable_layer0_attn,
         recur_layers=recur_layers,
         recurrence_active=base_model._recurrence_active,
+        repeat_lora_rank=args.repeat_lora_rank,
+        repeat_lora_alpha=args.repeat_lora_alpha,
+        repeat_untie_mlp=args.repeat_untie_mlp,
+        repeat_untie_mlp_layers=repeat_untie_mlp_layers,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
@@ -2332,7 +2518,7 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=True, fullgraph=True)
+    compiled_eval = eval_model
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(

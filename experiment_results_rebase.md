@@ -13,3 +13,8 @@
   `DIAGNOSTIC post_ema val_loss:1.9117 val_bpb:1.1322 eval_time:2306ms`
   `final_int8_zlib_roundtrip_exact val_loss:1.88039677 val_bpb:1.11367983`
 - Relative to the fresh baseline, this is `0.0018` bpb better post-EMA and `0.0007` bpb better on the final roundtrip metric.
+- Full untie of the repeated layer-4 MLP improved further:
+  `DIAGNOSTIC post_ema val_loss:1.9077 val_bpb:1.1299 eval_time:2310ms`
+  `final_int8_zlib_roundtrip_exact val_loss:1.87680398 val_bpb:1.11155197`
+- Relative to the fresh baseline, this is `0.0041` bpb better post-EMA and `0.0028` bpb better on the final roundtrip metric.
+- Relative to the previous recurrence rebase result, this is another `0.0023` bpb better post-EMA and `0.0021` bpb better on the final roundtrip metric.
