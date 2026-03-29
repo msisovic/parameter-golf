@@ -81,6 +81,7 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    xsa_skip_recur = bool(int(os.environ.get("XSA_SKIP_RECUR", "0")))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     sandwich_norm = bool(int(os.environ.get("SANDWICH_NORM", "0")))
@@ -827,6 +828,7 @@ class GPT(nn.Module):
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         xsa_last_n: int = 0,
+        xsa_skip_recur: bool = False,
         rope_dims: int = 0,
         ln_scale: bool = False,
         sandwich_norm: bool = False,
@@ -952,6 +954,8 @@ class GPT(nn.Module):
         self.bottleneck_bank_indices: list[int] = []
         if xsa_last_n > 0:
             for i in range(max(0, virtual_num_layers - xsa_last_n), virtual_num_layers):
+                if xsa_skip_recur and self.v2p[i] in self.recur_layers:
+                    continue
                 self.blocks[i].attn.use_xsa = True
         self._init_weights()
 
@@ -1999,6 +2003,19 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
+    def log_block_scales(model: GPT, prefix: str) -> None:
+        log0(f"{prefix} block_scales_begin")
+        for vi, block in enumerate(model.blocks):
+            pi = model.v2p[vi] if vi < len(model.v2p) else -1
+            repeated = int(model._is_repeated_virtual_index(vi)) if hasattr(model, "_is_repeated_virtual_index") else 0
+            attn_scale = block.attn_scale.detach().float()
+            mlp_scale = block.mlp_scale.detach().float()
+            log0(
+                f"{prefix} layer:{vi:02d} phys:{pi:02d} repeated:{repeated} "
+                f"attn_mean:{attn_scale.mean().item():.4f} attn_abs:{attn_scale.abs().mean().item():.4f} "
+                f"mlp_mean:{mlp_scale.mean().item():.4f} mlp_abs:{mlp_scale.abs().mean().item():.4f}"
+            )
+        log0(f"{prefix} block_scales_end")
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -2048,6 +2065,7 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
+        xsa_skip_recur=args.xsa_skip_recur,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
         sandwich_norm=args.sandwich_norm,
@@ -2397,6 +2415,7 @@ def main() -> None:
             f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
         )
+        log_block_scales(base_model, "post_ema")
         full_state_dict = base_model.state_dict()
         export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
         excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
@@ -2489,7 +2508,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         mtp_num_heads=0, mtp_loss_weight=0.0,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n,
+        xsa_last_n=args.xsa_last_n, xsa_skip_recur=args.xsa_skip_recur,
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, sandwich_norm=args.sandwich_norm,
         repeat_lora_rank=args.repeat_lora_rank, repeat_lora_alpha=args.repeat_lora_alpha, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
@@ -2521,6 +2540,7 @@ def main() -> None:
     # Re-bank the dequantized tensors
     deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, template_sd)
     eval_model.load_state_dict(deq_state, strict=True)
+    log_block_scales(eval_model, "final_int6")
     if args.eval_bottleneck_reps > 0 and eval_model.recur_layers:
         eval_model.add_eval_bottleneck(args.eval_bottleneck_reps)
         log0(f"eval_bottleneck:reps={args.eval_bottleneck_reps} layers={eval_model.bottleneck_bank_indices} extra_blocks={len(eval_model.bottleneck_blocks)}")

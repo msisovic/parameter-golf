@@ -25,3 +25,26 @@ Fixed settings for this sweep:
 - Equal `2500/2500`, `3000/3000`, `3500/3500` confirms the old center still holds: `3000/3000` is best among these three.
 - The gain is not recovered by simple retuning alone on seed `314`; all three are worse than the earlier `1.11471611` no-TTT run.
 - `3500/3500` improving post-EMA but regressing after GPTQ suggests the remaining gap is not purely a training-side issue.
+
+## Experiment 2: Broad XSA, Skip Recurrent Layers
+
+| Setup | Log | Final post-EMA BPB | Final int6 sliding-window BPB | Post-TTT BPB | Notes |
+|-------|-----|--------------------|--------------------------------|--------------|-------|
+| `RECUR_START_STEP=3000`, `WARMDOWN_ITERS=3000`, `XSA_LAST_N=13`, `XSA_SKIP_RECUR=1` | [logs/xsa_all_skip_recur.txt](/root/parameter-golf/logs/xsa_all_skip_recur.txt) | `1.1339` | `1.11477270` | `1.11452572` | Best structural tweak so far; broad XSA helps, but not on recurrent layers. |
+| Same as above, rerun with scale dump | [logs/xsa_all_skip_recur_scales.txt](/root/parameter-golf/logs/xsa_all_skip_recur_scales.txt) | `1.1335` | `1.11425194` | pending | Faster rerun with slightly better final score; likely runtime variance, not an intentional training-path change. |
+
+### Scale Dump Notes
+
+- `attn_scale` and `mlp_scale` are smooth and positive across all virtual layers; there is no obvious dead branch.
+- Repeated recurrent passes show a mild MLP increase relative to their first pass, but attention remains substantial:
+  - phys 4 first pass: `attn=0.4100`, `mlp=0.2414`
+  - phys 4 repeated: `attn=0.3858`, `mlp=0.2845`
+  - phys 5 first pass: `attn=0.3548`, `mlp=0.2574`
+  - phys 5 repeated: `attn=0.5062`, `mlp=0.3033`
+- `final_int6` scale dumps exactly match `post_ema`, which is expected because these per-block scale vectors are not part of the int6-quantized weights.
+
+### Updated Findings
+
+- Skipping XSA on recurrent layers while using broad XSA elsewhere is the clearest recurrence-specific win on the new baseline.
+- The scale dump does not support a simple story that repeated passes are "MLP only"; attention still carries a large residual weight on recurrent passes.
+- The improved rerun score (`1.11425194`) is real, but the speedup appears to be run-to-run/runtime variance rather than a known code change in the training path.
