@@ -84,6 +84,8 @@ class Hyperparameters:
     xsa_skip_recur = bool(int(os.environ.get("XSA_SKIP_RECUR", "1")))
     layer0_mlp_only = bool(int(os.environ.get("LAYER0_MLP_ONLY", "1")))
     fixed_skip_topology = bool(int(os.environ.get("FIXED_SKIP_TOPOLOGY", "0")))
+    recur_self_skip = bool(int(os.environ.get("RECUR_SELF_SKIP", "0")))
+    recur_self_skip_only = bool(int(os.environ.get("RECUR_SELF_SKIP_ONLY", "0")))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     sandwich_norm = bool(int(os.environ.get("SANDWICH_NORM", "0")))
@@ -838,6 +840,8 @@ class GPT(nn.Module):
         xsa_skip_recur: bool = False,
         layer0_mlp_only: bool = False,
         fixed_skip_topology: bool = False,
+        recur_self_skip: bool = False,
+        recur_self_skip_only: bool = False,
         rope_dims: int = 0,
         ln_scale: bool = False,
         sandwich_norm: bool = False,
@@ -897,6 +901,9 @@ class GPT(nn.Module):
         self._dec_recur = self.num_decoder_layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.fixed_skip_topology = fixed_skip_topology
+        self.recur_self_skip = recur_self_skip
+        self.recur_self_skip_only = recur_self_skip_only
+        self.recur_skip_weights = nn.Parameter(torch.ones(len(self.recur_layers), model_dim, dtype=torch.float32))
         self._stable_skip_src_by_phys: dict[int, int] = {}
         for i in range(self._enc_no_recur):
             decoder_phys = self._enc_no_recur + i
@@ -1031,6 +1038,8 @@ class GPT(nn.Module):
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def _get_skip(self, decoder_idx: int, decoder_vi: int, skips: list[Tensor], skip_by_phys: dict[int, Tensor]) -> Tensor | None:
+        if self.recur_self_skip_only:
+            return None
         if self.fixed_skip_topology:
             src_phys = self._stable_skip_src_by_phys.get(self.v2p[decoder_vi])
             if src_phys is None:
@@ -1063,6 +1072,7 @@ class GPT(nn.Module):
         v0 = None
         skips: list[Tensor] = []
         skip_by_phys: dict[int, Tensor] = {}
+        recur_first_pass: dict[int, Tensor] = {}
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
@@ -1073,7 +1083,10 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
-            skip_by_phys[self.v2p[i]] = x
+            pi = self.v2p[i]
+            skip_by_phys[pi] = x
+            if self.recur_self_skip and pi in self.recur_layers and pi not in recur_first_pass:
+                recur_first_pass[pi] = x
         for block, pi in zip(self.bottleneck_blocks, self.bottleneck_bank_indices):
             x, _ = block(x, x0,
                 self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
@@ -1081,6 +1094,12 @@ class GPT(nn.Module):
                 v_embed=None, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
+            if self.recur_self_skip and self._is_repeated_virtual_index(bi):
+                repeated_idx = bi - self._recur_cutoff
+                pi = self.v2p[bi]
+                recur_skip = recur_first_pass.get(pi)
+                if recur_skip is not None:
+                    x = x + self.recur_skip_weights[repeated_idx].to(dtype=x.dtype)[None, None, :] * recur_skip
             skip = self._get_skip(i, bi, skips, skip_by_phys)
             if skip is not None:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
@@ -1129,6 +1148,7 @@ class GPT(nn.Module):
         v0 = None
         skips: list[Tensor] = []
         skip_by_phys: dict[int, Tensor] = {}
+        recur_first_pass: dict[int, Tensor] = {}
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
@@ -1139,7 +1159,10 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
-            skip_by_phys[self.v2p[i]] = x
+            pi = self.v2p[i]
+            skip_by_phys[pi] = x
+            if self.recur_self_skip and pi in self.recur_layers and pi not in recur_first_pass:
+                recur_first_pass[pi] = x
         for block, pi in zip(self.bottleneck_blocks, self.bottleneck_bank_indices):
             x, _ = block(x, x0,
                 self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
@@ -1147,6 +1170,12 @@ class GPT(nn.Module):
                 v_embed=None, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
+            if self.recur_self_skip and self._is_repeated_virtual_index(bi):
+                repeated_idx = bi - self._recur_cutoff
+                pi = self.v2p[bi]
+                recur_skip = recur_first_pass.get(pi)
+                if recur_skip is not None:
+                    x = x + self.recur_skip_weights[repeated_idx].to(dtype=x.dtype)[None, None, :] * recur_skip
             skip = self._get_skip(i, bi, skips, skip_by_phys)
             if skip is not None:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
@@ -2056,6 +2085,23 @@ def main() -> None:
                 f"mlp_mean:{mlp_scale.mean().item():.4f} mlp_abs:{mlp_scale.abs().mean().item():.4f}"
             )
         log0(f"{prefix} block_scales_end")
+        log0(f"{prefix} skip_weights_begin")
+        for i in range(model.skip_weights.shape[0]):
+            sw = model.skip_weights[i].detach().float()
+            log0(
+                f"{prefix} skip:{i:02d} "
+                f"mean:{sw.mean().item():.4f} abs:{sw.abs().mean().item():.4f}"
+            )
+        log0(f"{prefix} skip_weights_end")
+        if model.recur_skip_weights.shape[0] > 0:
+            log0(f"{prefix} recur_skip_weights_begin")
+            for i in range(model.recur_skip_weights.shape[0]):
+                sw = model.recur_skip_weights[i].detach().float()
+                log0(
+                    f"{prefix} recur_skip:{i:02d} "
+                    f"mean:{sw.mean().item():.4f} abs:{sw.abs().mean().item():.4f}"
+                )
+            log0(f"{prefix} recur_skip_weights_end")
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -2108,6 +2154,8 @@ def main() -> None:
         xsa_skip_recur=args.xsa_skip_recur,
         layer0_mlp_only=args.layer0_mlp_only,
         fixed_skip_topology=args.fixed_skip_topology,
+        recur_self_skip=args.recur_self_skip,
+        recur_self_skip_only=args.recur_self_skip_only,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
         sandwich_norm=args.sandwich_norm,
@@ -2157,6 +2205,8 @@ def main() -> None:
         ]
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
+        if base_model.recur_skip_weights.numel() > 0:
+            scalar_params.append(base_model.recur_skip_weights)
         scalar_params.append(base_model.smear.gate)
         if base_model.bigram is not None:
             scalar_params.append(base_model.bigram.scale)
@@ -2236,6 +2286,8 @@ def main() -> None:
                 log0(f"recurrence:delayed start_step={args.recur_start_step}")
             if args.fixed_skip_topology:
                 log0(f"recurrence:fixed_skip_topology pairs={base_model._stable_skip_src_by_phys}")
+            if args.recur_self_skip:
+                log0(f"recurrence:self_skip enabled only={args.recur_self_skip_only}")
         repeat_lora_param_count = sum(p.numel() for p in base_model.repeat_lora.parameters())
         log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
         xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
@@ -2556,6 +2608,8 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n, xsa_skip_recur=args.xsa_skip_recur,
         layer0_mlp_only=args.layer0_mlp_only,
         fixed_skip_topology=args.fixed_skip_topology,
+        recur_self_skip=args.recur_self_skip,
+        recur_self_skip_only=args.recur_self_skip_only,
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, sandwich_norm=args.sandwich_norm,
         repeat_lora_rank=args.repeat_lora_rank, repeat_lora_alpha=args.repeat_lora_alpha, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
