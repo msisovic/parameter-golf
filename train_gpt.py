@@ -82,6 +82,8 @@ class Hyperparameters:
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     xsa_skip_recur = bool(int(os.environ.get("XSA_SKIP_RECUR", "0")))
+    layer0_mlp_only = bool(int(os.environ.get("LAYER0_MLP_ONLY", "0")))
+    fixed_skip_topology = bool(int(os.environ.get("FIXED_SKIP_TOPOLOGY", "0")))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     sandwich_norm = bool(int(os.environ.get("SANDWICH_NORM", "0")))
@@ -795,12 +797,17 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
+        self.disable_attn = False
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
-        attn_out = self.attn_post_norm(attn_out)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        if self.disable_attn:
+            x_out = x_in
+            raw_v = None
+        else:
+            attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
+            attn_out = self.attn_post_norm(attn_out)
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         mlp_out = self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         mlp_out = self.mlp_post_norm(mlp_out)
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
@@ -829,6 +836,8 @@ class GPT(nn.Module):
         bigram_dim: int = 128,
         xsa_last_n: int = 0,
         xsa_skip_recur: bool = False,
+        layer0_mlp_only: bool = False,
+        fixed_skip_topology: bool = False,
         rope_dims: int = 0,
         ln_scale: bool = False,
         sandwich_norm: bool = False,
@@ -887,6 +896,12 @@ class GPT(nn.Module):
         self._enc_recur = self.num_encoder_layers
         self._dec_recur = self.num_decoder_layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.fixed_skip_topology = fixed_skip_topology
+        self._stable_skip_src_by_phys: dict[int, int] = {}
+        for i in range(self._enc_no_recur):
+            decoder_phys = self._enc_no_recur + i
+            if i < self.num_skip_weights:
+                self._stable_skip_src_by_phys[decoder_phys] = self._enc_no_recur - 1 - i
         # Parameter banks: contiguous 3D tensors for batched optimizer (physical layer count)
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
@@ -957,6 +972,8 @@ class GPT(nn.Module):
                 if xsa_skip_recur and self.v2p[i] in self.recur_layers:
                     continue
                 self.blocks[i].attn.use_xsa = True
+        if layer0_mlp_only and len(self.blocks) > 0:
+            self.blocks[0].disable_attn = True
         self._init_weights()
 
     def _is_repeated_virtual_index(self, vi: int) -> bool:
@@ -1013,6 +1030,15 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+    def _get_skip(self, decoder_idx: int, decoder_vi: int, skips: list[Tensor], skip_by_phys: dict[int, Tensor]) -> Tensor | None:
+        if self.fixed_skip_topology:
+            src_phys = self._stable_skip_src_by_phys.get(self.v2p[decoder_vi])
+            if src_phys is None:
+                return None
+            return skip_by_phys.get(src_phys)
+        if not skips:
+            return None
+        return skips.pop()
     def set_recurrence_active(self, active: bool) -> None:
         """Switch between recurrence and non-recurrence forward pass."""
         if not self.recur_layers:
@@ -1036,6 +1062,7 @@ class GPT(nn.Module):
         x0 = x
         v0 = None
         skips: list[Tensor] = []
+        skip_by_phys: dict[int, Tensor] = {}
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
@@ -1046,6 +1073,7 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+            skip_by_phys[self.v2p[i]] = x
         for block, pi in zip(self.bottleneck_blocks, self.bottleneck_bank_indices):
             x, _ = block(x, x0,
                 self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
@@ -1053,8 +1081,9 @@ class GPT(nn.Module):
                 v_embed=None, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            skip = self._get_skip(i, bi, skips, skip_by_phys)
+            if skip is not None:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
             q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
@@ -1099,6 +1128,7 @@ class GPT(nn.Module):
         x0 = x
         v0 = None
         skips: list[Tensor] = []
+        skip_by_phys: dict[int, Tensor] = {}
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
@@ -1109,6 +1139,7 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+            skip_by_phys[self.v2p[i]] = x
         for block, pi in zip(self.bottleneck_blocks, self.bottleneck_bank_indices):
             x, _ = block(x, x0,
                 self.qo_bank[pi], self.kv_bank[pi], self.kv_bank[n + pi],
@@ -1116,8 +1147,9 @@ class GPT(nn.Module):
                 v_embed=None, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            skip = self._get_skip(i, bi, skips, skip_by_phys)
+            if skip is not None:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
             q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
@@ -1779,13 +1811,18 @@ class _HessianBlock(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
+        self.disable_attn = False
 
     def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed, v0=v0)
-        attn_out = self.attn_post_norm(attn_out)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        if self.disable_attn:
+            x_out = x_in
+            raw_v = None
+        else:
+            attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed, v0=v0)
+            attn_out = self.attn_post_norm(attn_out)
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         mlp_out = self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
         mlp_out = self.mlp_post_norm(mlp_out)
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
@@ -1812,6 +1849,7 @@ class _HessianGPT(nn.Module):
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         xsa_last_n: int = 0,
+        layer0_mlp_only: bool = False,
         rope_dims: int = 0,
         ln_scale: bool = False,
         sandwich_norm: bool = False,
@@ -1851,6 +1889,8 @@ class _HessianGPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        if layer0_mlp_only and len(self.blocks) > 0:
+            self.blocks[0].disable_attn = True
         kv_dim = num_kv_heads * (model_dim // num_heads)
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
         if self.ve_layer_indices:
@@ -2066,6 +2106,8 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
         xsa_skip_recur=args.xsa_skip_recur,
+        layer0_mlp_only=args.layer0_mlp_only,
+        fixed_skip_topology=args.fixed_skip_topology,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
         sandwich_norm=args.sandwich_norm,
@@ -2192,6 +2234,8 @@ def main() -> None:
             if args.recur_start_step > 0:
                 base_model.set_recurrence_active(False)
                 log0(f"recurrence:delayed start_step={args.recur_start_step}")
+            if args.fixed_skip_topology:
+                log0(f"recurrence:fixed_skip_topology pairs={base_model._stable_skip_src_by_phys}")
         repeat_lora_param_count = sum(p.numel() for p in base_model.repeat_lora.parameters())
         log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
         xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
@@ -2437,7 +2481,8 @@ def main() -> None:
             tie_embeddings=args.tie_embeddings, logit_softcap=args.logit_softcap,
             rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
             bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-            xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
+            xsa_last_n=args.xsa_last_n, layer0_mlp_only=args.layer0_mlp_only,
+            rope_dims=args.rope_dims, ln_scale=args.ln_scale,
             sandwich_norm=args.sandwich_norm, dtg=args.dtg_enabled,
             ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
             gated_attention=args.gated_attention, value_residual=args.value_residual,
@@ -2509,6 +2554,8 @@ def main() -> None:
         mtp_num_heads=0, mtp_loss_weight=0.0,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n, xsa_skip_recur=args.xsa_skip_recur,
+        layer0_mlp_only=args.layer0_mlp_only,
+        fixed_skip_topology=args.fixed_skip_topology,
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, sandwich_norm=args.sandwich_norm,
         repeat_lora_rank=args.repeat_lora_rank, repeat_lora_alpha=args.repeat_lora_alpha, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,

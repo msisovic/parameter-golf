@@ -48,3 +48,9 @@ Fixed settings for this sweep:
 - Skipping XSA on recurrent layers while using broad XSA elsewhere is the clearest recurrence-specific win on the new baseline.
 - The scale dump does not support a simple story that repeated passes are "MLP only"; attention still carries a large residual weight on recurrent passes.
 - The improved rerun score (`1.11425194`) is real, but the speedup appears to be run-to-run/runtime variance rather than a known code change in the training path.
+
+## Experiment 3: Layer 0 MLP-Only (Provisional)
+
+| Setup | Log | Status | Notes |
+|-------|-----|--------|-------|
+| `LAYER0_MLP_ONLY=1` on top of `XSA_LAST_N=13`, `XSA_SKIP_RECUR=1` | [logs/layer0_mlp_only_xsa_skip_recur.txt](/root/parameter-golf/logs/layer0_mlp_only_xsa_skip_recur.txt) | partial | Early training signal shows no obvious quality collapse and a real pre-recurrence speedup (`80.48ms` at step `3000` vs `85.06ms` baseline). The post-activation region is noisy because the recurrent compiled path changes. |
