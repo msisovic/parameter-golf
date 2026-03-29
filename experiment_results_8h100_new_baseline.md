@@ -97,9 +97,17 @@ Fixed settings for this sweep:
 
 ## Experiment 6: Recurrence Self-Skip Only (Started)
 
-| Setup | Log | Status | Notes |
-|-------|-----|--------|-------|
-| `RECUR_SELF_SKIP=1`, `RECUR_SELF_SKIP_ONLY=1` on the new anchor | [logs/recur_self_skip_only.txt](/root/parameter-golf/logs/recur_self_skip_only.txt) | running | Each repeated recurrent layer gets its own first-pass activation; generic decoder skips are disabled. Early training is fast (`80.00ms` at step `3000`) and the recurrence transition cost looks comparable to the anchor so far. |
+| Setup | Log | Final stop-time BPB | Final post-EMA BPB | Notes |
+|-------|-----|---------------------|--------------------|-------|
+| `RECUR_SELF_SKIP=1`, `RECUR_SELF_SKIP_ONLY=1` on the new anchor | [logs/recur_self_skip_only.txt](/root/parameter-golf/logs/recur_self_skip_only.txt) | `1.1423` | `1.1415` | Clear miss. Recurrent self-skips learned nonzero weights, but removing the generic mid-depth skip stack hurt badly. |
+
+### Recur Self-Skip Takeaway
+
+- Recurrent self-skips are alive:
+  - `recur_skip:00 ≈ 0.44`
+  - `recur_skip:01 ≈ 0.15`
+- But they are not a replacement for the broader useful skip structure.
+- Disabling the generic decoder skips leaves too much signal on the table, especially the strong mid-depth paths that were previously learned.
 
 ### Current Working Conclusions
 
