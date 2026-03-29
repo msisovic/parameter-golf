@@ -35,8 +35,8 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
-    iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    iterations = int(os.environ.get("ITERATIONS", 9000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -103,9 +103,13 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 64))
+    gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
+    gptq_temperature = float(os.environ.get("GPTQ_TEMPERATURE", 0.8))
+    gptq_batch_size = int(os.environ.get("GPTQ_BATCH_SIZE", 8))
     recur_layer = int(os.environ.get("RECUR_LAYER", -1))  # single layer compat
-    recur_layers_str = os.environ.get("RECUR_LAYERS", "")  # comma-separated, e.g. "4,5"
-    recur_start_step = int(os.environ.get("RECUR_START_STEP", 0))  # delay recurrence activation
+    recur_layers_str = os.environ.get("RECUR_LAYERS", "4,5")  # comma-separated, e.g. "4,5"
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))  # delay recurrence activation
     eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
     eval_bottleneck_reps = int(os.environ.get("EVAL_BOTTLENECK_REPS", 0))
 
@@ -965,7 +969,7 @@ class GPT(nn.Module):
         out_w = self.qo_bank[n + pi]
         up_w = self.mlp_up_bank[pi]
         down_w = self.mlp_down_bank[pi]
-        if self._is_repeated_virtual_index(vi):
+        if self._is_repeated_virtual_index(vi) and len(self.repeat_lora) > 0:
             repeated_idx = vi - self._recur_cutoff
             adapters = self.repeat_lora[repeated_idx]
             q_w = adapters["q"].apply_to(q_w)
@@ -1413,6 +1417,71 @@ def eval_val_sliding_ttt(
 
 # --- GPTQ-lite int6 quantization ---
 
+def generate_autoregressive_calib(
+    model: nn.Module,
+    device: torch.device,
+    num_seqs: int,
+    seq_len: int,
+    vocab_size: int,
+    temperature: float,
+    batch_size: int,
+    seed: int,
+) -> list[Tensor]:
+    """Generate calibration sequences from the model itself without external data."""
+    model.eval()
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed)
+    all_tokens: list[Tensor] = []
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for batch_start in range(0, num_seqs, batch_size):
+            bs = min(batch_size, num_seqs - batch_start)
+            tokens = torch.randint(0, vocab_size, (bs, 1), device=device, generator=rng)
+            for _ in range(seq_len - 1):
+                logits = model.forward_logits(tokens)
+                next_logit = logits[:, -1, :]
+                probs = torch.softmax(next_logit / temperature, dim=-1)
+                next_tok = torch.multinomial(probs, 1, generator=rng)
+                tokens = torch.cat([tokens, next_tok], dim=1)
+            for i in range(bs):
+                all_tokens.append(tokens[i : i + 1])
+    return all_tokens
+
+
+def collect_hessians_from_tokens(hessian_model: nn.Module, token_seqs: list[Tensor], device: torch.device) -> dict[str, Tensor]:
+    """Collect H = X^T X for each linear weight from pre-generated token sequences."""
+    hessians: dict[str, Tensor] = {}
+    hooks: list[torch.utils.hooks.RemovableHandle] = []
+    for name, module in hessian_model.named_modules():
+        if isinstance(module, CastedLinear):
+            param_name = name + ".weight"
+            cols = module.weight.shape[1]
+            hessians[param_name] = torch.zeros(cols, cols, dtype=torch.float32, device="cpu")
+
+            def make_hook(pname: str):
+                def hook_fn(_module, inputs, _output):
+                    x = inputs[0].detach().float()
+                    if x.ndim == 3:
+                        x = x.reshape(-1, x.shape[-1])
+                    hessians[pname] += (x.T @ x).cpu()
+                return hook_fn
+
+            hooks.append(module.register_forward_hook(make_hook(param_name)))
+    hessian_model.eval()
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for seq in token_seqs:
+            x = seq[:, :-1].to(device)
+            y = seq[:, 1:].to(device)
+            hessian_model(x, y)
+    for hook in hooks:
+        hook.remove()
+    num_batches = max(len(token_seqs), 1)
+    for name, H in hessians.items():
+        H /= num_batches
+        damp = 0.01 * torch.diag(H).mean().clamp_min(1e-6)
+        H += damp * torch.eye(H.shape[0])
+        hessians[name] = H
+    return hessians
+
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
@@ -1441,6 +1510,87 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
+
+
+def _quantize_int6_percentile(t32: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
+    if t32.ndim == 2:
+        best_q, best_s, best_err = None, None, float("inf")
+        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+            if pct < 1.0:
+                row_clip = torch.quantile(t32.abs(), pct, dim=1)
+            else:
+                row_clip = t32.abs().amax(dim=1)
+            s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
+            recon = q.float() * s.float()[:, None]
+            err = (t32 - recon).pow(2).mean().item()
+            if err < best_err:
+                best_q, best_s, best_err = q, s, err
+        return best_q, best_s
+    amax = t32.abs().max().item()
+    scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
+    return q, scale
+
+
+def quantize_int6_gptq(
+    weight: Tensor,
+    hessian: Tensor | None = None,
+    clip_range: int = 31,
+    block_size: int = 128,
+) -> tuple[Tensor, Tensor]:
+    """Hessian-aware int6 quantization with blockwise GPTQ error compensation."""
+    t32 = weight.float()
+    if t32.ndim != 2 or hessian is None:
+        return _quantize_int6_percentile(t32, clip_range)
+    rows, cols = t32.shape
+    H = hessian.float().clone()
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1
+    damp = 0.01 * torch.mean(torch.diag(H))
+    H[torch.arange(cols), torch.arange(cols)] += damp
+    perm = torch.argsort(torch.diag(H), descending=True)
+    inv_perm = torch.argsort(perm)
+    W = t32[:, perm].clone()
+    W[:, dead[perm]] = 0
+    H = H[perm][:, perm]
+    Hinv = torch.linalg.cholesky(H)
+    Hinv = torch.cholesky_inverse(Hinv)
+    Hinv = torch.linalg.cholesky(Hinv, upper=True)
+    best_q, best_scale, best_err = None, None, float("inf")
+    for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+        if pct < 1.0:
+            row_clip = torch.quantile(t32.abs(), pct, dim=1)
+        else:
+            row_clip = t32.abs().amax(dim=1)
+        s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+        sf = s.float()
+        Q = torch.zeros_like(W, dtype=torch.int8)
+        W_work = W.clone()
+        for i1 in range(0, cols, block_size):
+            i2 = min(i1 + block_size, cols)
+            count = i2 - i1
+            W1 = W_work[:, i1:i2].clone()
+            Q1 = torch.zeros(rows, count, dtype=torch.int8)
+            Err1 = torch.zeros(rows, count)
+            Hinv1 = Hinv[i1:i2, i1:i2]
+            for i in range(count):
+                w = W1[:, i]
+                d = Hinv1[i, i]
+                q = torch.clamp(torch.round(w / sf), -clip_range, clip_range).to(torch.int8)
+                Q1[:, i] = q
+                err = (w - q.float() * sf) / d
+                W1[:, i:] -= err.unsqueeze(1) * Hinv1[i, i:].unsqueeze(0)
+                Err1[:, i] = err
+            Q[:, i1:i2] = Q1
+            if i2 < cols:
+                W_work[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+        recon = Q.float() * sf[:, None]
+        mse = (W - recon).pow(2).mean().item()
+        if mse < best_err:
+            best_q, best_scale, best_err = Q, s, mse
+    best_q = best_q[:, inv_perm]
+    return best_q, best_scale
 
 def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
     """Convert 3D bank tensors into individual 2D tensors with standard names."""
@@ -1509,7 +1659,248 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
             out[name] = tensor
     return out
 
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
+
+class _HessianAttn(nn.Module):
+    """Non-banked attention with CastedLinear layers so hooks can see linear inputs."""
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_base: float,
+        qk_gain_init: float,
+        gated_attention: bool = False,
+        value_residual: bool = False,
+    ):
+        super().__init__()
+        self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
+        self.head_dim = dim // num_heads
+        kv_dim = num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rope_dims = 0
+        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
+        self.use_xsa = False
+        self.gated_attention = gated_attention
+        if gated_attention:
+            self.attn_gate = nn.Linear(dim, num_heads, bias=True)
+            nn.init.zeros_(self.attn_gate.weight)
+            nn.init.constant_(self.attn_gate.bias, 4.0)
+        self.value_residual = value_residual
+        if value_residual:
+            self.vr_lambda = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        B, T, H, D = y.shape
+        Hkv = v.size(-2)
+        group = H // Hkv
+        y_g = y.reshape(B, T, Hkv, group, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(-2)
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, T, H, D)
+
+    def forward(self, x: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = self.c_v(x)
+        if v_embed is not None:
+            v = v + v_embed
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        raw_v = v if self.value_residual else None
+        if self.value_residual and v0 is not None:
+            lam = self.vr_lambda.to(dtype=v.dtype)
+            v = lam[0] * v0 + lam[1] * v
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
+        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        y = flash_attn_3_func(q, k, v, causal=True)
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v)
+        if self.gated_attention:
+            y = y * torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)
+        return self.proj(y.reshape(bsz, seqlen, dim)), raw_v
+
+
+class _HessianMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        mlp_dim = int(mlp_mult * dim)
+        self.fc = CastedLinear(dim, mlp_dim, bias=False)
+        self.proj = CastedLinear(mlp_dim, dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
+
+
+class _HessianBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+        layer_idx: int = 0,
+        ln_scale: bool = False,
+        sandwich_norm: bool = False,
+        dtg: bool = False,
+        gated_attention: bool = False,
+        value_residual: bool = False,
+    ):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.attn_post_norm = RMSNorm() if sandwich_norm else nn.Identity()
+        self.mlp_norm = RMSNorm()
+        self.mlp_post_norm = RMSNorm() if sandwich_norm else nn.Identity()
+        self.attn = _HessianAttn(
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+            gated_attention=gated_attention, value_residual=value_residual,
+        )
+        self.mlp = _HessianMLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        if dtg:
+            self.dtg_gate = nn.Linear(dim, 1, bias=True)
+            nn.init.zeros_(self.dtg_gate.weight)
+            nn.init.constant_(self.dtg_gate.bias, 2.0)
+        else:
+            self.dtg_gate = None
+
+    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed, v0=v0)
+        attn_out = self.attn_post_norm(attn_out)
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        mlp_out = self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
+        mlp_out = self.mlp_post_norm(mlp_out)
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+        if self.dtg_gate is not None:
+            gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
+            x_out = x_in + gate * (x_out - x_in)
+        return x_out, raw_v
+
+
+class _HessianGPT(nn.Module):
+    """Non-banked GPT used only for Hessian collection over exported bank weights."""
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        model_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        tie_embeddings: bool,
+        logit_softcap: float,
+        rope_base: float,
+        qk_gain_init: float,
+        bigram_vocab_size: int = 0,
+        bigram_dim: int = 128,
+        xsa_last_n: int = 0,
+        rope_dims: int = 0,
+        ln_scale: bool = False,
+        sandwich_norm: bool = False,
+        dtg: bool = False,
+        ve_enabled: bool = False,
+        ve_dim: int = 128,
+        ve_layers: str = "9,10",
+        gated_attention: bool = False,
+        value_residual: bool = False,
+    ):
+        super().__init__()
+        self.tie_embeddings = tie_embeddings
+        self.logit_softcap = logit_softcap
+        self.num_layers = num_layers
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.smear = SmearGate(model_dim)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.blocks = nn.ModuleList(
+            [
+                _HessianBlock(
+                    model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                    layer_idx=i, ln_scale=ln_scale, sandwich_norm=sandwich_norm, dtg=dtg,
+                    gated_attention=gated_attention, value_residual=value_residual,
+                )
+                for i in range(num_layers)
+            ]
+        )
+        if rope_dims > 0:
+            head_dim = model_dim // num_heads
+            for block in self.blocks:
+                block.attn.rope_dims = rope_dims
+                block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
+        kv_dim = num_kv_heads * (model_dim // num_heads)
+        self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
+        if self.ve_layer_indices:
+            self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim)
+            self.ve_layer_scales = nn.ParameterList([nn.Parameter(torch.ones(1, dtype=torch.float32)) for _ in self.ve_layer_indices])
+        else:
+            self.ve_shared = None
+            self.ve_layer_scales = nn.ParameterList()
+        self.final_norm = RMSNorm()
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+
+    def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict) -> Tensor | None:
+        if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
+            return None
+        if "ve" not in ve_cache:
+            ve_cache["ve"] = self.ve_shared(input_ids)
+        ve_idx = self.ve_layer_indices.index(layer_idx)
+        return ve_cache["ve"] * self.ve_layer_scales[ve_idx].to(dtype=ve_cache["ve"].dtype)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = self.smear(x)
+        x0 = x
+        v0 = None
+        skips: list[Tensor] = []
+        ve_cache: dict = {}
+        for i in range(self.num_encoder_layers):
+            ve = self._get_ve(i, input_ids, ve_cache)
+            x, raw_v = self.blocks[i](x, x0, v_embed=ve, v0=v0)
+            if v0 is None and raw_v is not None:
+                v0 = raw_v
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            bi = self.num_encoder_layers + i
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            ve = self._get_ve(bi, input_ids, ve_cache)
+            x, _ = self.blocks[bi](x, x0, v_embed=ve, v0=v0)
+        x = self.final_norm(x)
+        x_flat = x.reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
+        logits_proj = F.linear(x_flat, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x_flat)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+def mixed_quantize_int6(
+    state_dict: dict[str, Tensor],
+    int6_cats: set[str],
+    hessians: dict[str, Tensor] | None = None,
+    gptq_block_size: int = 128,
+):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
@@ -1529,7 +1920,11 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             meta[name] = "passthrough_ctrl"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_per_row(t)
+            H = hessians.get(name) if hessians else None
+            if H is not None:
+                q, s = quantize_int6_gptq(t, hessian=H, clip_range=31, block_size=gptq_block_size)
+            else:
+                q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6"}
@@ -2016,7 +2411,64 @@ def main() -> None:
         # Unbank 3D tensors into individual 2D tensors for quantization
         sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
         unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
-        quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
+        log0("gptq:building non-banked model for Hessian collection...")
+        hessian_model = _HessianGPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
+            sandwich_norm=args.sandwich_norm, dtg=args.dtg_enabled,
+            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+            gated_attention=args.gated_attention, value_residual=args.value_residual,
+        ).to(device).bfloat16()
+        for m in hessian_model.modules():
+            if isinstance(m, CastedLinear):
+                m.float()
+        restore_low_dim_params_to_fp32(hessian_model)
+        hessian_state = hessian_model.state_dict()
+        hessian_loadable = {
+            k: v.to(device)
+            for k, v in unbanked_sd.items()
+            if k in hessian_state and hessian_state[k].shape == v.shape
+        }
+        skipped_hessian_keys = [
+            k for k, v in unbanked_sd.items()
+            if k in hessian_state and hessian_state[k].shape != v.shape
+        ]
+        if skipped_hessian_keys:
+            log0(f"gptq:hessian_model skipping {len(skipped_hessian_keys)} mismatched tensors")
+        hessian_model.load_state_dict(hessian_loadable, strict=False)
+        log0(
+            f"gptq:generating autoregressive calibration data "
+            f"({args.gptq_calib_batches} seqs x {args.train_seq_len} tokens, temp={args.gptq_temperature})..."
+        )
+        base_model.load_state_dict(export_sd, strict=False)
+        t_gptq_gen = time.perf_counter()
+        ar_tokens = generate_autoregressive_calib(
+            base_model,
+            device,
+            num_seqs=args.gptq_calib_batches,
+            seq_len=args.train_seq_len,
+            vocab_size=args.vocab_size,
+            temperature=args.gptq_temperature,
+            batch_size=args.gptq_batch_size,
+            seed=args.seed,
+        )
+        log0(f"gptq:generated {len(ar_tokens)} sequences in {time.perf_counter() - t_gptq_gen:.1f}s")
+        log0("gptq:collecting hessians from autoregressive data...")
+        hessians = collect_hessians_from_tokens(hessian_model, ar_tokens, device)
+        log0(f"gptq:collected hessians for {len(hessians)} layers (AR self-gen)")
+        del ar_tokens
+        del hessian_model
+        torch.cuda.empty_cache()
+        quant_result, quant_meta = mixed_quantize_int6(
+            unbanked_sd,
+            {"mlp", "attn"},
+            hessians=hessians,
+            gptq_block_size=args.gptq_block_size,
+        )
         quant_buf = io.BytesIO()
         torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
         quant_raw = quant_buf.getvalue()
@@ -2120,7 +2572,7 @@ def main() -> None:
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
     # Legal score-first TTT (PR #461 recipe)
-    ttt_untie = bool(int(os.environ.get("TTT_UNTIE", "1")))
+    ttt_untie = bool(int(os.environ.get("TTT_UNTIE", "0")))
     if args.ttt_enabled:
         if eval_model.recur_layers and ttt_untie:
             log0(f"ttt:untying recurrence at layers {eval_model.recur_layers}")
