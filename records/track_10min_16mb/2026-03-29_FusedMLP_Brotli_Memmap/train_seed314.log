@@ -1,0 +1,107 @@
+W0330 16:49:05.829000 1929 torch/distributed/run.py:803] 
+W0330 16:49:05.829000 1929 torch/distributed/run.py:803] *****************************************
+W0330 16:49:05.829000 1929 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0330 16:49:05.829000 1929 torch/distributed/run.py:803] *****************************************
+logs/82699593-936d-44b3-99a5-7fdbdeec18f6.txt
+/root/parameter-golf/train_gpt_mlp35_mixed.py:663: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  return torch.from_numpy(_get_shard_memmap(file))
+/root/parameter-golf/train_gpt_mlp35_mixed.py:663: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  return torch.from_numpy(_get_shard_memmap(file))
+/root/parameter-golf/train_gpt_mlp35_mixed.py:663: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  return torch.from_numpy(_get_shard_memmap(file))
+/root/parameter-golf/train_gpt_mlp35_mixed.py:663: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  return torch.from_numpy(_get_shard_memmap(file))
+/root/parameter-golf/train_gpt_mlp35_mixed.py:663: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  return torch.from_numpy(_get_shard_memmap(file))
+/root/parameter-golf/train_gpt_mlp35_mixed.py:663: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  return torch.from_numpy(_get_shard_memmap(file))
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:10
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+/root/parameter-golf/train_gpt_mlp35_mixed.py:663: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  return torch.from_numpy(_get_shard_memmap(file))
+/root/parameter-golf/train_gpt_mlp35_mixed.py:663: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  return torch.from_numpy(_get_shard_memmap(file))
+model_params:29951068
+fused_mlp:True
+cutlass_evt:True
+compressor:brotli
+optimizer:standard_NS5
+mtp_num_heads:0 mtp_loss_weight:0.2 mtp_params:0
+XSA:last_11 active_layers:[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.035 head_lr:0.0 matrix_lr:0.025 scalar_lr:0.025
+train_batch_tokens:786432 train_seq_len:2048 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+seed:314
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/20000 val_loss:6.9271 val_bpb:4.1026 train_time:0ms step_avg:0.01ms
+step:1/20000 train_loss:6.9239 train_time:148ms step_avg:147.73ms
+step:2/20000 train_loss:8.6300 train_time:181ms step_avg:90.60ms
+step:3/20000 train_loss:7.5039 train_time:266ms step_avg:88.74ms
+step:4/20000 train_loss:7.2535 train_time:353ms step_avg:88.23ms
+step:5/20000 train_loss:7.1752 train_time:437ms step_avg:87.44ms
+step:6/20000 train_loss:6.9607 train_time:523ms step_avg:87.09ms
+step:7/20000 train_loss:7.0094 train_time:608ms step_avg:86.79ms
+step:8/20000 train_loss:6.7257 train_time:693ms step_avg:86.57ms
+step:9/20000 train_loss:6.4200 train_time:777ms step_avg:86.35ms
+step:10/20000 train_loss:6.1407 train_time:863ms step_avg:86.31ms
+step:500/20000 train_loss:2.2640 train_time:43547ms step_avg:87.09ms
+step:1000/20000 train_loss:2.1325 train_time:87241ms step_avg:87.24ms
+step:1500/20000 train_loss:2.1642 train_time:130943ms step_avg:87.30ms
+step:2000/20000 train_loss:2.0655 train_time:174733ms step_avg:87.37ms
+step:2500/20000 train_loss:2.0582 train_time:218544ms step_avg:87.42ms
+step:3000/20000 train_loss:2.0606 train_time:262373ms step_avg:87.46ms
+step:3500/20000 train_loss:2.0526 train_time:306193ms step_avg:87.48ms
+step:4000/20000 train_loss:1.9668 train_time:349993ms step_avg:87.50ms
+step:4000/20000 val_loss:2.0168 val_bpb:1.1945 train_time:350051ms step_avg:87.51ms
+step:4500/20000 train_loss:2.0292 train_time:393811ms step_avg:87.51ms
+step:5000/20000 train_loss:1.9700 train_time:437614ms step_avg:87.52ms
+step:5500/20000 train_loss:1.9561 train_time:481433ms step_avg:87.53ms
+step:6000/20000 train_loss:1.9566 train_time:525244ms step_avg:87.54ms
+swa:start step:6200
+late_qat:enabled step:6325 scale:0.1499
+step:6500/20000 train_loss:1.9166 train_time:569498ms step_avg:87.62ms
+step:6844/20000 val_loss:1.9033 val_bpb:1.1272 train_time:600145ms step_avg:87.69ms
+stopping_early: wallclock_cap train_time:600145ms step:6844/20000
+peak memory allocated: 23956 MiB reserved: 23996 MiB
+ema:applying EMA weights
+DIAGNOSTIC post_ema val_loss:1.9000 val_bpb:1.1253 eval_time:2135ms
+Serialized model: 117823926 bytes
+Code size: 131305 bytes
+gptq:building non-banked model for Hessian collection...
+gptq:generating autoregressive calibration data (64 seqs x 2048 tokens, temp=0.8)...
+gptq:generated 64 sequences in 166.7s
+gptq:collecting hessians from autoregressive data...
+gptq:collected hessians for 68 layers (AR self-gen)
+mixed_quant: 10 int6, 56 int5
+mixed_quant: int6 layers: ['blocks.0.mlp.proj.weight', 'blocks.1.mlp.proj.weight', 'blocks.2.mlp.proj.weight', 'blocks.3.mlp.proj.weight', 'blocks.4.mlp.proj.weight']...
+selective_prune: 7124411 ±1 candidates, unpruned=13.85MB target=15.9MB
+selective_prune: already fits, no pruning needed
+Serialized model int6+brotli: 14388393 bytes
+Total submission size int6+brotli: 14519698 bytes
+final_int6_roundtrip val_loss:1.9177 val_bpb:1.1357 eval_time:21615ms
+final_int6_roundtrip_exact val_loss:1.91766187 val_bpb:1.13574737
+final_int6_sliding_window val_loss:1.8780 val_bpb:1.1123 stride:64 eval_time:94447ms
+final_int6_sliding_window_exact val_loss:1.87801836 val_bpb:1.11227120
+final_int8_zlib_roundtrip_exact val_loss:1.87801836 val_bpb:1.11227120

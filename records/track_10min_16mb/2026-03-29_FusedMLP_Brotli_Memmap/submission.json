@@ -1,0 +1,10 @@
+{
+  "name": "Fused MLP (Triton+CUTLASS EVT) + MLP 3.5× + Mixed int5/int6 + Brotli",
+  "author": "Abay Bektursun",
+  "github_id": "abaybektursun",
+  "date": "2026-03-30",
+  "val_loss": 1.87844412,
+  "val_bpb": 1.11252336,
+  "bytes_total": 14525480,
+  "blurb": "Fused Triton TMA forward + CUTLASS EVT backward MLP kernels, pre-computed activation gradient, MLP 3.5x (1792 hidden dim, motivated by SVD analysis showing 94.4% MLP utilization), Hessian-based mixed int5/int6 quantization (motivated by per-matrix quant sensitivity showing MLP = 80% of damage), Brotli-11 compression, LR floor 0.05, memmap multi-shard pipeline. AR self-gen GPTQ. 3-seed mean (314/999/1337): 1.1125 BPB / 1.8784 nats. Delta vs prior leaderboard SOTA: -0.0116 nats. Welch's t=-17.63, p<0.01."
+}
