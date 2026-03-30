@@ -100,6 +100,7 @@ class Hyperparameters:
     repeat_lora_wd = float(os.environ.get("REPEAT_LORA_WD", "0.0"))
     repeat_untie_mlp = os.environ.get("REPEAT_UNTIE_MLP", "none").strip().lower()
     repeat_untie_mlp_layers = os.environ.get("REPEAT_UNTIE_MLP_LAYERS", "").strip()
+    repeat_untie_mlp_overrides = os.environ.get("REPEAT_UNTIE_MLP_OVERRIDES", "").strip()
     gptq_selective_prune = bool(int(os.environ.get("GPTQ_SELECTIVE_PRUNE", "0")))
     post_gptq_eval_only = bool(int(os.environ.get("POST_GPTQ_EVAL_ONLY", "0")))
     skip_post_gptq_eval = bool(int(os.environ.get("SKIP_POST_GPTQ_EVAL", "0")))
@@ -926,6 +927,7 @@ class GPT(nn.Module):
         repeat_lora_alpha: float = 0.0,
         repeat_untie_mlp: str = "none",
         repeat_untie_mlp_layers: list[int] | None = None,
+        repeat_untie_mlp_overrides: dict[int, str] | None = None,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -951,6 +953,11 @@ class GPT(nn.Module):
         invalid_repeat_untie_layers = [rl for rl in requested_repeat_untie_layers if rl not in self.recur_layers]
         if invalid_repeat_untie_layers:
             raise ValueError(f"repeat untie mlp layers must be a subset of recur_layers, got {invalid_repeat_untie_layers}")
+        self.repeat_untie_mlp_overrides = dict(repeat_untie_mlp_overrides or {})
+        invalid_repeat_untie_override_layers = [rl for rl in self.repeat_untie_mlp_overrides if rl not in self.recur_layers]
+        invalid_repeat_untie_override_modes = [mode for mode in self.repeat_untie_mlp_overrides.values() if mode not in {"none", "down", "full"}]
+        if invalid_repeat_untie_override_layers or invalid_repeat_untie_override_modes:
+            raise ValueError(f"invalid repeat untie mlp overrides: layers={invalid_repeat_untie_override_layers} modes={invalid_repeat_untie_override_modes}")
         if self.repeat_untie_mlp == "none":
             self.repeat_untie_mlp_layers = []
         elif requested_repeat_untie_layers:
@@ -993,9 +1000,10 @@ class GPT(nn.Module):
                     "down": LowRankAdapter(model_dim, mlp_dim, repeat_lora_rank, repeat_lora_alpha),
                 }))
         self.repeat_mlp = nn.ModuleList()
-        if self.repeat_untie_mlp != "none" and self.recur_layers:
+        if (self.repeat_untie_mlp != "none" or self.repeat_untie_mlp_overrides) and self.recur_layers:
             for physical_idx in self.recur_layers:
                 mode = self.repeat_untie_mlp if physical_idx in self.repeat_untie_mlp_layers else "none"
+                mode = self.repeat_untie_mlp_overrides.get(physical_idx, mode)
                 self.repeat_mlp.append(RepeatMLPWeights(model_dim, mlp_mult, mode))
         self.blocks = nn.ModuleList(
             [
@@ -1369,6 +1377,14 @@ def _classify_param(name: str) -> str:
 
 def _parse_layer_list(layers_str: str) -> list[int]:
     return [int(x) for x in layers_str.split(",") if x.strip()]
+def _parse_layer_mode_overrides(overrides_str: str) -> dict[int, str]:
+    out = {}
+    if not overrides_str:
+        return out
+    for item in overrides_str.split(","):
+        layer_str, mode = item.split(":", 1)
+        out[int(layer_str.strip())] = mode.strip().lower()
+    return out
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -1494,10 +1510,10 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
     out: dict[str, Tensor] = {}
     n = num_layers
     # Reconstruct banks from individual weight keys
-    qo_slices = [None] * (2 * n)
-    kv_slices = [None] * (2 * n)
-    up_slices = [None] * n
-    down_slices = [None] * n
+    qo_slices = [template_sd["qo_bank"][i] for i in range(2 * n)]
+    kv_slices = [template_sd["kv_bank"][i] for i in range(2 * n)]
+    up_slices = [template_sd["mlp_up_bank"][i] for i in range(n)]
+    down_slices = [template_sd["mlp_down_bank"][i] for i in range(n)]
     consumed = set()
     for i in range(n):
         qk = f"blocks.{i}.attn.c_q.weight"
@@ -1532,6 +1548,17 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
         if name not in consumed:
             out[name] = tensor
     return out
+
+def _drop_disabled_layer0_attn_unbanked(sd: dict[str, Tensor], disable_layer0_attn: bool) -> dict[str, Tensor]:
+    if not disable_layer0_attn:
+        return sd
+    disabled_keys = {
+        "blocks.0.attn.c_q.weight",
+        "blocks.0.attn.c_k.weight",
+        "blocks.0.attn.c_v.weight",
+        "blocks.0.attn.proj.weight",
+    }
+    return {k: v for k, v in sd.items() if k not in disabled_keys}
 
 # --- Non-banked model for Hessian collection ---
 # This mirrors the unbanked state dict keys: blocks.{i}.attn.c_q/c_k/c_v/proj, blocks.{i}.mlp.fc/proj
@@ -1618,7 +1645,8 @@ class _HessianGPT(nn.Module):
                  recur_layers=None,
                  recurrence_active=False,
                  repeat_untie_mlp="none",
-                 repeat_untie_mlp_layers=None):
+                 repeat_untie_mlp_layers=None,
+                 repeat_untie_mlp_overrides=None):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1634,6 +1662,11 @@ class _HessianGPT(nn.Module):
         invalid_repeat_untie_layers = [rl for rl in requested_repeat_untie_layers if rl not in self.recur_layers]
         if invalid_repeat_untie_layers:
             raise ValueError(f"repeat untie mlp layers must be a subset of recur_layers, got {invalid_repeat_untie_layers}")
+        self.repeat_untie_mlp_overrides = dict(repeat_untie_mlp_overrides or {})
+        invalid_repeat_untie_override_layers = [rl for rl in self.repeat_untie_mlp_overrides if rl not in self.recur_layers]
+        invalid_repeat_untie_override_modes = [mode for mode in self.repeat_untie_mlp_overrides.values() if mode not in {"none", "down", "full"}]
+        if invalid_repeat_untie_override_layers or invalid_repeat_untie_override_modes:
+            raise ValueError(f"invalid repeat untie mlp overrides: layers={invalid_repeat_untie_override_layers} modes={invalid_repeat_untie_override_modes}")
         if self.repeat_untie_mlp == "none":
             self.repeat_untie_mlp_layers = []
         elif requested_repeat_untie_layers:
@@ -1658,9 +1691,10 @@ class _HessianGPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.repeat_mlp = nn.ModuleList()
-        if self.repeat_untie_mlp != "none" and self.recur_layers:
+        if (self.repeat_untie_mlp != "none" or self.repeat_untie_mlp_overrides) and self.recur_layers:
             for physical_idx in self.recur_layers:
                 mode = self.repeat_untie_mlp if physical_idx in self.repeat_untie_mlp_layers else "none"
+                mode = self.repeat_untie_mlp_overrides.get(physical_idx, mode)
                 self.repeat_mlp.append(RepeatMLPWeights(model_dim, mlp_mult, mode))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
@@ -1963,6 +1997,7 @@ def main() -> None:
     CastedLinear._qat_enabled = args.qat_enabled
     recur_layers = _parse_layer_list(args.recur_layers_str)
     repeat_untie_mlp_layers = _parse_layer_list(args.repeat_untie_mlp_layers)
+    repeat_untie_mlp_overrides = _parse_layer_mode_overrides(args.repeat_untie_mlp_overrides)
     if args.post_gptq_eval_only:
         log0("post_gptq_eval_only: enabled")
         eval_model = GPT(
@@ -1976,7 +2011,7 @@ def main() -> None:
             gated_attention=args.gated_attention, value_residual=args.value_residual,
             disable_layer0_attn=args.disable_layer0_attn, recur_layers=recur_layers, recurrence_active=bool(recur_layers),
             repeat_lora_rank=args.repeat_lora_rank, repeat_lora_alpha=args.repeat_lora_alpha,
-            repeat_untie_mlp=args.repeat_untie_mlp, repeat_untie_mlp_layers=repeat_untie_mlp_layers,
+            repeat_untie_mlp=args.repeat_untie_mlp, repeat_untie_mlp_layers=repeat_untie_mlp_layers, repeat_untie_mlp_overrides=repeat_untie_mlp_overrides,
         ).to(device).bfloat16()
         eval_model.qo_bank.data = eval_model.qo_bank.data.float(); eval_model.kv_bank.data = eval_model.kv_bank.data.float()
         eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float(); eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
@@ -1986,7 +2021,10 @@ def main() -> None:
         with open("final_model.int6.ptz", "rb") as f: quant_blob_disk = f.read()
         quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
         template_sd = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
-        template_unbanked = _unbank_state_dict(template_sd, args.num_layers)
+        template_unbanked = _drop_disabled_layer0_attn_unbanked(
+            _unbank_state_dict(template_sd, args.num_layers),
+            args.disable_layer0_attn,
+        )
         deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], template_unbanked)
         eval_model.load_state_dict(_rebank_state_dict(deq_unbanked, args.num_layers, template_sd), strict=True)
         q_val_loss, q_val_bpb = eval_val(args, eval_model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, eval_seq_len=effective_eval_seq_len)
@@ -2034,6 +2072,7 @@ def main() -> None:
         repeat_lora_alpha=args.repeat_lora_alpha,
         repeat_untie_mlp=args.repeat_untie_mlp,
         repeat_untie_mlp_layers=repeat_untie_mlp_layers,
+        repeat_untie_mlp_overrides=repeat_untie_mlp_overrides,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -2372,7 +2411,10 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    unbanked_sd = _drop_disabled_layer0_attn_unbanked(
+        _unbank_state_dict(sd_cpu, args.num_layers),
+        args.disable_layer0_attn,
+    )
     # Full GPTQ: collect Hessians via a temporary non-banked model
     log0(f"gptq:building non-banked model for Hessian collection...")
     hessian_model = _HessianGPT(
@@ -2388,6 +2430,7 @@ def main() -> None:
         recurrence_active=base_model._recurrence_active,
         repeat_untie_mlp=args.repeat_untie_mlp,
         repeat_untie_mlp_layers=repeat_untie_mlp_layers,
+        repeat_untie_mlp_overrides=repeat_untie_mlp_overrides,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
@@ -2508,6 +2551,7 @@ def main() -> None:
         repeat_lora_alpha=args.repeat_lora_alpha,
         repeat_untie_mlp=args.repeat_untie_mlp,
         repeat_untie_mlp_layers=repeat_untie_mlp_layers,
+        repeat_untie_mlp_overrides=repeat_untie_mlp_overrides,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
