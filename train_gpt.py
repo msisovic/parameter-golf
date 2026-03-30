@@ -93,6 +93,7 @@ class Hyperparameters:
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
     disable_layer0_attn = bool(int(os.environ.get("DISABLE_LAYER0_ATTN", "1")))
     recur_layers_str = os.environ.get("RECUR_LAYERS", "4,5")
+    recur_layers_explicit = "RECUR_LAYERS" in os.environ
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
     repeat_lora_rank = int(os.environ.get("REPEAT_LORA_RANK", "0"))
     repeat_lora_alpha = float(os.environ.get("REPEAT_LORA_ALPHA", "0.0"))
@@ -1385,6 +1386,17 @@ def _parse_layer_mode_overrides(overrides_str: str) -> dict[int, str]:
         layer_str, mode = item.split(":", 1)
         out[int(layer_str.strip())] = mode.strip().lower()
     return out
+def _resolve_recur_layers(
+    recur_layers: list[int],
+    repeat_untie_mlp_layers: list[int],
+    repeat_untie_mlp_overrides: dict[int, str],
+    recur_layers_explicit: bool,
+) -> tuple[list[int], list[int]]:
+    requested_repeat_layers = set(repeat_untie_mlp_layers) | set(repeat_untie_mlp_overrides)
+    inferred_recur_layers = sorted(requested_repeat_layers - set(recur_layers))
+    if inferred_recur_layers and not recur_layers_explicit:
+        recur_layers = sorted(set(recur_layers) | requested_repeat_layers)
+    return recur_layers, inferred_recur_layers
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -1998,6 +2010,19 @@ def main() -> None:
     recur_layers = _parse_layer_list(args.recur_layers_str)
     repeat_untie_mlp_layers = _parse_layer_list(args.repeat_untie_mlp_layers)
     repeat_untie_mlp_overrides = _parse_layer_mode_overrides(args.repeat_untie_mlp_overrides)
+    recur_layers, inferred_recur_layers = _resolve_recur_layers(
+        recur_layers,
+        repeat_untie_mlp_layers,
+        repeat_untie_mlp_overrides,
+        args.recur_layers_explicit,
+    )
+    if inferred_recur_layers:
+        if args.recur_layers_explicit:
+            raise ValueError(
+                f"repeat untie mlp layers require recurrence on those layers; "
+                f"add them to RECUR_LAYERS or remove them from repeat untie settings: {inferred_recur_layers}"
+            )
+        log0(f"recurrence:inferred_layers_from_repeat_mlp={inferred_recur_layers} resolved_layers={recur_layers}")
     if args.post_gptq_eval_only:
         log0("post_gptq_eval_only: enabled")
         eval_model = GPT(
