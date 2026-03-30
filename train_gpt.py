@@ -1494,10 +1494,10 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
     out: dict[str, Tensor] = {}
     n = num_layers
     # Reconstruct banks from individual weight keys
-    qo_slices = [None] * (2 * n)
-    kv_slices = [None] * (2 * n)
-    up_slices = [None] * n
-    down_slices = [None] * n
+    qo_slices = [template_sd["qo_bank"][i] for i in range(2 * n)]
+    kv_slices = [template_sd["kv_bank"][i] for i in range(2 * n)]
+    up_slices = [template_sd["mlp_up_bank"][i] for i in range(n)]
+    down_slices = [template_sd["mlp_down_bank"][i] for i in range(n)]
     consumed = set()
     for i in range(n):
         qk = f"blocks.{i}.attn.c_q.weight"
@@ -1532,6 +1532,17 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
         if name not in consumed:
             out[name] = tensor
     return out
+
+def _drop_disabled_layer0_attn_unbanked(sd: dict[str, Tensor], disable_layer0_attn: bool) -> dict[str, Tensor]:
+    if not disable_layer0_attn:
+        return sd
+    disabled_keys = {
+        "blocks.0.attn.c_q.weight",
+        "blocks.0.attn.c_k.weight",
+        "blocks.0.attn.c_v.weight",
+        "blocks.0.attn.proj.weight",
+    }
+    return {k: v for k, v in sd.items() if k not in disabled_keys}
 
 # --- Non-banked model for Hessian collection ---
 # This mirrors the unbanked state dict keys: blocks.{i}.attn.c_q/c_k/c_v/proj, blocks.{i}.mlp.fc/proj
@@ -1986,7 +1997,10 @@ def main() -> None:
         with open("final_model.int6.ptz", "rb") as f: quant_blob_disk = f.read()
         quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
         template_sd = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
-        template_unbanked = _unbank_state_dict(template_sd, args.num_layers)
+        template_unbanked = _drop_disabled_layer0_attn_unbanked(
+            _unbank_state_dict(template_sd, args.num_layers),
+            args.disable_layer0_attn,
+        )
         deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], template_unbanked)
         eval_model.load_state_dict(_rebank_state_dict(deq_unbanked, args.num_layers, template_sd), strict=True)
         q_val_loss, q_val_bpb = eval_val(args, eval_model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, eval_seq_len=effective_eval_seq_len)
@@ -2372,7 +2386,10 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    unbanked_sd = _drop_disabled_layer0_attn_unbanked(
+        _unbank_state_dict(sd_cpu, args.num_layers),
+        args.disable_layer0_attn,
+    )
     # Full GPTQ: collect Hessians via a temporary non-banked model
     log0(f"gptq:building non-banked model for Hessian collection...")
     hessian_model = _HessianGPT(
