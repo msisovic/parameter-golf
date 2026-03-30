@@ -31,12 +31,12 @@ class Hyperparameters:
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
-    seed = int(os.environ.get("SEED", 1337))
+    seed = int(os.environ.get("SEED", 314))
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -78,8 +78,8 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -93,15 +93,13 @@ class Hyperparameters:
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
     disable_layer0_attn = bool(int(os.environ.get("DISABLE_LAYER0_ATTN", "1")))
     recur_layers_str = os.environ.get("RECUR_LAYERS", "4,5")
-    recur_layers_explicit = "RECUR_LAYERS" in os.environ
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
     repeat_lora_rank = int(os.environ.get("REPEAT_LORA_RANK", "0"))
     repeat_lora_alpha = float(os.environ.get("REPEAT_LORA_ALPHA", "0.0"))
     repeat_lora_lr = float(os.environ.get("REPEAT_LORA_LR", 1e-3))
     repeat_lora_wd = float(os.environ.get("REPEAT_LORA_WD", "0.0"))
-    repeat_untie_mlp = os.environ.get("REPEAT_UNTIE_MLP", "none").strip().lower()
-    repeat_untie_mlp_layers = os.environ.get("REPEAT_UNTIE_MLP_LAYERS", "").strip()
-    repeat_untie_mlp_overrides = os.environ.get("REPEAT_UNTIE_MLP_OVERRIDES", "").strip()
+    repeat_untie_mlp = os.environ.get("REPEAT_UNTIE_MLP", "down").strip().lower()
+    repeat_untie_mlp_layers = os.environ.get("REPEAT_UNTIE_MLP_LAYERS", "5").strip()
     gptq_selective_prune = bool(int(os.environ.get("GPTQ_SELECTIVE_PRUNE", "0")))
     post_gptq_eval_only = bool(int(os.environ.get("POST_GPTQ_EVAL_ONLY", "0")))
     skip_post_gptq_eval = bool(int(os.environ.get("SKIP_POST_GPTQ_EVAL", "0")))
@@ -928,7 +926,6 @@ class GPT(nn.Module):
         repeat_lora_alpha: float = 0.0,
         repeat_untie_mlp: str = "none",
         repeat_untie_mlp_layers: list[int] | None = None,
-        repeat_untie_mlp_overrides: dict[int, str] | None = None,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -954,11 +951,6 @@ class GPT(nn.Module):
         invalid_repeat_untie_layers = [rl for rl in requested_repeat_untie_layers if rl not in self.recur_layers]
         if invalid_repeat_untie_layers:
             raise ValueError(f"repeat untie mlp layers must be a subset of recur_layers, got {invalid_repeat_untie_layers}")
-        self.repeat_untie_mlp_overrides = dict(repeat_untie_mlp_overrides or {})
-        invalid_repeat_untie_override_layers = [rl for rl in self.repeat_untie_mlp_overrides if rl not in self.recur_layers]
-        invalid_repeat_untie_override_modes = [mode for mode in self.repeat_untie_mlp_overrides.values() if mode not in {"none", "down", "full"}]
-        if invalid_repeat_untie_override_layers or invalid_repeat_untie_override_modes:
-            raise ValueError(f"invalid repeat untie mlp overrides: layers={invalid_repeat_untie_override_layers} modes={invalid_repeat_untie_override_modes}")
         if self.repeat_untie_mlp == "none":
             self.repeat_untie_mlp_layers = []
         elif requested_repeat_untie_layers:
@@ -1001,10 +993,9 @@ class GPT(nn.Module):
                     "down": LowRankAdapter(model_dim, mlp_dim, repeat_lora_rank, repeat_lora_alpha),
                 }))
         self.repeat_mlp = nn.ModuleList()
-        if (self.repeat_untie_mlp != "none" or self.repeat_untie_mlp_overrides) and self.recur_layers:
+        if self.repeat_untie_mlp != "none" and self.recur_layers:
             for physical_idx in self.recur_layers:
                 mode = self.repeat_untie_mlp if physical_idx in self.repeat_untie_mlp_layers else "none"
-                mode = self.repeat_untie_mlp_overrides.get(physical_idx, mode)
                 self.repeat_mlp.append(RepeatMLPWeights(model_dim, mlp_mult, mode))
         self.blocks = nn.ModuleList(
             [
@@ -1378,25 +1369,6 @@ def _classify_param(name: str) -> str:
 
 def _parse_layer_list(layers_str: str) -> list[int]:
     return [int(x) for x in layers_str.split(",") if x.strip()]
-def _parse_layer_mode_overrides(overrides_str: str) -> dict[int, str]:
-    out = {}
-    if not overrides_str:
-        return out
-    for item in overrides_str.split(","):
-        layer_str, mode = item.split(":", 1)
-        out[int(layer_str.strip())] = mode.strip().lower()
-    return out
-def _resolve_recur_layers(
-    recur_layers: list[int],
-    repeat_untie_mlp_layers: list[int],
-    repeat_untie_mlp_overrides: dict[int, str],
-    recur_layers_explicit: bool,
-) -> tuple[list[int], list[int]]:
-    requested_repeat_layers = set(repeat_untie_mlp_layers) | set(repeat_untie_mlp_overrides)
-    inferred_recur_layers = sorted(requested_repeat_layers - set(recur_layers))
-    if inferred_recur_layers and not recur_layers_explicit:
-        recur_layers = sorted(set(recur_layers) | requested_repeat_layers)
-    return recur_layers, inferred_recur_layers
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -1657,8 +1629,7 @@ class _HessianGPT(nn.Module):
                  recur_layers=None,
                  recurrence_active=False,
                  repeat_untie_mlp="none",
-                 repeat_untie_mlp_layers=None,
-                 repeat_untie_mlp_overrides=None):
+                 repeat_untie_mlp_layers=None):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1674,11 +1645,6 @@ class _HessianGPT(nn.Module):
         invalid_repeat_untie_layers = [rl for rl in requested_repeat_untie_layers if rl not in self.recur_layers]
         if invalid_repeat_untie_layers:
             raise ValueError(f"repeat untie mlp layers must be a subset of recur_layers, got {invalid_repeat_untie_layers}")
-        self.repeat_untie_mlp_overrides = dict(repeat_untie_mlp_overrides or {})
-        invalid_repeat_untie_override_layers = [rl for rl in self.repeat_untie_mlp_overrides if rl not in self.recur_layers]
-        invalid_repeat_untie_override_modes = [mode for mode in self.repeat_untie_mlp_overrides.values() if mode not in {"none", "down", "full"}]
-        if invalid_repeat_untie_override_layers or invalid_repeat_untie_override_modes:
-            raise ValueError(f"invalid repeat untie mlp overrides: layers={invalid_repeat_untie_override_layers} modes={invalid_repeat_untie_override_modes}")
         if self.repeat_untie_mlp == "none":
             self.repeat_untie_mlp_layers = []
         elif requested_repeat_untie_layers:
@@ -1703,10 +1669,9 @@ class _HessianGPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.repeat_mlp = nn.ModuleList()
-        if (self.repeat_untie_mlp != "none" or self.repeat_untie_mlp_overrides) and self.recur_layers:
+        if self.repeat_untie_mlp != "none" and self.recur_layers:
             for physical_idx in self.recur_layers:
                 mode = self.repeat_untie_mlp if physical_idx in self.repeat_untie_mlp_layers else "none"
-                mode = self.repeat_untie_mlp_overrides.get(physical_idx, mode)
                 self.repeat_mlp.append(RepeatMLPWeights(model_dim, mlp_mult, mode))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
@@ -2009,20 +1974,6 @@ def main() -> None:
     CastedLinear._qat_enabled = args.qat_enabled
     recur_layers = _parse_layer_list(args.recur_layers_str)
     repeat_untie_mlp_layers = _parse_layer_list(args.repeat_untie_mlp_layers)
-    repeat_untie_mlp_overrides = _parse_layer_mode_overrides(args.repeat_untie_mlp_overrides)
-    recur_layers, inferred_recur_layers = _resolve_recur_layers(
-        recur_layers,
-        repeat_untie_mlp_layers,
-        repeat_untie_mlp_overrides,
-        args.recur_layers_explicit,
-    )
-    if inferred_recur_layers:
-        if args.recur_layers_explicit:
-            raise ValueError(
-                f"repeat untie mlp layers require recurrence on those layers; "
-                f"add them to RECUR_LAYERS or remove them from repeat untie settings: {inferred_recur_layers}"
-            )
-        log0(f"recurrence:inferred_layers_from_repeat_mlp={inferred_recur_layers} resolved_layers={recur_layers}")
     if args.post_gptq_eval_only:
         log0("post_gptq_eval_only: enabled")
         eval_model = GPT(
@@ -2036,7 +1987,7 @@ def main() -> None:
             gated_attention=args.gated_attention, value_residual=args.value_residual,
             disable_layer0_attn=args.disable_layer0_attn, recur_layers=recur_layers, recurrence_active=bool(recur_layers),
             repeat_lora_rank=args.repeat_lora_rank, repeat_lora_alpha=args.repeat_lora_alpha,
-            repeat_untie_mlp=args.repeat_untie_mlp, repeat_untie_mlp_layers=repeat_untie_mlp_layers, repeat_untie_mlp_overrides=repeat_untie_mlp_overrides,
+            repeat_untie_mlp=args.repeat_untie_mlp, repeat_untie_mlp_layers=repeat_untie_mlp_layers,
         ).to(device).bfloat16()
         eval_model.qo_bank.data = eval_model.qo_bank.data.float(); eval_model.kv_bank.data = eval_model.kv_bank.data.float()
         eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float(); eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
@@ -2097,7 +2048,6 @@ def main() -> None:
         repeat_lora_alpha=args.repeat_lora_alpha,
         repeat_untie_mlp=args.repeat_untie_mlp,
         repeat_untie_mlp_layers=repeat_untie_mlp_layers,
-        repeat_untie_mlp_overrides=repeat_untie_mlp_overrides,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -2455,7 +2405,6 @@ def main() -> None:
         recurrence_active=base_model._recurrence_active,
         repeat_untie_mlp=args.repeat_untie_mlp,
         repeat_untie_mlp_layers=repeat_untie_mlp_layers,
-        repeat_untie_mlp_overrides=repeat_untie_mlp_overrides,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
@@ -2576,7 +2525,6 @@ def main() -> None:
         repeat_lora_alpha=args.repeat_lora_alpha,
         repeat_untie_mlp=args.repeat_untie_mlp,
         repeat_untie_mlp_layers=repeat_untie_mlp_layers,
-        repeat_untie_mlp_overrides=repeat_untie_mlp_overrides,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
