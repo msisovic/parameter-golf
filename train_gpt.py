@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+from contextlib import nullcontext
 import glob
 import io
 import lzma
@@ -107,6 +108,8 @@ class Hyperparameters:
     ttt_beta1 = float(os.environ.get("TTT_BETA1", "0.9"))
     ttt_beta2 = float(os.environ.get("TTT_BETA2", "0.95"))
     ttt_eps = float(os.environ.get("TTT_EPS", "1e-8"))
+    ttt_untie_mlp = os.environ.get("TTT_UNTIE_MLP", "none").strip().lower()
+    ttt_untie_mlp_layers = os.environ.get("TTT_UNTIE_MLP_LAYERS", "").strip()
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", "256"))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", "2048"))
     ttt_accum_chunks = int(os.environ.get("TTT_ACCUM_CHUNKS", "1"))
@@ -1385,6 +1388,44 @@ def _get_direct_ttt_params(model: GPT, target: str) -> list[nn.Parameter]:
     return params
 
 
+def _build_eval_only_repeat_mlp(model: GPT, mode: str, layers: list[int]) -> nn.ModuleList:
+    if mode not in {"down", "full"}:
+        raise ValueError(f"TTT_UNTIE_MLP must be one of none/down/full, got {mode}")
+    layer_set = set(layers)
+    mlp_mult = model.mlp_up_bank.shape[1] / model.mlp_up_bank.shape[2]
+    repeat_mlp = nn.ModuleList()
+    for physical_idx in model.recur_layers:
+        layer_mode = mode if physical_idx in layer_set else "none"
+        repeat_weights = RepeatMLPWeights(model.qo_bank.shape[-1], mlp_mult, layer_mode)
+        if repeat_weights.fc is not None:
+            repeat_weights.fc = repeat_weights.fc.to(device=model.mlp_up_bank.device, dtype=torch.bfloat16)
+            repeat_weights.fc.float()
+            repeat_weights.fc.weight.data.copy_(model.mlp_up_bank[physical_idx])
+        if repeat_weights.proj is not None:
+            repeat_weights.proj = repeat_weights.proj.to(device=model.mlp_down_bank.device, dtype=torch.bfloat16)
+            repeat_weights.proj.float()
+            repeat_weights.proj.weight.data.copy_(model.mlp_down_bank[physical_idx])
+        repeat_mlp.append(repeat_weights)
+    return repeat_mlp
+
+
+class _EvalOnlyRepeatMLPContext:
+    def __init__(self, model: GPT, mode: str, layers: list[int]):
+        self.model = model
+        self.mode = mode
+        self.layers = layers
+        self._orig_repeat_mlp: nn.ModuleList | None = None
+
+    def __enter__(self) -> GPT:
+        self._orig_repeat_mlp = self.model.repeat_mlp
+        self.model.repeat_mlp = _build_eval_only_repeat_mlp(self.model, self.mode, self.layers)
+        return self.model
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._orig_repeat_mlp is not None:
+            self.model.repeat_mlp = self._orig_repeat_mlp
+
+
 def eval_val_ttt_direct(
     args: Hyperparameters,
     base_model: GPT,
@@ -1404,108 +1445,112 @@ def eval_val_ttt_direct(
     accum_chunks = max(args.ttt_accum_chunks, 1)
     ttt_epochs = max(args.ttt_epochs, 1)
     rank_docs.sort(key=lambda d: (d[1] - 2) // chunk_size)
-
-    target_params = _get_direct_ttt_params(base_model, args.ttt_target)
-    if not target_params:
-        raise ValueError(f"TTT target {args.ttt_target} produced no trainable params")
-    init_params = [p.detach().clone() for p in target_params]
-    optimizer = torch.optim.AdamW(
-        [{"params": target_params, "lr": args.ttt_lr}],
-        betas=(args.ttt_beta1, args.ttt_beta2),
-        eps=args.ttt_eps,
-        weight_decay=args.ttt_wd,
-        fused=True,
-    )
-
-    for p in base_model.parameters():
-        p.requires_grad_(False)
-    for p in target_params:
-        p.requires_grad_(True)
+    ttt_layers = _parse_layer_list(args.ttt_untie_mlp_layers)
+    if args.ttt_untie_mlp != "none" and not ttt_layers:
+        ttt_layers = list(base_model.recur_layers)
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     byte_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    base_model.eval()
-    with torch.enable_grad():
-        for doc_start, doc_len in rank_docs:
-            for p, init in zip(target_params, init_params, strict=True):
-                p.data.copy_(init)
-            optimizer.zero_grad(set_to_none=True)
-            _reset_optimizer_state(optimizer)
+    repeat_ctx = _EvalOnlyRepeatMLPContext(base_model, args.ttt_untie_mlp, ttt_layers) if args.ttt_untie_mlp != "none" else nullcontext(base_model)
+    with repeat_ctx as active_model:
+        target_params = _get_direct_ttt_params(active_model, args.ttt_target)
+        if not target_params:
+            raise ValueError(f"TTT target {args.ttt_target} produced no trainable params")
+        init_params = [p.detach().clone() for p in target_params]
+        optimizer = torch.optim.AdamW(
+            [{"params": target_params, "lr": args.ttt_lr}],
+            betas=(args.ttt_beta1, args.ttt_beta2),
+            eps=args.ttt_eps,
+            weight_decay=args.ttt_wd,
+            fused=True,
+        )
 
-            pred_len = doc_len - 1
-            num_chunks = (pred_len + chunk_size - 1) // chunk_size
-            accum_count = 0
+        for p in active_model.parameters():
+            p.requires_grad_(False)
+        for p in target_params:
+            p.requires_grad_(True)
 
-            for ci in range(num_chunks):
-                ws, wl, co, cl = _compute_chunk_window(ci, pred_len, num_chunks, chunk_size, eval_seq_len)
-                chunk = all_val_tokens[doc_start + ws : doc_start + ws + wl + 1]
-                toks = chunk.to(dtype=torch.int64, device=device)
-                x = toks[:-1].unsqueeze(0)
-                y = toks[1:].unsqueeze(0)
-                needs_train = ci < num_chunks - 1
+        active_model.eval()
+        with torch.enable_grad():
+            for doc_start, doc_len in rank_docs:
+                for p, init in zip(target_params, init_params, strict=True):
+                    p.data.copy_(init)
+                optimizer.zero_grad(set_to_none=True)
+                _reset_optimizer_state(optimizer)
 
-                if needs_train:
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        logits = base_model.forward_logits(x)
-                    nll = F.cross_entropy(
-                        logits.reshape(-1, logits.size(-1)).float(),
-                        y.reshape(-1),
-                        reduction="none",
-                    ).reshape(1, wl)
-                else:
-                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        logits = base_model.forward_logits(x)
+                pred_len = doc_len - 1
+                num_chunks = (pred_len + chunk_size - 1) // chunk_size
+                accum_count = 0
+
+                for ci in range(num_chunks):
+                    ws, wl, co, cl = _compute_chunk_window(ci, pred_len, num_chunks, chunk_size, eval_seq_len)
+                    chunk = all_val_tokens[doc_start + ws : doc_start + ws + wl + 1]
+                    toks = chunk.to(dtype=torch.int64, device=device)
+                    x = toks[:-1].unsqueeze(0)
+                    y = toks[1:].unsqueeze(0)
+                    needs_train = ci < num_chunks - 1
+
+                    if needs_train:
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            logits = active_model.forward_logits(x)
                         nll = F.cross_entropy(
                             logits.reshape(-1, logits.size(-1)).float(),
                             y.reshape(-1),
                             reduction="none",
                         ).reshape(1, wl)
-
-                _accumulate_chunk_bpb(
-                    nll.detach(),
-                    x,
-                    y,
-                    co,
-                    cl,
-                    base_bytes_lut,
-                    has_leading_space_lut,
-                    is_boundary_token_lut,
-                    loss_sum,
-                    byte_sum,
-                    token_count,
-                )
-
-                if not needs_train:
-                    continue
-
-                for epoch_idx in range(ttt_epochs):
-                    if epoch_idx == 0:
-                        train_nll = nll
                     else:
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            train_logits = base_model.forward_logits(x)
-                        train_nll = F.cross_entropy(
-                            train_logits.reshape(-1, train_logits.size(-1)).float(),
-                            y.reshape(-1),
-                            reduction="none",
-                        ).reshape(1, wl)
-                    chunk_loss = train_nll[0, co:co + cl].mean() / accum_chunks
-                    chunk_loss.backward()
-                    accum_count += 1
-                    should_step = accum_count >= accum_chunks
-                    if should_step:
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
-                        accum_count = 0
+                        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            logits = active_model.forward_logits(x)
+                            nll = F.cross_entropy(
+                                logits.reshape(-1, logits.size(-1)).float(),
+                                y.reshape(-1),
+                                reduction="none",
+                            ).reshape(1, wl)
 
-            if accum_count > 0:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    _accumulate_chunk_bpb(
+                        nll.detach(),
+                        x,
+                        y,
+                        co,
+                        cl,
+                        base_bytes_lut,
+                        has_leading_space_lut,
+                        is_boundary_token_lut,
+                        loss_sum,
+                        byte_sum,
+                        token_count,
+                    )
 
-    for p in base_model.parameters():
-        p.requires_grad_(True)
+                    if not needs_train:
+                        continue
+
+                    for epoch_idx in range(ttt_epochs):
+                        if epoch_idx == 0:
+                            train_nll = nll
+                        else:
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                train_logits = active_model.forward_logits(x)
+                            train_nll = F.cross_entropy(
+                                train_logits.reshape(-1, train_logits.size(-1)).float(),
+                                y.reshape(-1),
+                                reduction="none",
+                            ).reshape(1, wl)
+                        chunk_loss = train_nll[0, co:co + cl].mean() / accum_chunks
+                        chunk_loss.backward()
+                        accum_count += 1
+                        if accum_count >= accum_chunks:
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            accum_count = 0
+
+                if accum_count > 0:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+        for p in active_model.parameters():
+            p.requires_grad_(True)
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -2200,7 +2245,8 @@ def main() -> None:
             f"ttt:enabled target={args.ttt_target} lr={args.ttt_lr} wd={args.ttt_wd} "
             f"betas=({args.ttt_beta1},{args.ttt_beta2}) chunk_size={args.ttt_chunk_size} "
             f"eval_seq_len={args.ttt_eval_seq_len if args.ttt_eval_seq_len > 0 else effective_eval_seq_len} "
-            f"accum_chunks={args.ttt_accum_chunks} epochs={args.ttt_epochs} bos_id={bos_id}"
+            f"accum_chunks={args.ttt_accum_chunks} epochs={args.ttt_epochs} "
+            f"untie_mlp={args.ttt_untie_mlp} untie_layers={args.ttt_untie_mlp_layers or args.recur_layers_str} bos_id={bos_id}"
         )
     CastedLinear._qat_enabled = args.qat_enabled
     recur_layers = _parse_layer_list(args.recur_layers_str)
