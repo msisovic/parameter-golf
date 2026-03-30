@@ -100,6 +100,17 @@ class Hyperparameters:
     repeat_lora_wd = float(os.environ.get("REPEAT_LORA_WD", "0.0"))
     repeat_untie_mlp = os.environ.get("REPEAT_UNTIE_MLP", "down").strip().lower()
     repeat_untie_mlp_layers = os.environ.get("REPEAT_UNTIE_MLP_LAYERS", "5").strip()
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_target = os.environ.get("TTT_TARGET", "repeat_mlp_down").strip().lower()
+    ttt_lr = float(os.environ.get("TTT_LR", "3e-4"))
+    ttt_wd = float(os.environ.get("TTT_WD", "0.01"))
+    ttt_beta1 = float(os.environ.get("TTT_BETA1", "0.9"))
+    ttt_beta2 = float(os.environ.get("TTT_BETA2", "0.95"))
+    ttt_eps = float(os.environ.get("TTT_EPS", "1e-8"))
+    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", "256"))
+    ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", "2048"))
+    ttt_accum_chunks = int(os.environ.get("TTT_ACCUM_CHUNKS", "1"))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "1"))
     gptq_selective_prune = bool(int(os.environ.get("GPTQ_SELECTIVE_PRUNE", "0")))
     post_gptq_eval_only = bool(int(os.environ.get("POST_GPTQ_EVAL_ONLY", "0")))
     skip_post_gptq_eval = bool(int(os.environ.get("SKIP_POST_GPTQ_EVAL", "0")))
@@ -1297,6 +1308,215 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
+def _reset_optimizer_state(opt: torch.optim.Optimizer) -> None:
+    for group in opt.param_groups:
+        for p in group["params"]:
+            state = opt.state.get(p)
+            if not state:
+                continue
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    value.zero_()
+            step = state.get("step")
+            if torch.is_tensor(step):
+                step.zero_()
+
+
+def _find_docs(all_tokens: Tensor, bos_id: int, include_next_bos: bool = True) -> list[tuple[int, int]]:
+    bos_positions = (all_tokens == bos_id).nonzero(as_tuple=True)[0].numpy()
+    docs: list[tuple[int, int]] = []
+    for i in range(len(bos_positions)):
+        start = int(bos_positions[i])
+        end = int(bos_positions[i + 1]) if i + 1 < len(bos_positions) else all_tokens.numel()
+        if include_next_bos and i + 1 < len(bos_positions):
+            end += 1
+        if end - start >= 2:
+            docs.append((start, end - start))
+    return docs
+
+
+def _compute_chunk_window(ci: int, pred_len: int, num_chunks: int, chunk_size: int, eval_seq_len: int) -> tuple[int, int, int, int]:
+    chunk_start = ci * chunk_size
+    chunk_end = pred_len if ci == num_chunks - 1 else (ci + 1) * chunk_size
+    win_start = max(0, chunk_end - eval_seq_len)
+    win_len = chunk_end - win_start
+    chunk_offset = chunk_start - win_start
+    chunk_len = chunk_end - chunk_start
+    return win_start, win_len, chunk_offset, chunk_len
+
+
+def _accumulate_chunk_bpb(
+    nll: Tensor,
+    x: Tensor,
+    y: Tensor,
+    chunk_offset: int,
+    chunk_len: int,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    loss_sum: Tensor,
+    byte_sum: Tensor,
+    token_count: Tensor,
+) -> None:
+    lbl = nll[0, chunk_offset:chunk_offset + chunk_len].to(torch.float64)
+    prev = x[0, chunk_offset:chunk_offset + chunk_len]
+    tgt = y[0, chunk_offset:chunk_offset + chunk_len]
+    tok_bytes = base_bytes_lut[tgt].to(torch.float64)
+    tok_bytes += has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]
+    loss_sum += lbl.sum()
+    byte_sum += tok_bytes.sum()
+    token_count += chunk_len
+
+
+def _get_direct_ttt_params(model: GPT, target: str) -> list[nn.Parameter]:
+    params: list[nn.Parameter] = []
+    if target == "repeat_mlp_down":
+        for repeat_mlp in model.repeat_mlp:
+            if repeat_mlp.proj is not None:
+                params.append(repeat_mlp.proj.weight)
+    elif target == "repeat_mlp_full":
+        for repeat_mlp in model.repeat_mlp:
+            if repeat_mlp.fc is not None:
+                params.append(repeat_mlp.fc.weight)
+            if repeat_mlp.proj is not None:
+                params.append(repeat_mlp.proj.weight)
+    else:
+        raise ValueError(f"Unsupported TTT_TARGET={target}")
+    return params
+
+
+def eval_val_ttt_direct(
+    args: Hyperparameters,
+    base_model: GPT,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    all_val_tokens: Tensor,
+    bos_id: int,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    docs = _find_docs(all_val_tokens, bos_id)
+    rank_docs = docs[(len(docs) * rank) // world_size : (len(docs) * (rank + 1)) // world_size]
+    chunk_size = args.ttt_chunk_size
+    eval_seq_len = args.ttt_eval_seq_len if args.ttt_eval_seq_len > 0 else args.eval_seq_len
+    accum_chunks = max(args.ttt_accum_chunks, 1)
+    ttt_epochs = max(args.ttt_epochs, 1)
+    rank_docs.sort(key=lambda d: (d[1] - 2) // chunk_size)
+
+    target_params = _get_direct_ttt_params(base_model, args.ttt_target)
+    if not target_params:
+        raise ValueError(f"TTT target {args.ttt_target} produced no trainable params")
+    init_params = [p.detach().clone() for p in target_params]
+    optimizer = torch.optim.AdamW(
+        [{"params": target_params, "lr": args.ttt_lr}],
+        betas=(args.ttt_beta1, args.ttt_beta2),
+        eps=args.ttt_eps,
+        weight_decay=args.ttt_wd,
+        fused=True,
+    )
+
+    for p in base_model.parameters():
+        p.requires_grad_(False)
+    for p in target_params:
+        p.requires_grad_(True)
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    byte_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model.eval()
+    with torch.enable_grad():
+        for doc_start, doc_len in rank_docs:
+            for p, init in zip(target_params, init_params, strict=True):
+                p.data.copy_(init)
+            optimizer.zero_grad(set_to_none=True)
+            _reset_optimizer_state(optimizer)
+
+            pred_len = doc_len - 1
+            num_chunks = (pred_len + chunk_size - 1) // chunk_size
+            accum_count = 0
+
+            for ci in range(num_chunks):
+                ws, wl, co, cl = _compute_chunk_window(ci, pred_len, num_chunks, chunk_size, eval_seq_len)
+                chunk = all_val_tokens[doc_start + ws : doc_start + ws + wl + 1]
+                toks = chunk.to(dtype=torch.int64, device=device)
+                x = toks[:-1].unsqueeze(0)
+                y = toks[1:].unsqueeze(0)
+                needs_train = ci < num_chunks - 1
+
+                if needs_train:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        logits = base_model.forward_logits(x)
+                    nll = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)).float(),
+                        y.reshape(-1),
+                        reduction="none",
+                    ).reshape(1, wl)
+                else:
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        logits = base_model.forward_logits(x)
+                        nll = F.cross_entropy(
+                            logits.reshape(-1, logits.size(-1)).float(),
+                            y.reshape(-1),
+                            reduction="none",
+                        ).reshape(1, wl)
+
+                _accumulate_chunk_bpb(
+                    nll.detach(),
+                    x,
+                    y,
+                    co,
+                    cl,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                    loss_sum,
+                    byte_sum,
+                    token_count,
+                )
+
+                if not needs_train:
+                    continue
+
+                for epoch_idx in range(ttt_epochs):
+                    if epoch_idx == 0:
+                        train_nll = nll
+                    else:
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            train_logits = base_model.forward_logits(x)
+                        train_nll = F.cross_entropy(
+                            train_logits.reshape(-1, train_logits.size(-1)).float(),
+                            y.reshape(-1),
+                            reduction="none",
+                        ).reshape(1, wl)
+                    chunk_loss = train_nll[0, co:co + cl].mean() / accum_chunks
+                    chunk_loss.backward()
+                    accum_count += 1
+                    should_step = accum_count >= accum_chunks
+                    if should_step:
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        accum_count = 0
+
+            if accum_count > 0:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+
+    val_loss = float(loss_sum.item() / token_count.item())
+    val_bpb = float((loss_sum.item() / math.log(2.0)) / byte_sum.item())
+    return val_loss, val_bpb
+
+
 def generate_autoregressive_calib(model, device, num_seqs=64, seq_len=2048,
                                    vocab_size=1024, temperature=0.8, batch_size=8, seed=42):
     """Generate sequences autoregressively from the model for GPTQ calibration.
@@ -1965,12 +2185,23 @@ def main() -> None:
     effective_eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
     val_seq_len = max(args.train_seq_len, effective_eval_seq_len)
     val_tokens = load_validation_tokens(args.val_files, val_seq_len)
+    all_val_tokens = None
+    bos_id = int(sp.bos_id())
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
+    if args.ttt_enabled:
+        all_val_tokens = torch.cat([load_data_shard(Path(p)) for p in sorted(glob.glob(args.val_files))]).contiguous()
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if args.ttt_enabled:
+        log0(
+            f"ttt:enabled target={args.ttt_target} lr={args.ttt_lr} wd={args.ttt_wd} "
+            f"betas=({args.ttt_beta1},{args.ttt_beta2}) chunk_size={args.ttt_chunk_size} "
+            f"eval_seq_len={args.ttt_eval_seq_len if args.ttt_eval_seq_len > 0 else effective_eval_seq_len} "
+            f"accum_chunks={args.ttt_accum_chunks} epochs={args.ttt_epochs} bos_id={bos_id}"
+        )
     CastedLinear._qat_enabled = args.qat_enabled
     recur_layers = _parse_layer_list(args.recur_layers_str)
     repeat_untie_mlp_layers = _parse_layer_list(args.repeat_untie_mlp_layers)
@@ -2566,6 +2797,29 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        if args.ttt_enabled:
+            if all_val_tokens is None:
+                raise RuntimeError("TTT enabled but full validation tokens were not loaded")
+            torch.cuda.synchronize()
+            t_ttt = time.perf_counter()
+            ttt_val_loss, ttt_val_bpb = eval_val_ttt_direct(
+                args,
+                eval_model,
+                rank,
+                world_size,
+                device,
+                all_val_tokens,
+                bos_id,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"final_int6_ttt_direct val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
+                f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+            )
+            log0(f"final_int6_ttt_direct_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
     if args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
