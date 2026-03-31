@@ -210,6 +210,11 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
+    disable_layer0_attn = bool(int(os.environ.get("DISABLE_LAYER0_ATTN", "1")))
+    recur_layers_str = os.environ.get("RECUR_LAYERS", "4,5")
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
+    repeat_untie_mlp = os.environ.get("REPEAT_UNTIE_MLP", "down").strip().lower()
+    repeat_untie_mlp_layers = os.environ.get("REPEAT_UNTIE_MLP_LAYERS", "5").strip()
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
@@ -236,6 +241,13 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) ->
     if was_2d:
         X = X.squeeze(0)
     return X
+
+
+def _parse_layer_list(spec: str) -> list[int]:
+    spec = spec.strip()
+    if not spec or spec.lower() == "none":
+        return []
+    return [int(part.strip()) for part in spec.split(",") if part.strip()]
 
 # --- Parallel Muon optimizer ---
 
@@ -1315,6 +1327,13 @@ class MLP(nn.Module):
         x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
         return F.linear(x.square(), down_w.to(x.dtype))
 
+class RepeatMLPWeights(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int, mode: str):
+        super().__init__()
+        mlp_dim = int(mlp_mult * dim)
+        self.fc = CastedLinear(dim, mlp_dim, bias=False) if mode == "full" else None
+        self.proj = CastedLinear(mlp_dim, dim, bias=False) if mode in ("full", "down") else None
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -1329,6 +1348,7 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        disable_attn: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1340,6 +1360,7 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.disable_attn = disable_attn
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
             nn.init.zeros_(self.dtg_gate.weight)
@@ -1349,8 +1370,11 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        raw_v = None
+        x_out = x_in
+        if not self.disable_attn:
+            attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
+            x_out = x_out + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
@@ -1384,6 +1408,11 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        disable_layer0_attn: bool = False,
+        recur_layers: list[int] | None = None,
+        recurrence_active: bool = False,
+        repeat_untie_mlp: str = "none",
+        repeat_untie_mlp_layers: list[int] | None = None,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -1398,8 +1427,38 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.recur_layers = sorted(set(recur_layers or []))
+        self.repeat_untie_mlp = repeat_untie_mlp
+        if self.repeat_untie_mlp not in {"none", "down", "full"}:
+            raise ValueError(f"repeat untie mlp mode must be one of none/down/full, got {self.repeat_untie_mlp}")
+        requested_repeat_untie_layers = sorted(set(repeat_untie_mlp_layers or []))
+        for rl in self.recur_layers:
+            if not (0 <= rl < num_layers):
+                raise ValueError(f"recur layer {rl} out of range [0, {num_layers})")
+        invalid_repeat_untie_layers = [rl for rl in requested_repeat_untie_layers if rl not in self.recur_layers]
+        if invalid_repeat_untie_layers:
+            raise ValueError(f"repeat untie mlp layers must be a subset of recur_layers, got {invalid_repeat_untie_layers}")
+        if self.repeat_untie_mlp == "none":
+            self.repeat_untie_mlp_layers = []
+        elif requested_repeat_untie_layers:
+            self.repeat_untie_mlp_layers = requested_repeat_untie_layers
+        else:
+            self.repeat_untie_mlp_layers = list(self.recur_layers)
+        if self.recur_layers:
+            cutoff = max(self.recur_layers) + 1
+            self._v2p_recur = list(range(cutoff)) + self.recur_layers + list(range(cutoff, num_layers))
+        else:
+            self._v2p_recur = list(range(num_layers))
+        self._v2p_no_recur = list(range(num_layers))
+        self.virtual_num_layers = len(self._v2p_recur)
+        self._enc_no_recur = num_layers // 2
+        self._dec_no_recur = num_layers - self._enc_no_recur
+        self._enc_recur = self.virtual_num_layers // 2
+        self._dec_recur = self.virtual_num_layers - self._enc_recur
+        self._recurrence_active = False
+        self.v2p = self._v2p_no_recur
+        self.num_encoder_layers = self._enc_recur
+        self.num_decoder_layers = self._dec_recur
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         # Parameter banks: contiguous 3D tensors for batched optimizer
@@ -1411,6 +1470,11 @@ class GPT(nn.Module):
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.repeat_mlp = nn.ModuleList()
+        if self.repeat_untie_mlp != "none" and self.recur_layers:
+            for physical_idx in self.recur_layers:
+                mode = self.repeat_untie_mlp if physical_idx in self.repeat_untie_mlp_layers else "none"
+                self.repeat_mlp.append(RepeatMLPWeights(model_dim, mlp_mult, mode))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1425,8 +1489,9 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    disable_attn=disable_layer0_attn and i == 0,
                 )
-                for i in range(num_layers)
+                for i in range(self.virtual_num_layers)
             ]
         )
         if rope_dims > 0:
@@ -1455,8 +1520,9 @@ class GPT(nn.Module):
         for head in self.mtp_heads:
             head._zero_init = True
         if xsa_last_n > 0:
-            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+            for i in range(max(0, self.virtual_num_layers - xsa_last_n), self.virtual_num_layers):
                 self.blocks[i].attn.use_xsa = True
+        self.set_recurrence_active(recurrence_active)
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -1474,6 +1540,11 @@ class GPT(nn.Module):
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
             self.qo_bank.data[n + i].mul_(proj_scale)
             self.mlp_down_bank.data[i].mul_(proj_scale)
+        for repeat_mlp in self.repeat_mlp:
+            if repeat_mlp.fc is not None:
+                nn.init.zeros_(repeat_mlp.fc.weight)
+            if repeat_mlp.proj is not None:
+                nn.init.zeros_(repeat_mlp.proj.weight)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
@@ -1490,8 +1561,49 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def set_recurrence_active(self, active: bool) -> None:
+        was_active = self._recurrence_active
+        self._recurrence_active = bool(active) and bool(self.recur_layers)
+        if self._recurrence_active:
+            self.v2p = self._v2p_recur
+            self.num_encoder_layers = self._enc_recur
+            self.num_decoder_layers = self._dec_recur
+        else:
+            self.v2p = self._v2p_no_recur
+            self.num_encoder_layers = self._enc_no_recur
+            self.num_decoder_layers = self._dec_no_recur
+        if self._recurrence_active and not was_active and self.repeat_mlp:
+            self._sync_repeat_mlp_from_base()
+    def _sync_repeat_mlp_from_base(self) -> None:
+        with torch.no_grad():
+            for repeat_idx, physical_idx in enumerate(self.recur_layers):
+                repeat_mlp = self.repeat_mlp[repeat_idx]
+                if repeat_mlp.fc is not None:
+                    repeat_mlp.fc.weight.copy_(self.mlp_up_bank[physical_idx])
+                if repeat_mlp.proj is not None:
+                    repeat_mlp.proj.weight.copy_(self.mlp_down_bank[physical_idx])
+    def _is_repeated_virtual_index(self, virtual_idx: int) -> bool:
+        if not self._recurrence_active or not self.recur_layers:
+            return False
+        return self._enc_recur <= virtual_idx < self._enc_recur + len(self.recur_layers)
+    def _get_block_weights(self, virtual_idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         n = self.num_layers
+        physical_idx = self.v2p[virtual_idx]
+        q_w = self.qo_bank[physical_idx]
+        k_w = self.kv_bank[physical_idx]
+        v_w = self.kv_bank[n + physical_idx]
+        out_w = self.qo_bank[n + physical_idx]
+        up_w = self.mlp_up_bank[physical_idx]
+        down_w = self.mlp_down_bank[physical_idx]
+        if self._is_repeated_virtual_index(virtual_idx) and self.repeat_mlp:
+            repeated_idx = virtual_idx - self._enc_recur
+            repeat_mlp = self.repeat_mlp[repeated_idx]
+            if repeat_mlp.fc is not None:
+                up_w = repeat_mlp.fc.weight
+            if repeat_mlp.proj is not None:
+                down_w = repeat_mlp.proj.weight
+        return q_w, k_w, v_w, out_w, up_w, down_w
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -1502,11 +1614,9 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
             ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+            x, raw_v = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1514,11 +1624,9 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+            x, _ = self.blocks[bi](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1549,7 +1657,6 @@ class GPT(nn.Module):
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
-        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -1560,11 +1667,9 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(i)
             ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+            x, raw_v = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1572,11 +1677,9 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            q_w, k_w, v_w, out_w, up_w, down_w = self._get_block_weights(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+            x, _ = self.blocks[bi](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1890,6 +1993,17 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
             out[name] = tensor
     return out
 
+def _drop_disabled_layer0_attn_unbanked(sd: dict[str, Tensor], disable_layer0_attn: bool) -> dict[str, Tensor]:
+    if not disable_layer0_attn:
+        return sd
+    disabled_keys = {
+        "blocks.0.attn.c_q.weight",
+        "blocks.0.attn.c_k.weight",
+        "blocks.0.attn.c_v.weight",
+        "blocks.0.attn.proj.weight",
+    }
+    return {k: v for k, v in sd.items() if k not in disabled_keys}
+
 # --- Non-banked model for Hessian collection ---
 # This mirrors the unbanked state dict keys: blocks.{i}.attn.c_q/c_k/c_v/proj, blocks.{i}.mlp.fc/proj
 
@@ -1943,7 +2057,7 @@ class _HessianMLP(nn.Module):
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 class _HessianBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False, disable_attn=False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -1953,11 +2067,14 @@ class _HessianBlock(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.disable_attn = disable_attn
     def forward(self, x, x0, v_embed=None):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_in
+        if not self.disable_attn:
+            attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
+            x_out = x_out + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
         return x_out
 
@@ -1967,7 +2084,12 @@ class _HessianGPT(nn.Module):
                  mlp_mult, tie_embeddings, logit_softcap, rope_base, qk_gain_init,
                  bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
-                 ve_enabled=False, ve_dim=128, ve_layers="9,10"):
+                 ve_enabled=False, ve_dim=128, ve_layers="9,10",
+                 disable_layer0_attn=False,
+                 recur_layers=None,
+                 recurrence_active=False,
+                 repeat_untie_mlp="none",
+                 repeat_untie_mlp_layers=None):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1975,14 +2097,46 @@ class _HessianGPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.recur_layers = sorted(set(recur_layers or []))
+        self.repeat_untie_mlp = repeat_untie_mlp
+        if self.repeat_untie_mlp not in {"none", "down", "full"}:
+            raise ValueError(f"repeat untie mlp mode must be one of none/down/full, got {self.repeat_untie_mlp}")
+        requested_repeat_untie_layers = sorted(set(repeat_untie_mlp_layers or []))
+        invalid_repeat_untie_layers = [rl for rl in requested_repeat_untie_layers if rl not in self.recur_layers]
+        if invalid_repeat_untie_layers:
+            raise ValueError(f"repeat untie mlp layers must be a subset of recur_layers, got {invalid_repeat_untie_layers}")
+        if self.repeat_untie_mlp == "none":
+            self.repeat_untie_mlp_layers = []
+        elif requested_repeat_untie_layers:
+            self.repeat_untie_mlp_layers = requested_repeat_untie_layers
+        else:
+            self.repeat_untie_mlp_layers = list(self.recur_layers)
+        if self.recur_layers:
+            cutoff = max(self.recur_layers) + 1
+            self._v2p_recur = list(range(cutoff)) + self.recur_layers + list(range(cutoff, num_layers))
+        else:
+            self._v2p_recur = list(range(num_layers))
+        self._v2p_no_recur = list(range(num_layers))
+        self.virtual_num_layers = len(self._v2p_recur)
+        self._enc_no_recur = num_layers // 2
+        self._dec_no_recur = num_layers - self._enc_no_recur
+        self._enc_recur = self.virtual_num_layers // 2
+        self._dec_recur = self.virtual_num_layers - self._enc_recur
+        self._recurrence_active = False
+        self.v2p = self._v2p_no_recur
+        self.num_encoder_layers = self._enc_recur
+        self.num_decoder_layers = self._dec_recur
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.repeat_mlp = nn.ModuleList()
+        if self.repeat_untie_mlp != "none" and self.recur_layers:
+            for physical_idx in self.recur_layers:
+                mode = self.repeat_untie_mlp if physical_idx in self.repeat_untie_mlp_layers else "none"
+                self.repeat_mlp.append(RepeatMLPWeights(model_dim, mlp_mult, mode))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                          layer_idx=i, ln_scale=ln_scale)
-            for i in range(num_layers)
+                          layer_idx=i, ln_scale=ln_scale, disable_attn=disable_layer0_attn and i == 0)
+            for i in range(self.virtual_num_layers)
         ])
         if rope_dims > 0:
             head_dim = model_dim // num_heads
@@ -1990,7 +2144,7 @@ class _HessianGPT(nn.Module):
                 block.attn.rope_dims = rope_dims
                 block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
         if xsa_last_n > 0:
-            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+            for i in range(max(0, self.virtual_num_layers - xsa_last_n), self.virtual_num_layers):
                 self.blocks[i].attn.use_xsa = True
         kv_dim = num_kv_heads * (model_dim // num_heads)
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
@@ -2002,6 +2156,7 @@ class _HessianGPT(nn.Module):
             self.ve_layer_scales = nn.ParameterList()
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        self.set_recurrence_active(recurrence_active)
     def _get_ve(self, layer_idx, input_ids, ve_cache):
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
             return None
@@ -2009,6 +2164,16 @@ class _HessianGPT(nn.Module):
             ve_cache['ve'] = self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_cache['ve'] * self.ve_layer_scales[ve_idx].to(dtype=ve_cache['ve'].dtype)
+    def set_recurrence_active(self, active):
+        self._recurrence_active = bool(active) and bool(self.recur_layers)
+        if self._recurrence_active:
+            self.v2p = self._v2p_recur
+            self.num_encoder_layers = self._enc_recur
+            self.num_decoder_layers = self._dec_recur
+        else:
+            self.v2p = self._v2p_no_recur
+            self.num_encoder_layers = self._enc_no_recur
+            self.num_decoder_layers = self._dec_no_recur
     def forward(self, input_ids, target_ids):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -2020,14 +2185,56 @@ class _HessianGPT(nn.Module):
         ve_cache = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
+            if self._recurrence_active and self.repeat_mlp and self._enc_recur <= i < self._enc_recur + len(self.recur_layers):
+                repeat_idx = i - self._enc_recur
+                block = self.blocks[i]
+                mix = block.resid_mix.to(dtype=x.dtype)
+                x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+                x_out = x_in
+                if not block.disable_attn:
+                    attn_out = block.attn(block.attn_norm(x_in) * block.ln_scale_factor, v_embed=ve)
+                    x_out = x_out + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+                mlp_in = block.mlp_norm(x_out) * block.ln_scale_factor
+                repeat_mlp = self.repeat_mlp[repeat_idx]
+                if repeat_mlp.fc is not None:
+                    mlp_hidden = F.leaky_relu(repeat_mlp.fc(mlp_in), negative_slope=0.5)
+                else:
+                    mlp_hidden = F.leaky_relu(block.mlp.fc(mlp_in), negative_slope=0.5)
+                if repeat_mlp.proj is not None:
+                    mlp_out = repeat_mlp.proj(mlp_hidden.square())
+                else:
+                    mlp_out = block.mlp.proj(mlp_hidden.square())
+                x = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+            else:
+                x = self.blocks[i](x, x0, v_embed=ve)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            if self._recurrence_active and self.repeat_mlp and self._enc_recur <= bi < self._enc_recur + len(self.recur_layers):
+                repeat_idx = bi - self._enc_recur
+                block = self.blocks[bi]
+                mix = block.resid_mix.to(dtype=x.dtype)
+                x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+                x_out = x_in
+                if not block.disable_attn:
+                    attn_out = block.attn(block.attn_norm(x_in) * block.ln_scale_factor, v_embed=ve)
+                    x_out = x_out + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+                mlp_in = block.mlp_norm(x_out) * block.ln_scale_factor
+                repeat_mlp = self.repeat_mlp[repeat_idx]
+                if repeat_mlp.fc is not None:
+                    mlp_hidden = F.leaky_relu(repeat_mlp.fc(mlp_in), negative_slope=0.5)
+                else:
+                    mlp_hidden = F.leaky_relu(block.mlp.fc(mlp_in), negative_slope=0.5)
+                if repeat_mlp.proj is not None:
+                    mlp_out = repeat_mlp.proj(mlp_hidden.square())
+                else:
+                    mlp_out = block.mlp.proj(mlp_hidden.square())
+                x = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+            else:
+                x = self.blocks[bi](x, x0, v_embed=ve)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -2201,6 +2408,8 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     CastedLinear._qat_enabled = args.qat_enabled
+    recur_layers = _parse_layer_list(args.recur_layers_str)
+    repeat_untie_mlp_layers = _parse_layer_list(args.repeat_untie_mlp_layers)
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -2226,6 +2435,11 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        disable_layer0_attn=args.disable_layer0_attn,
+        recur_layers=recur_layers,
+        recurrence_active=False,
+        repeat_untie_mlp=args.repeat_untie_mlp,
+        repeat_untie_mlp_layers=repeat_untie_mlp_layers,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -2250,6 +2464,7 @@ def main() -> None:
         base_model.qo_bank, base_model.kv_bank,
         base_model.mlp_up_bank, base_model.mlp_down_bank,
     ]
+    matrix_params.extend(p for p in base_model.repeat_mlp.parameters())
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
         p
@@ -2328,6 +2543,8 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"recurrence:layers={recur_layers} start_step={args.recur_start_step} active={int(base_model._recurrence_active)}")
+    log0(f"repeat_untie_mlp:mode={args.repeat_untie_mlp} layers={repeat_untie_mlp_layers if repeat_untie_mlp_layers else recur_layers if args.repeat_untie_mlp != 'none' else []} params={sum(p.numel() for p in base_model.repeat_mlp.parameters())}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -2354,18 +2571,14 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-    if args.warmup_steps > 0:
-        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
-        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        model.train()
-        for warmup_step in range(args.warmup_steps):
+    def run_warmup_steps(num_steps: int, label: str) -> None:
+        for warmup_step in range(num_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
-            # All-reduce all grads for warmup (simple, not optimized)
             if distributed:
                 for p in base_model.parameters():
                     if p.grad is not None:
@@ -2373,12 +2586,23 @@ def main() -> None:
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            if num_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == num_steps:
+                log0(f"{label}_warmup_step:{warmup_step + 1}/{num_steps}")
+    if args.warmup_steps > 0:
+        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        model.train()
+        run_warmup_steps(args.warmup_steps, "base")
+        if recur_layers:
+            base_model.set_recurrence_active(True)
+            log0(f"recurrence:prewarm active={int(base_model._recurrence_active)} virtual_layers:{base_model.virtual_num_layers}")
+            run_warmup_steps(args.warmup_steps, "recur")
+            base_model.set_recurrence_active(False)
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
+        base_model.set_recurrence_active(False)
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
@@ -2392,6 +2616,9 @@ def main() -> None:
     t0 = time.perf_counter()
     step = 0
     while True:
+        if recur_layers and not base_model._recurrence_active and step >= args.recur_start_step:
+            base_model.set_recurrence_active(True)
+            log0(f"recurrence:activated step:{step} layers={recur_layers} virtual_layers:{base_model.virtual_num_layers}")
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
@@ -2538,7 +2765,10 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    unbanked_sd = _drop_disabled_layer0_attn_unbanked(
+        _unbank_state_dict(sd_cpu, args.num_layers),
+        args.disable_layer0_attn,
+    )
     # Full GPTQ: collect Hessians via a temporary non-banked model
     log0(f"gptq:building non-banked model for Hessian collection...")
     hessian_model = _HessianGPT(
@@ -2549,6 +2779,11 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+        disable_layer0_attn=args.disable_layer0_attn,
+        recur_layers=recur_layers,
+        recurrence_active=bool(recur_layers),
+        repeat_untie_mlp=args.repeat_untie_mlp,
+        repeat_untie_mlp_layers=repeat_untie_mlp_layers,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
@@ -2665,6 +2900,11 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        disable_layer0_attn=args.disable_layer0_attn,
+        recur_layers=recur_layers,
+        recurrence_active=base_model._recurrence_active,
+        repeat_untie_mlp=args.repeat_untie_mlp,
+        repeat_untie_mlp_layers=repeat_untie_mlp_layers,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
