@@ -65,6 +65,9 @@ class Hyperparameters():
     rope_train_seq_len = int(os.environ.get('ROPE_TRAIN_SEQ_LEN', 2048))
     ln_scale = bool(int(os.environ.get('LN_SCALE', '1')))
     qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 4.0))
+    parallel_residual = bool(int(os.environ.get('PARALLEL_RESIDUAL', '0')))
+    parallel_start_layer = int(os.environ.get('PARALLEL_START_LAYER', 7))
+    parallel_start_layer_is_physical = bool(int(os.environ.get('PARALLEL_START_LAYER_IS_PHYSICAL', '1')))
 
     # Layer looping
     num_loops = int(os.environ.get('NUM_LOOPS', 2))
@@ -506,6 +509,15 @@ class GPT(nn.Module):
         self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
+        self.parallel_residual = h.parallel_residual
+        self.parallel_start_layer = max(0, h.parallel_start_layer)
+        self.parallel_start_layer_is_physical = h.parallel_start_layer_is_physical
+        if self.parallel_residual:
+            self.parallel_post_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, 2, dtype=torch.float32))
+            self.parallel_resid_lambdas = nn.Parameter(torch.full((h.num_layers, 2), 1.1**0.5, dtype=torch.float32))
+        else:
+            self.parallel_post_lambdas = None
+            self.parallel_resid_lambdas = None
 
         self._init_weights()
 
@@ -520,27 +532,108 @@ class GPT(nn.Module):
                       module.weight.shape[1] >= 64):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
+    def _parallel_active_for_layer(self, physical_idx: int, virtual_idx: int) -> bool:
+        if self.parallel_post_lambdas is None:
+            return False
+        if self.parallel_start_layer_is_physical:
+            return physical_idx >= self.parallel_start_layer
+        return virtual_idx >= self.parallel_start_layer
+
+    def _mix_with_x0(self, lane: Tensor, x0: Tensor, resid_mix: Tensor) -> Tensor:
+        mix = resid_mix.to(dtype=lane.dtype)
+        return mix[0][None, None, :] * lane + mix[1][None, None, :] * x0
+
+    def _apply_skip_single(self, x: Tensor, skip: Tensor | tuple[Tensor, Tensor], skip_idx: int) -> Tensor:
+        if isinstance(skip, tuple):
+            skip = skip[1]
+        scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip
+        if self.skip_gates is None:
+            return x + scaled_skip
+        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+        return torch.lerp(scaled_skip, x, g)
+
+    def _apply_skip_parallel(
+        self,
+        lane0: Tensor,
+        lane1: Tensor,
+        skip: Tensor | tuple[Tensor, Tensor],
+        skip_idx: int,
+    ) -> tuple[Tensor, Tensor]:
+        if isinstance(skip, tuple):
+            skip0, skip1 = skip
+        else:
+            skip0 = skip1 = skip
+        w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
+        if self.skip_gates is None:
+            return lane0 + w * skip0, lane1 + w * skip1
+        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+        return torch.lerp(w * skip0, lane0, g), torch.lerp(w * skip1, lane1, g)
+
+    def _parallel_block(
+        self,
+        block_idx: int,
+        lane0: Tensor,
+        lane1: Tensor,
+        x0: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if self.parallel_post_lambdas is None or self.parallel_resid_lambdas is None:
+            raise RuntimeError("parallel residual weights are not initialized")
+        block = self.blocks[block_idx]
+
+        attn_read = self._mix_with_x0(lane0, x0, block.resid_mix)
+        attn_out = block.attn(block.attn_norm(attn_read) * block.ln_scale_factor)
+        attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
+        attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        lane0 = attn_resid * lane0 + attn_post[0] * attn_out
+        lane1 = attn_resid * lane1 + attn_post[1] * attn_out
+
+        mlp_read = self._mix_with_x0(lane1, x0, block.resid_mix)
+        mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
+            block.mlp_norm(mlp_read) * block.ln_scale_factor)
+        mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        lane0 = mlp_resid * lane0 + mlp_post[0] * mlp_out
+        lane1 = mlp_resid * lane1 + mlp_post[1] * mlp_out
+        return lane0, lane1
+
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
             x = self.embed_proj(x)
         x0 = x
-        skips: list[Tensor] = []
-        enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
-        dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
-        for i in enc_iter:
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for skip_idx, i in enumerate(dec_iter):
-            if skip_idx < self.num_skip_weights and skips:
-                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                if self.skip_gates is not None:
-                    g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
-                    x = torch.lerp(scaled_skip, x, g)
-                else:
-                    x = x + scaled_skip
-            x = self.blocks[i](x, x0)
+        skips: list[Tensor | tuple[Tensor, Tensor]] = []
+        enc_iter = list(self.encoder_indices) if self.looping_active else list(range(self.num_encoder_layers))
+        dec_iter = list(self.decoder_indices) if self.looping_active else list(range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers))
+        lane0: Tensor | None = None
+        lane1: Tensor | None = None
+        for virtual_idx, block_idx in enumerate(enc_iter):
+            if self._parallel_active_for_layer(block_idx, virtual_idx):
+                if lane0 is None or lane1 is None:
+                    lane0 = x
+                    lane1 = x
+                lane0, lane1 = self._parallel_block(block_idx, lane0, lane1, x0)
+                skips.append((lane0, lane1))
+            else:
+                x = self.blocks[block_idx](x, x0)
+                skips.append(x)
+        dec_offset = len(enc_iter)
+        for skip_idx, block_idx in enumerate(dec_iter):
+            virtual_idx = dec_offset + skip_idx
+            if self._parallel_active_for_layer(block_idx, virtual_idx):
+                if lane0 is None or lane1 is None:
+                    lane0 = x
+                    lane1 = x
+                if skip_idx < self.num_skip_weights and skips:
+                    lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
+                lane0, lane1 = self._parallel_block(block_idx, lane0, lane1, x0)
+            else:
+                if skip_idx < self.num_skip_weights and skips:
+                    x = self._apply_skip_single(x, skips.pop(), skip_idx)
+                x = self.blocks[block_idx](x, x0)
+        if lane1 is not None:
+            x = 0.5 * (lane0 + lane1)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -649,7 +742,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas",
     ).split(",")
     if pattern
 )
@@ -674,6 +767,10 @@ class Optimizers():
             scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
             scalar_params.append(base_model.skip_gates)
+        if base_model.parallel_post_lambdas is not None:
+            scalar_params.append(base_model.parallel_post_lambdas)
+        if base_model.parallel_resid_lambdas is not None:
+            scalar_params.append(base_model.parallel_resid_lambdas)
 
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -1168,6 +1265,11 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     else:
         model = compiled_model
     log(f"model_params:{sum(p.numel() for p in base_model.parameters())}")
+    log(
+        f"parallel_residual:active={int(base_model.parallel_post_lambdas is not None)} "
+        f"start_layer={base_model.parallel_start_layer} "
+        f"start_mode={'physical' if base_model.parallel_start_layer_is_physical else 'virtual'}"
+    )
 
     # Set up optimizer and load train data
     optimizers = Optimizers(h, base_model)
