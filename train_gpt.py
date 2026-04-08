@@ -546,8 +546,6 @@ class GPT(nn.Module):
     def _apply_skip_single(self, x: Tensor, skip: Tensor | tuple[Tensor, Tensor], skip_idx: int) -> Tensor:
         if isinstance(skip, tuple):
             skip = skip[1]
-        elif isinstance(skip, Tensor) and skip.ndim == x.ndim + 1 and skip.size(0) == 2:
-            skip = skip[1]
         scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip
         if self.skip_gates is None:
             return x + scaled_skip
@@ -563,8 +561,6 @@ class GPT(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         if isinstance(skip, tuple):
             skip0, skip1 = skip
-        elif isinstance(skip, Tensor) and skip.ndim == lane0.ndim + 1 and skip.size(0) == 2:
-            skip0, skip1 = skip.unbind(0)
         else:
             skip0 = skip1 = skip
         w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
@@ -572,24 +568,6 @@ class GPT(nn.Module):
             return lane0 + w * skip0, lane1 + w * skip1
         g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
         return torch.lerp(w * skip0, lane0, g), torch.lerp(w * skip1, lane1, g)
-
-    def _apply_skip_parallel_packed(
-        self,
-        lanes: Tensor,
-        skip: Tensor | tuple[Tensor, Tensor],
-        skip_idx: int,
-    ) -> Tensor:
-        if isinstance(skip, tuple):
-            skip_tensor = torch.stack(skip, dim=0)
-        elif isinstance(skip, Tensor) and skip.ndim == lanes.ndim and skip.size(0) == 2:
-            skip_tensor = skip
-        else:
-            skip_tensor = skip.unsqueeze(0).expand_as(lanes)
-        w = self.skip_weights[skip_idx].to(dtype=lanes.dtype)[None, None, None, :]
-        if self.skip_gates is None:
-            return lanes + w * skip_tensor
-        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lanes.dtype))[None, None, None, :]
-        return torch.lerp(w * skip_tensor, lanes, g)
 
     def _parallel_block(
         self,
@@ -619,30 +597,6 @@ class GPT(nn.Module):
         lane1 = mlp_resid * lane1 + mlp_post[1] * mlp_out
         return lane0, lane1
 
-    def _parallel_block_packed(
-        self,
-        block_idx: int,
-        lanes: Tensor,
-        x0: Tensor,
-    ) -> Tensor:
-        if self.parallel_post_lambdas is None or self.parallel_resid_lambdas is None:
-            raise RuntimeError("parallel residual weights are not initialized")
-        block = self.blocks[block_idx]
-
-        attn_read = self._mix_with_x0(lanes[0], x0, block.resid_mix)
-        attn_out = block.attn(block.attn_norm(attn_read) * block.ln_scale_factor)
-        attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
-        attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lanes.dtype)
-        attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lanes.dtype)
-        lanes = attn_resid * lanes + attn_post[:, None, None, None] * attn_out.unsqueeze(0)
-
-        mlp_read = self._mix_with_x0(lanes[1], x0, block.resid_mix)
-        mlp_out = block.mlp_scale.to(dtype=lanes.dtype)[None, None, :] * block.mlp(
-            block.mlp_norm(mlp_read) * block.ln_scale_factor)
-        mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lanes.dtype)
-        mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lanes.dtype)
-        return mlp_resid * lanes + mlp_post[:, None, None, None] * mlp_out.unsqueeze(0)
-
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -652,13 +606,15 @@ class GPT(nn.Module):
         skips: list[Tensor | tuple[Tensor, Tensor]] = []
         enc_iter = list(self.encoder_indices) if self.looping_active else list(range(self.num_encoder_layers))
         dec_iter = list(self.decoder_indices) if self.looping_active else list(range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers))
-        lanes: Tensor | None = None
+        lane0: Tensor | None = None
+        lane1: Tensor | None = None
         for virtual_idx, block_idx in enumerate(enc_iter):
             if self._parallel_active_for_layer(block_idx, virtual_idx):
-                if lanes is None:
-                    lanes = torch.stack((x, x), dim=0)
-                lanes = self._parallel_block_packed(block_idx, lanes, x0)
-                skips.append(lanes)
+                if lane0 is None or lane1 is None:
+                    lane0 = x
+                    lane1 = x
+                lane0, lane1 = self._parallel_block(block_idx, lane0, lane1, x0)
+                skips.append((lane0, lane1))
             else:
                 x = self.blocks[block_idx](x, x0)
                 skips.append(x)
@@ -666,17 +622,18 @@ class GPT(nn.Module):
         for skip_idx, block_idx in enumerate(dec_iter):
             virtual_idx = dec_offset + skip_idx
             if self._parallel_active_for_layer(block_idx, virtual_idx):
-                if lanes is None:
-                    lanes = torch.stack((x, x), dim=0)
+                if lane0 is None or lane1 is None:
+                    lane0 = x
+                    lane1 = x
                 if skip_idx < self.num_skip_weights and skips:
-                    lanes = self._apply_skip_parallel_packed(lanes, skips.pop(), skip_idx)
-                lanes = self._parallel_block_packed(block_idx, lanes, x0)
+                    lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
+                lane0, lane1 = self._parallel_block(block_idx, lane0, lane1, x0)
             else:
                 if skip_idx < self.num_skip_weights and skips:
                     x = self._apply_skip_single(x, skips.pop(), skip_idx)
                 x = self.blocks[block_idx](x, x0)
-        if lanes is not None:
-            x = lanes.mean(dim=0)
+        if lane1 is not None:
+            x = 0.5 * (lane0 + lane1)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
