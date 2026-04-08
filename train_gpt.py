@@ -68,7 +68,6 @@ class Hyperparameters():
     parallel_residual = bool(int(os.environ.get('PARALLEL_RESIDUAL', '0')))
     parallel_start_layer = int(os.environ.get('PARALLEL_START_LAYER', 7))
     parallel_start_layer_is_physical = bool(int(os.environ.get('PARALLEL_START_LAYER_IS_PHYSICAL', '1')))
-    parallel_overlap_attn_lane0 = bool(int(os.environ.get('PARALLEL_OVERLAP_ATTN_LANE0', '0')))
 
     # Layer looping
     num_loops = int(os.environ.get('NUM_LOOPS', 2))
@@ -513,8 +512,6 @@ class GPT(nn.Module):
         self.parallel_residual = h.parallel_residual
         self.parallel_start_layer = max(0, h.parallel_start_layer)
         self.parallel_start_layer_is_physical = h.parallel_start_layer_is_physical
-        self.parallel_overlap_attn_lane0 = h.parallel_overlap_attn_lane0
-        self.parallel_overlap_stream = torch.cuda.Stream() if self.parallel_overlap_attn_lane0 and torch.cuda.is_available() else None
         if self.parallel_residual:
             self.parallel_post_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, 2, dtype=torch.float32))
             self.parallel_resid_lambdas = nn.Parameter(torch.full((h.num_layers, 2), 1.1**0.5, dtype=torch.float32))
@@ -588,25 +585,15 @@ class GPT(nn.Module):
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
-        if self.parallel_overlap_attn_lane0 and self.parallel_overlap_stream is not None:
-            current_stream = torch.cuda.current_stream()
-            with torch.cuda.stream(self.parallel_overlap_stream):
-                self.parallel_overlap_stream.wait_stream(current_stream)
-                lane0_mid = attn_resid * lane0 + attn_post[0] * attn_out
-            lane1 = attn_resid * lane1 + attn_post[1] * attn_out
-        else:
-            lane0 = attn_resid * lane0 + attn_post[0] * attn_out
-            lane1 = attn_resid * lane1 + attn_post[1] * attn_out
+        lane0_base = lane0
+        lane1 = attn_resid * lane1 + attn_post[1] * attn_out
 
         mlp_read = self._mix_with_x0(lane1, x0, block.resid_mix)
         mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
             block.mlp_norm(mlp_read) * block.ln_scale_factor)
-        if self.parallel_overlap_attn_lane0 and self.parallel_overlap_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.parallel_overlap_stream)
-            lane0 = lane0_mid
         mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
-        lane0 = mlp_resid * lane0 + mlp_post[0] * mlp_out
+        lane0 = (mlp_resid * attn_resid) * lane0_base + (mlp_resid * attn_post[0]) * attn_out + mlp_post[0] * mlp_out
         lane1 = mlp_resid * lane1 + mlp_post[1] * mlp_out
         return lane0, lane1
 
