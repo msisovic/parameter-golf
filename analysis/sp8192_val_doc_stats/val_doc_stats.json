@@ -1,0 +1,56 @@
+{
+  "num_docs": 50000,
+  "total_tokens_including_bos": 40540803,
+  "total_scored_tokens_doc_aware": 40490803,
+  "mean_tokens": 810.81606,
+  "median_tokens": 475.0,
+  "p75_tokens": 912,
+  "p90_tokens": 1595,
+  "p95_tokens": 2357,
+  "p99_tokens": 5675,
+  "max_tokens": 79463,
+  "doc_length_thresholds": [
+    {
+      "threshold": 1024,
+      "docs_longer_count": 10607,
+      "docs_longer_fraction": 0.21214
+    },
+    {
+      "threshold": 2048,
+      "docs_longer_count": 3182,
+      "docs_longer_fraction": 0.06364
+    },
+    {
+      "threshold": 4096,
+      "docs_longer_count": 925,
+      "docs_longer_fraction": 0.0185
+    },
+    {
+      "threshold": 8192,
+      "docs_longer_count": 251,
+      "docs_longer_fraction": 0.00502
+    }
+  ],
+  "within_doc_token_mass_thresholds": [
+    {
+      "threshold": 1024,
+      "tokens_beyond_count": 13143502,
+      "tokens_beyond_fraction_of_scored_doc_aware_tokens": 0.324604626882801
+    },
+    {
+      "threshold": 2048,
+      "tokens_beyond_count": 7137936,
+      "tokens_beyond_fraction_of_scored_doc_aware_tokens": 0.17628536534580458
+    },
+    {
+      "threshold": 4096,
+      "tokens_beyond_count": 3606094,
+      "tokens_beyond_fraction_of_scored_doc_aware_tokens": 0.0890595822463684
+    },
+    {
+      "threshold": 8192,
+      "tokens_beyond_count": 1630104,
+      "tokens_beyond_fraction_of_scored_doc_aware_tokens": 0.04025862366819448
+    }
+  ]
+}
