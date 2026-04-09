@@ -65,8 +65,8 @@ class Hyperparameters():
     rope_train_seq_len = int(os.environ.get('ROPE_TRAIN_SEQ_LEN', 2048))
     ln_scale = bool(int(os.environ.get('LN_SCALE', '1')))
     qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 4.0))
-    parallel_residual = bool(int(os.environ.get('PARALLEL_RESIDUAL', '0')))
-    parallel_start_layer = int(os.environ.get('PARALLEL_START_LAYER', 7))
+    parallel_residual = bool(int(os.environ.get('PARALLEL_RESIDUAL', '1')))
+    parallel_start_layer = int(os.environ.get('PARALLEL_START_LAYER', 8))
     parallel_start_layer_is_physical = bool(int(os.environ.get('PARALLEL_START_LAYER_IS_PHYSICAL', '1')))
 
     # Layer looping
@@ -514,7 +514,7 @@ class GPT(nn.Module):
         self.parallel_start_layer_is_physical = h.parallel_start_layer_is_physical
         if self.parallel_residual:
             self.parallel_post_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, 2, dtype=torch.float32))
-            self.parallel_resid_lambdas = nn.Parameter(torch.full((h.num_layers, 2), 1.1**0.5, dtype=torch.float32))
+            self.parallel_resid_lambdas = nn.Parameter(torch.full((h.num_layers, 2), 1.1, dtype=torch.float32))
         else:
             self.parallel_post_lambdas = None
             self.parallel_resid_lambdas = None
@@ -583,19 +583,16 @@ class GPT(nn.Module):
         attn_read = self._mix_with_x0(lane0, x0, block.resid_mix)
         attn_out = block.attn(block.attn_norm(attn_read) * block.ln_scale_factor)
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
-        attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
-        lane0 = attn_resid * lane0 + attn_post[0] * attn_out
-        lane1 = attn_resid * lane1 + attn_post[1] * attn_out
 
         mlp_read = self._mix_with_x0(lane1, x0, block.resid_mix)
         mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
             block.mlp_norm(mlp_read) * block.ln_scale_factor)
-        mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
-        lane0 = mlp_resid * lane0 + mlp_post[0] * mlp_out
-        lane1 = mlp_resid * lane1 + mlp_post[1] * mlp_out
-        return lane0, lane1
+        resid = self.parallel_resid_lambdas[block_idx].to(dtype=lane0.dtype)
+        lane0_new = resid[0] * lane0 + attn_post[0] * attn_out + mlp_post[0] * mlp_out
+        lane1_new = resid[1] * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
+        return lane0_new, lane1_new
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1251,6 +1248,40 @@ def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
     return val_loss, val_bpb
 
 
+def log_parallel_residual_converged(log_fn, model: GPT) -> None:
+    if model.parallel_post_lambdas is None or model.parallel_resid_lambdas is None:
+        return
+    if model.looping_active:
+        virtual_to_physical = list(model.encoder_indices) + list(model.decoder_indices)
+    else:
+        virtual_to_physical = list(range(len(model.blocks)))
+    used_layers = [
+        virtual_idx for virtual_idx, physical_idx in enumerate(virtual_to_physical)
+        if model._parallel_active_for_layer(physical_idx, virtual_idx)
+    ]
+    post = model.parallel_post_lambdas.detach().cpu()
+    resid = model.parallel_resid_lambdas.detach().cpu()
+    mode = "physical" if model.parallel_start_layer_is_physical else "virtual"
+    log_fn(
+        f"parallel_residual:converged active=1 start_layer={model.parallel_start_layer} "
+        f"start_mode={mode} final_lane=mean used_layers={len(used_layers)}"
+    )
+    for virtual_idx in used_layers:
+        physical_idx = int(virtual_to_physical[virtual_idx])
+        if not (0 <= physical_idx < post.shape[0] and 0 <= physical_idx < resid.shape[0]):
+            log_fn(f"parallel_residual layer:{virtual_idx} physical:{physical_idx} skipped=out_of_range")
+            continue
+        log_fn(
+            f"parallel_residual layer:{virtual_idx} physical:{physical_idx} "
+            f"attn_resid:{resid[physical_idx, 0]:.4f} "
+            f"attn_to_attn:{post[physical_idx, 0, 0]:.4f} "
+            f"attn_to_mlp:{post[physical_idx, 0, 1]:.4f} "
+            f"mlp_resid:{resid[physical_idx, 1]:.4f} "
+            f"mlp_to_attn:{post[physical_idx, 1, 0]:.4f} "
+            f"mlp_to_mlp:{post[physical_idx, 1, 1]:.4f}"
+        )
+
+
 # -----------------------------
 # Training
 # -----------------------------
@@ -1421,6 +1452,7 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     current_state = base_model.state_dict()
     avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
     base_model.load_state_dict(avg_state, strict=True)
+    log_parallel_residual_converged(log, base_model)
 
     return base_model, compiled_model
 
