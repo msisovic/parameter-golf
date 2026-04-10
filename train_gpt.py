@@ -68,6 +68,8 @@ class Hyperparameters():
     parallel_residual = bool(int(os.environ.get('PARALLEL_RESIDUAL', '1')))
     parallel_start_layer = int(os.environ.get('PARALLEL_START_LAYER', 8))
     parallel_start_layer_is_physical = bool(int(os.environ.get('PARALLEL_START_LAYER_IS_PHYSICAL', '1')))
+    parallel_final_lane = os.environ.get('PARALLEL_FINAL_LANE', 'mean').strip().lower()
+    parallel_late_no_lane0_write_n = int(os.environ.get('PARALLEL_LATE_NO_LANE0_WRITE_N', 0))
 
     # Layer looping
     num_loops = int(os.environ.get('NUM_LOOPS', 2))
@@ -512,6 +514,13 @@ class GPT(nn.Module):
         self.parallel_residual = h.parallel_residual
         self.parallel_start_layer = max(0, h.parallel_start_layer)
         self.parallel_start_layer_is_physical = h.parallel_start_layer_is_physical
+        self.parallel_final_lane = h.parallel_final_lane
+        if self.parallel_final_lane not in {"mean", "lane0", "attn", "lane1", "mlp", "output"}:
+            raise ValueError(
+                "PARALLEL_FINAL_LANE must be one of mean,lane0,attn,lane1,mlp,output; "
+                f"got {self.parallel_final_lane!r}"
+            )
+        self.parallel_late_no_lane0_write_n = max(0, h.parallel_late_no_lane0_write_n)
         if self.parallel_residual:
             self.parallel_post_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, 2, dtype=torch.float32))
             self.parallel_resid_lambdas = nn.Parameter(torch.full((h.num_layers, 2), 1.1, dtype=torch.float32))
@@ -538,6 +547,33 @@ class GPT(nn.Module):
         if self.parallel_start_layer_is_physical:
             return physical_idx >= self.parallel_start_layer
         return virtual_idx >= self.parallel_start_layer
+
+    def _parallel_virtual_to_physical(self) -> list[int]:
+        if self.looping_active:
+            return list(self.encoder_indices) + list(self.decoder_indices)
+        return list(range(len(self.blocks)))
+
+    def _parallel_used_layers(self) -> list[tuple[int, int]]:
+        virtual_to_physical = self._parallel_virtual_to_physical()
+        return [
+            (virtual_idx, physical_idx)
+            for virtual_idx, physical_idx in enumerate(virtual_to_physical)
+            if self._parallel_active_for_layer(physical_idx, virtual_idx)
+        ]
+
+    def _parallel_active_layers_remaining(self, physical_idx: int, virtual_idx: int) -> int:
+        used_layers = self._parallel_used_layers()
+        for i, layer in enumerate(used_layers):
+            if layer == (virtual_idx, physical_idx):
+                return len(used_layers) - i
+        return 0
+
+    def _final_parallel_hidden(self, lane0: Tensor, lane1: Tensor) -> Tensor:
+        if self.parallel_final_lane in {"lane1", "mlp", "output"}:
+            return lane1
+        if self.parallel_final_lane in {"lane0", "attn"}:
+            return lane0
+        return 0.5 * (lane0 + lane1)
 
     def _mix_with_x0(self, lane: Tensor, x0: Tensor, resid_mix: Tensor) -> Tensor:
         mix = resid_mix.to(dtype=lane.dtype)
@@ -572,6 +608,7 @@ class GPT(nn.Module):
     def _parallel_block(
         self,
         block_idx: int,
+        virtual_idx: int,
         lane0: Tensor,
         lane1: Tensor,
         x0: Tensor,
@@ -590,7 +627,11 @@ class GPT(nn.Module):
             block.mlp_norm(mlp_read) * block.ln_scale_factor)
         mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         resid = self.parallel_resid_lambdas[block_idx].to(dtype=lane0.dtype)
+        active_layers_remaining = self._parallel_active_layers_remaining(block_idx, virtual_idx)
+        no_lane0_write = 0 < active_layers_remaining <= self.parallel_late_no_lane0_write_n
         lane0_new = resid[0] * lane0 + attn_post[0] * attn_out + mlp_post[0] * mlp_out
+        if no_lane0_write:
+            lane0_new = resid[0] * lane0
         lane1_new = resid[1] * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
         return lane0_new, lane1_new
 
@@ -610,7 +651,7 @@ class GPT(nn.Module):
                 if lane0 is None or lane1 is None:
                     lane0 = x
                     lane1 = x
-                lane0, lane1 = self._parallel_block(block_idx, lane0, lane1, x0)
+                lane0, lane1 = self._parallel_block(block_idx, virtual_idx, lane0, lane1, x0)
                 skips.append((lane0, lane1))
             else:
                 x = self.blocks[block_idx](x, x0)
@@ -624,13 +665,13 @@ class GPT(nn.Module):
                     lane1 = x
                 if skip_idx < self.num_skip_weights and skips:
                     lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
-                lane0, lane1 = self._parallel_block(block_idx, lane0, lane1, x0)
+                lane0, lane1 = self._parallel_block(block_idx, virtual_idx, lane0, lane1, x0)
             else:
                 if skip_idx < self.num_skip_weights and skips:
                     x = self._apply_skip_single(x, skips.pop(), skip_idx)
                 x = self.blocks[block_idx](x, x0)
         if lane1 is not None:
-            x = 0.5 * (lane0 + lane1)
+            x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -1251,26 +1292,25 @@ def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
 def log_parallel_residual_converged(log_fn, model: GPT) -> None:
     if model.parallel_post_lambdas is None or model.parallel_resid_lambdas is None:
         return
-    if model.looping_active:
-        virtual_to_physical = list(model.encoder_indices) + list(model.decoder_indices)
-    else:
-        virtual_to_physical = list(range(len(model.blocks)))
-    used_layers = [
-        virtual_idx for virtual_idx, physical_idx in enumerate(virtual_to_physical)
-        if model._parallel_active_for_layer(physical_idx, virtual_idx)
-    ]
+    used_layers = model._parallel_used_layers()
     post = model.parallel_post_lambdas.detach().cpu()
     resid = model.parallel_resid_lambdas.detach().cpu()
     mode = "physical" if model.parallel_start_layer_is_physical else "virtual"
     log_fn(
         f"parallel_residual:converged active=1 start_layer={model.parallel_start_layer} "
-        f"start_mode={mode} final_lane=mean used_layers={len(used_layers)}"
+        f"start_mode={mode} final_lane={model.parallel_final_lane} "
+        f"late_no_lane0_write_n={model.parallel_late_no_lane0_write_n} "
+        f"used_layers={len(used_layers)}"
     )
-    for virtual_idx in used_layers:
-        physical_idx = int(virtual_to_physical[virtual_idx])
+    for virtual_idx, physical_idx in used_layers:
+        physical_idx = int(physical_idx)
         if not (0 <= physical_idx < post.shape[0] and 0 <= physical_idx < resid.shape[0]):
             log_fn(f"parallel_residual layer:{virtual_idx} physical:{physical_idx} skipped=out_of_range")
             continue
+        active_layers_remaining = model._parallel_active_layers_remaining(physical_idx, virtual_idx)
+        suffix = ""
+        if 0 < active_layers_remaining <= model.parallel_late_no_lane0_write_n:
+            suffix = " variant=no_lane0_write"
         log_fn(
             f"parallel_residual layer:{virtual_idx} physical:{physical_idx} "
             f"attn_resid:{resid[physical_idx, 0]:.4f} "
@@ -1279,6 +1319,7 @@ def log_parallel_residual_converged(log_fn, model: GPT) -> None:
             f"mlp_resid:{resid[physical_idx, 1]:.4f} "
             f"mlp_to_attn:{post[physical_idx, 1, 0]:.4f} "
             f"mlp_to_mlp:{post[physical_idx, 1, 1]:.4f}"
+            f"{suffix}"
         )
 
 
@@ -1299,7 +1340,9 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     log(
         f"parallel_residual:active={int(base_model.parallel_post_lambdas is not None)} "
         f"start_layer={base_model.parallel_start_layer} "
-        f"start_mode={'physical' if base_model.parallel_start_layer_is_physical else 'virtual'}"
+        f"start_mode={'physical' if base_model.parallel_start_layer_is_physical else 'virtual'} "
+        f"final_lane={base_model.parallel_final_lane} "
+        f"late_no_lane0_write_n={base_model.parallel_late_no_lane0_write_n}"
     )
 
     # Set up optimizer and load train data
