@@ -134,12 +134,16 @@ class Hyperparameters:
     loop_start = int(os.environ.get('LOOP_START', 3))
     loop_end = int(os.environ.get('LOOP_END', 5))
     enable_looping_at = float(os.environ.get('ENABLE_LOOPING_AT', 0.35))
-    parallel_residual_start = int(os.environ.get('PARALLEL_RESIDUAL_START', os.environ.get('PARALLEL_START_LAYER', 8)))
+    parallel_residual_start = int(os.environ.get('PARALLEL_RESIDUAL_START', os.environ.get('PARALLEL_START_LAYER', 7)))
     parallel_residual = bool(int(os.environ.get('PARALLEL_RESIDUAL', '1')))
     parallel_start_layer = parallel_residual_start
     parallel_start_layer_is_physical = bool(int(os.environ.get('PARALLEL_START_LAYER_IS_PHYSICAL', '1')))
-    parallel_final_lane = os.environ.get('PARALLEL_FINAL_LANE', 'mlp')
+    parallel_final_lane = os.environ.get('PARALLEL_FINAL_LANE', 'mean')
     parallel_freeze_lane0 = bool(int(os.environ.get('PARALLEL_FREEZE_LANE0', '0')))
+    parallel_identity_init = bool(int(os.environ.get('PARALLEL_IDENTITY_INIT', '1')))
+    parallel_skip_lane0_only = bool(int(os.environ.get('PARALLEL_SKIP_LANE0_ONLY', '1')))
+    parallel_mlp_read_mix = bool(int(os.environ.get('PARALLEL_MLP_READ_MIX', '0')))
+    parallel_lambda_wd = float(os.environ.get('PARALLEL_LAMBDA_WD', 0.0))
     min_lr = float(os.environ.get('MIN_LR', 0.0))
     embed_lr = float(os.environ.get('EMBED_LR', 0.6))
     head_lr = float(os.environ.get('HEAD_LR', 0.008))
@@ -541,11 +545,22 @@ class GPT(nn.Module):
         self.parallel_start_layer_is_physical = h.parallel_start_layer_is_physical
         self.parallel_final_lane = h.parallel_final_lane.lower()
         self.parallel_freeze_lane0 = h.parallel_freeze_lane0
+        self.parallel_identity_init = h.parallel_identity_init
+        self.parallel_skip_lane0_only = h.parallel_skip_lane0_only
+        self.parallel_mlp_read_mix = h.parallel_mlp_read_mix
+        self.parallel_lambda_wd = h.parallel_lambda_wd
         if self.parallel_final_lane not in ('mlp', 'mean', 'attn'):
             raise ValueError(f"PARALLEL_FINAL_LANE must be one of 'mlp', 'mean', or 'attn', got {h.parallel_final_lane!r}")
         if self.parallel_residual:
-            self.parallel_post_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, 2, dtype=torch.float32))
-            self.parallel_resid_lambdas = nn.Parameter(torch.full((h.num_layers, 2), 1.1 ** 0.5, dtype=torch.float32))
+            if self.parallel_identity_init:
+                post = torch.zeros(h.num_layers, 2, 2, dtype=torch.float32)
+                post[:, 0, 0] = 1.0
+                post[:, 1, 1] = 1.0
+                self.parallel_post_lambdas = nn.Parameter(post)
+                self.parallel_resid_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, dtype=torch.float32))
+            else:
+                self.parallel_post_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, 2, dtype=torch.float32))
+                self.parallel_resid_lambdas = nn.Parameter(torch.full((h.num_layers, 2), 1.1 ** 0.5, dtype=torch.float32))
         else:
             self.parallel_post_lambdas = None
             self.parallel_resid_lambdas = None
@@ -602,6 +617,13 @@ class GPT(nn.Module):
         else:
             skip0 = skip1 = skip
         w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
+        if self.parallel_skip_lane0_only:
+            if self.skip_gates is None:
+                next_lane0 = lane0 if self.parallel_freeze_lane0 else lane0 + w * skip0
+                return (next_lane0, lane1)
+            g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+            next_lane0 = lane0 if self.parallel_freeze_lane0 else torch.lerp(w * skip0, lane0, g)
+            return (next_lane0, lane1)
         if self.skip_gates is None:
             next_lane0 = lane0 if self.parallel_freeze_lane0 else lane0 + w * skip0
             return (next_lane0, lane1 + w * skip1)
@@ -623,7 +645,7 @@ class GPT(nn.Module):
         attn_read = self._mix_with_x0(lane0, x0, block.resid_mix)
         attn_out = block.attn(block.attn_norm(attn_read) * block.ln_scale_factor, q_w, k_w, v_w, out_w)
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
-        mlp_read = self._mix_with_x0(lane1, x0, block.resid_mix)
+        mlp_read = self._mix_with_x0(lane1, x0, block.resid_mix) if self.parallel_mlp_read_mix else lane1
         mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(block.mlp_norm(mlp_read) * block.ln_scale_factor, up_w, down_w)
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
@@ -661,9 +683,11 @@ class GPT(nn.Module):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(block_idx)
             if self._parallel_active_for_layer(block_idx, virtual_idx):
                 if lane0 is None or lane1 is None:
+                    if self.parallel_skip_lane0_only and skip_idx < self.num_skip_weights and skips:
+                        x = self._apply_skip_single(x, skips.pop(), skip_idx)
                     lane0 = x
                     lane1 = x
-                if skip_idx < self.num_skip_weights and skips:
+                elif skip_idx < self.num_skip_weights and skips:
                     lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
                 lane0, lane1 = self._parallel_block(block_idx, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w)
             else:
@@ -836,21 +860,25 @@ class Optimizers:
         matrix_params = [base_model.qo_bank, base_model.kv_bank, base_model.mlp_up_bank, base_model.mlp_down_bank]
         block_named_params = list(base_model.blocks.named_parameters())
         scalar_params = [p for name, p in block_named_params if p.ndim < 2 or any((pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))]
+        parallel_scalar_params = []
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
             scalar_params.append(base_model.skip_gates)
         if base_model.parallel_post_lambdas is not None:
-            scalar_params.append(base_model.parallel_post_lambdas)
+            parallel_scalar_params.append(base_model.parallel_post_lambdas)
         if base_model.parallel_resid_lambdas is not None:
-            scalar_params.append(base_model.parallel_resid_lambdas)
+            parallel_scalar_params.append(base_model.parallel_resid_lambdas)
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [{'params': [base_model.tok_emb.weight], 'lr': token_lr, 'base_lr': token_lr}]
         self.optimizer_tok = torch.optim.AdamW(tok_params, betas=(h.beta1, h.beta2), eps=h.adam_eps, weight_decay=h.embed_wd, fused=True)
         self.optimizer_muon = Muon(matrix_params, lr=h.matrix_lr, momentum=h.muon_momentum, backend_steps=h.muon_backend_steps, weight_decay=h.muon_wd, row_normalize=h.muon_row_normalize)
         for group in self.optimizer_muon.param_groups:
             group['base_lr'] = h.matrix_lr
-        self.optimizer_scalar = torch.optim.AdamW([{'params': scalar_params, 'lr': h.scalar_lr, 'base_lr': h.scalar_lr}], betas=(h.beta1, h.beta2), eps=h.adam_eps, weight_decay=h.adam_wd, fused=True)
+        scalar_groups = [{'params': scalar_params, 'lr': h.scalar_lr, 'base_lr': h.scalar_lr, 'weight_decay': h.adam_wd}]
+        if parallel_scalar_params:
+            scalar_groups.append({'params': parallel_scalar_params, 'lr': h.scalar_lr, 'base_lr': h.scalar_lr, 'weight_decay': h.parallel_lambda_wd})
+        self.optimizer_scalar = torch.optim.AdamW(scalar_groups, betas=(h.beta1, h.beta2), eps=h.adam_eps, fused=True)
         self.optimizers = [self.optimizer_tok, self.optimizer_muon, self.optimizer_scalar]
         if base_model.lm_head is not None:
             self.optimizer_head = torch.optim.Adam([{'params': [base_model.lm_head.weight], 'lr': h.head_lr, 'base_lr': h.head_lr}], betas=(h.beta1, h.beta2), eps=h.adam_eps, fused=True)
@@ -859,6 +887,7 @@ class Optimizers:
             self.optimizer_head = None
         self.replicated_params = list(tok_params[0]['params'])
         self.replicated_params.extend(scalar_params)
+        self.replicated_params.extend(parallel_scalar_params)
         if base_model.lm_head is not None:
             self.replicated_params.append(base_model.lm_head.weight)
 
@@ -906,7 +935,7 @@ def log_parallel_residual_converged(log0, model):
     post = model.parallel_post_lambdas.detach().cpu()
     resid = model.parallel_resid_lambdas.detach().cpu()
     mode = 'physical' if model.parallel_start_layer_is_physical else 'virtual'
-    log0(f'parallel_residual:converged active=1 start_layer={model.parallel_start_layer} start_mode={mode} final_lane={model.parallel_final_lane} freeze_lane0={int(model.parallel_freeze_lane0)} used_layers={len(used_layers)}')
+    log0(f'parallel_residual:converged active=1 start_layer={model.parallel_start_layer} start_mode={mode} final_lane={model.parallel_final_lane} freeze_lane0={int(model.parallel_freeze_lane0)} identity_init={int(model.parallel_identity_init)} skip_lane0_only={int(model.parallel_skip_lane0_only)} mlp_read_mix={int(model.parallel_mlp_read_mix)} lambda_wd={model.parallel_lambda_wd:g} used_layers={len(used_layers)}')
     for vi in used_layers:
         pi = int(v2p[vi])
         if not (0 <= pi < post.shape[0] and 0 <= pi < resid.shape[0]):
@@ -1472,7 +1501,7 @@ def train_model(h, device, val_data):
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
     log(f'model_params:{sum((p.numel() for p in base_model.parameters()))}')
-    log(f"parallel_residual:active={int(base_model.parallel_post_lambdas is not None)} start_layer={base_model.parallel_start_layer} start_mode={'physical' if base_model.parallel_start_layer_is_physical else 'virtual'} final_lane={base_model.parallel_final_lane} freeze_lane0={int(base_model.parallel_freeze_lane0)}")
+    log(f"parallel_residual:active={int(base_model.parallel_post_lambdas is not None)} start_layer={base_model.parallel_start_layer} start_mode={'physical' if base_model.parallel_start_layer_is_physical else 'virtual'} final_lane={base_model.parallel_final_lane} freeze_lane0={int(base_model.parallel_freeze_lane0)} identity_init={int(base_model.parallel_identity_init)} skip_lane0_only={int(base_model.parallel_skip_lane0_only)} mlp_read_mix={int(base_model.parallel_mlp_read_mix)} lambda_wd={base_model.parallel_lambda_wd:g}")
     optimizers = Optimizers(h, base_model)
     train_loader = ShuffledSequenceLoader(h, device)
     max_wallclock_ms = 1000.0 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
