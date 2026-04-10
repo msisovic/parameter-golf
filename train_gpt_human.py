@@ -553,11 +553,8 @@ class GPT(nn.Module):
             raise ValueError(f"PARALLEL_FINAL_LANE must be one of 'mlp', 'mean', or 'attn', got {h.parallel_final_lane!r}")
         if self.parallel_residual:
             if self.parallel_identity_init:
-                post = torch.zeros(h.num_layers, 2, 2, dtype=torch.float32)
-                post[:, 0, 0] = 1.0
-                post[:, 1, 1] = 1.0
-                self.parallel_post_lambdas = nn.Parameter(post)
-                self.parallel_resid_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, dtype=torch.float32))
+                self.parallel_post_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, 2, dtype=torch.float32))
+                self.parallel_resid_lambdas = nn.Parameter(torch.full((h.num_layers, 2), 1.1, dtype=torch.float32))
             else:
                 self.parallel_post_lambdas = nn.Parameter(torch.ones(h.num_layers, 2, 2, dtype=torch.float32))
                 self.parallel_resid_lambdas = nn.Parameter(torch.full((h.num_layers, 2), 1.1 ** 0.5, dtype=torch.float32))
