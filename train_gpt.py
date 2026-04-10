@@ -41,7 +41,7 @@ class Hyperparameters:
     loop_end = int(os.environ.get('LOOP_END', 5))
     enable_looping_at = float(os.environ.get('ENABLE_LOOPING_AT', 0.35))
     parallel_residual_start = int(os.environ.get('PARALLEL_RESIDUAL_START', os.environ.get('PARALLEL_START_LAYER', 7)))
-    parallel_residual = bool(int(os.environ.get('PARALLEL_RESIDUAL', '0')))
+    parallel_residual = bool(int(os.environ.get('PARALLEL_RESIDUAL', '1')))
     parallel_start_layer = parallel_residual_start
     parallel_start_layer_is_physical = bool(int(os.environ.get('PARALLEL_START_LAYER_IS_PHYSICAL', '1')))
     parallel_final_lane = os.environ.get('PARALLEL_FINAL_LANE', 'mlp')
@@ -499,13 +499,13 @@ class GPT(nn.Module):
         attn_read = self._mix_with_x0(lane0, x0, block.resid_mix)
         attn_out = block.attn(block.attn_norm(attn_read) * block.ln_scale_factor)
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
+        mlp_read = self._mix_with_x0(lane1, x0, block.resid_mix)
+        mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(block.mlp_norm(mlp_read) * block.ln_scale_factor)
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         if not self.parallel_freeze_lane0:
             lane0 = attn_resid * lane0 + attn_post[0] * attn_out
         lane1 = attn_resid * lane1 + attn_post[1] * attn_out
-        mlp_read = self._mix_with_x0(lane1, x0, block.resid_mix)
-        mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(block.mlp_norm(mlp_read) * block.ln_scale_factor)
         mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         if not self.parallel_freeze_lane0:
@@ -688,6 +688,25 @@ def restore_fp32_params(model):
     for name, param in model.named_parameters():
         if (param.ndim < 2 or any((pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))) and param.dtype != torch.float32:
             param.data = param.data.float()
+
+def log_parallel_residual_converged(log0, model):
+    if getattr(model, 'parallel_post_lambdas', None) is None:
+        return
+    if model.looping_active:
+        v2p = list(model.encoder_indices) + list(model.decoder_indices)
+    else:
+        v2p = list(range(model.num_encoder_layers + model.num_decoder_layers))
+    used_layers = [vi for vi, pi in enumerate(v2p) if model._parallel_active_for_layer(pi, vi)]
+    post = model.parallel_post_lambdas.detach().cpu()
+    resid = model.parallel_resid_lambdas.detach().cpu()
+    mode = 'physical' if model.parallel_start_layer_is_physical else 'virtual'
+    log0(f'parallel_residual:converged active=1 start_layer={model.parallel_start_layer} start_mode={mode} final_lane={model.parallel_final_lane} freeze_lane0={int(model.parallel_freeze_lane0)} used_layers={len(used_layers)}')
+    for vi in used_layers:
+        pi = int(v2p[vi])
+        if not (0 <= pi < post.shape[0] and 0 <= pi < resid.shape[0]):
+            log0(f'parallel_residual layer:{vi} physical:{pi} skipped=out_of_range')
+            continue
+        log0(f'parallel_residual layer:{vi} physical:{pi} attn_resid:{resid[pi, 0]:.4f} attn_to_attn:{post[pi, 0, 0]:.4f} attn_to_mlp:{post[pi, 0, 1]:.4f} mlp_resid:{resid[pi, 1]:.4f} mlp_to_attn:{post[pi, 1, 0]:.4f} mlp_to_mlp:{post[pi, 1, 1]:.4f}')
 
 def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
     hessians = {}
@@ -1233,6 +1252,7 @@ def train_model(h, device, val_data):
     current_state = base_model.state_dict()
     avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
     base_model.load_state_dict(avg_state, strict=True)
+    log_parallel_residual_converged(log, base_model)
     return (base_model, compiled_model)
 
 def train_and_eval(h, device):
