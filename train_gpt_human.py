@@ -646,15 +646,13 @@ class GPT(nn.Module):
         mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(block.mlp_norm(mlp_read) * block.ln_scale_factor, up_w, down_w)
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
-        if not self.parallel_freeze_lane0:
-            lane0 = attn_resid * lane0 + attn_post[0] * attn_out
-        lane1 = attn_resid * lane1 + attn_post[1] * attn_out
         mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        next_lane0 = lane0
         if not self.parallel_freeze_lane0:
-            lane0 = mlp_resid * lane0 + mlp_post[0] * mlp_out
-        lane1 = mlp_resid * lane1 + mlp_post[1] * mlp_out
-        return (lane0, lane1)
+            next_lane0 = attn_resid * lane0 + attn_post[0] * attn_out + mlp_post[0] * mlp_out
+        next_lane1 = mlp_resid * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
+        return (next_lane0, next_lane1)
 
     def _forward_logits_from_embeddings(self, x):
         x0 = x
