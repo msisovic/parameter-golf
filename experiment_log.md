@@ -94,3 +94,15 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - Delta vs baseline: `+123` steps, about `+2.54%`
 - Delta vs kept Stage 1 stack: `+67` steps, about `+1.37%`
 - Conclusion: unlike the Python-level fusion, the Triton kernel is a real stacked win here and should stay in the active stack
+
+## Notes
+
+- Why the Python-level fusion regressed while Triton won:
+  - The failed custom autograd version still computed the loss with generic PyTorch tensor ops (`tanh`, `logsumexp`, `gather`, `softmax`) and a dense Python-defined backward.
+  - That replaced the highly optimized stock CE kernel with multiple full-vocab passes, so it added overhead instead of removing it.
+  - The Triton version is materially different because it fuses softcap transform, rowwise reduction, target extraction, and loss-gradient construction into dedicated kernels.
+  - In short: the positive result came from real kernel fusion, not from merely rewriting CE algebra in Python.
+
+- Follow-up worth trying next:
+  - Port the deeper modded-nanogpt `#207` idea: fuse LM-head quantization into the Triton loss path instead of keeping “FP8 head” and “fused softcap+CE” as separate stages.
+  - That is the clearest remaining path if we want to push beyond the current `+2.54%` stacked win in the logits/loss lane.
