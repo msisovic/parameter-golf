@@ -1,7 +1,8 @@
-import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
+import ast, base64, collections, copy, fcntl, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
+from pyminify import to_source
 from flash_attn_interface import (
     flash_attn_func as flash_attn_3_func,
     flash_attn_varlen_func,
@@ -1842,10 +1843,7 @@ def _rebank_state_dict(flat_sd, num_layers, model_dim, kv_dim, hidden_dim):
 
 def _compressed_code_size(code):
     code_raw = code.encode("utf-8")
-    minified = subprocess.run(
-        ["pyminify", "--no-rename-locals", "--no-hoist-literals", "--remove-literal-statements", "-"],
-        input=code_raw, capture_output=True, check=True,
-    ).stdout
+    minified = to_source(ast.parse(code), indent_with=" ").encode("utf-8")
     compressed = lzma.compress(minified)
     encoded = base64.b85encode(compressed)
     wrapper = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode("' + encoded + b'")))\n'
