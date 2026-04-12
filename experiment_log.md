@@ -63,3 +63,19 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - Delta vs baseline: `+55` steps, about `+1.14%`
 - Delta vs Stage 1: `-1` step, so this does not improve the stack and should be left off for now
 - Updated expectation after Stage 1+2: the stacked target should come down materially; with CE-cast removal not helping, the currently supported stack is still about `+1%`, not `+3%` to `+5%`
+
+### Stage 1 + Stage 3 attempt: custom fused softcap + CE
+
+```bash
+TTT_ENABLED=0 SEED=0 PARALLEL_RESIDUAL_START=8 GPTQ_RESERVE_SECONDS=13 FP8_LM_HEAD=1 FUSED_SOFTCAP_CE=1 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+- Run log: `logs/9e525334-5085-411b-9eb3-56242c1725a8.txt`
+- Run was stopped after the 4000-step validation because throughput was already clearly worse than the current best stack
+- Partial throughput signal:
+  - `4000/20000 train_loss: 2.8961 train_time: 8.0m tok/s: 6566690`
+  - This is materially slower than the kept FP8-head stack at the same point (`6799827 tok/s` in the earlier Stage 1 run)
+- Partial validation:
+  - `4000/20000 val_loss: 2.8677 val_bpb: 1.1101`
+- Conclusion: this Python-level custom autograd fusion is not a viable speed path; it loses to the optimized stock CE kernel
