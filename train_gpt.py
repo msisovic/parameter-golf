@@ -41,6 +41,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 3e1))
     fp8_lm_head = bool(int(os.environ.get("FP8_LM_HEAD", "0")))
     train_ce_float = bool(int(os.environ.get("TRAIN_CE_FLOAT", "1")))
+    fused_softcap_ce = bool(int(os.environ.get("FUSED_SOFTCAP_CE", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 1e4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     rope_train_seq_len = int(os.environ.get("ROPE_TRAIN_SEQ_LEN", 2048))
@@ -475,6 +476,37 @@ def fp8_linear_tensorwise(x, weight, weight_fp8_t, w_scale):
     return FP8LinearTensorwiseFn.apply(x, weight, weight_fp8_t, w_scale)
 
 
+class FusedSoftcapCrossEntropyFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, targets, softcap):
+        logits_2d = logits.reshape(-1, logits.size(-1))
+        targets_1d = targets.reshape(-1)
+        tanh_out = torch.tanh(logits_2d / softcap)
+        soft_logits = (softcap * tanh_out).float()
+        logsumexp = torch.logsumexp(soft_logits, dim=-1)
+        target_logits = soft_logits.gather(1, targets_1d[:, None]).squeeze(1)
+        loss = (logsumexp - target_logits).mean()
+        ctx.input_shape = logits.shape
+        ctx.softcap = softcap
+        ctx.num_targets = targets_1d.numel()
+        ctx.save_for_backward(tanh_out, targets_1d)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        tanh_out, targets_1d = ctx.saved_tensors
+        soft_logits = (ctx.softcap * tanh_out).float()
+        probs = torch.softmax(soft_logits, dim=-1)
+        probs[torch.arange(targets_1d.numel(), device=targets_1d.device), targets_1d] -= 1.0
+        grad_logits = probs.mul_(1.0 - tanh_out.float().square())
+        grad_logits.mul_(grad_output.float() / ctx.num_targets)
+        return grad_logits.view(ctx.input_shape).to(tanh_out.dtype), None, None
+
+
+def fused_softcap_cross_entropy(logits, targets, softcap):
+    return FusedSoftcapCrossEntropyFn.apply(logits, targets, softcap)
+
+
 @triton.jit
 def linear_leaky_relu_square_kernel(
     a_desc,
@@ -775,6 +807,7 @@ class GPT(nn.Module):
         self.logit_softcap = h.logit_softcap
         self.fp8_lm_head = h.fp8_lm_head
         self.train_ce_float = h.train_ce_float
+        self.fused_softcap_ce = h.fused_softcap_ce
         self.register_buffer("fp8_lm_head_weight_t", None, persistent=False)
         self.register_buffer("fp8_lm_head_weight_scale", None, persistent=False)
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
@@ -915,6 +948,23 @@ class GPT(nn.Module):
         self.fp8_lm_head_weight_t = w_fp8.t()
         self.fp8_lm_head_weight_scale = w_scale
 
+    def _project_logits(self, x):
+        x = self.final_norm(x)
+        if self.head_proj is not None:
+            x = self.head_proj(x)
+        if self.tie_embeddings:
+            if self.training and self.fp8_lm_head:
+                if self.fp8_lm_head_weight_t is None or self.fp8_lm_head_weight_scale is None:
+                    self.refresh_fp8_lm_head_cache()
+                return fp8_linear_tensorwise(
+                    x,
+                    self.tok_emb.weight,
+                    self.fp8_lm_head_weight_t,
+                    self.fp8_lm_head_weight_scale,
+                )
+            return F.linear(x, self.tok_emb.weight)
+        return self.lm_head(x)
+
     def _bank_weights(self, i):
         n = self.num_layers
         return (
@@ -1039,7 +1089,7 @@ class GPT(nn.Module):
         next_lane1 = mlp_resid * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
         return next_lane0, next_lane1
 
-    def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
+    def _forward_features(self, input_ids, cu_seqlens=None, max_seqlen=0):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -1121,29 +1171,23 @@ class GPT(nn.Module):
             else:
                 lm = self.lane_merge.to(dtype=lane0.dtype)
                 x = lm * lane0 + (1.0 - lm) * lane1
-        x = self.final_norm(x)
-        if self.head_proj is not None:
-            x = self.head_proj(x)
-        if self.tie_embeddings:
-            if self.training and self.fp8_lm_head:
-                if self.fp8_lm_head_weight_t is None or self.fp8_lm_head_weight_scale is None:
-                    self.refresh_fp8_lm_head_cache()
-                logits_proj = fp8_linear_tensorwise(
-                    x,
-                    self.tok_emb.weight,
-                    self.fp8_lm_head_weight_t,
-                    self.fp8_lm_head_weight_scale,
-                )
-            else:
-                logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
+        return x
+
+    def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
+        x = self._forward_features(
+            input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+        )
+        logits_proj = self._project_logits(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids, target_ids, cu_seqlens=None, max_seqlen=0):
-        logits = self.forward_logits(
+        x = self._forward_features(
             input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
         )
+        logits = self._project_logits(x)
+        if self.training and self.fused_softcap_ce:
+            return fused_softcap_cross_entropy(logits, target_ids, self.logit_softcap)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         logits_flat = logits.reshape(-1, logits.size(-1))
         if self.train_ce_float:
             logits_flat = logits_flat.float()
