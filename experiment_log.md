@@ -179,3 +179,106 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
     - the Triton quantizer is not numerically identical to the eager PyTorch FP8 cast path
     - on local checks it changed logits and gradients slightly, so this is acting as a different quantization/noise regime rather than a pure implementation cleanup
     - promising for optimization signal, but not yet a speed win and not enough by itself to claim a better capped result
+
+- `2026-04-12`: full capped run of the Triton tensorwise quantizer on the active stack.
+  - command:
+    - `SEED=0 TTT_ENABLED=0 PARALLEL_RESIDUAL_START=8 GPTQ_RESERVE_SECONDS=13 FP8_LM_HEAD=1 FUSED_SOFTCAP_CE=1 FP8_LM_HEAD_TRITON_QUANT=1 torchrun --standalone --nproc_per_node=8 train_gpt.py`
+  - result:
+    - `4933` steps in `587188 ms`
+    - `diagnostic pre-quantization post-ema val_loss: 2.77000072`
+    - `diagnostic quantized val_loss: 2.79848029`
+  - read:
+    - early 500-step train loss improvement did not carry through to the capped run
+    - throughput and quality both ended up slightly behind the current kept stack
+    - this is therefore not the next speed win, despite the promising short-run signal
+
+- `2026-04-12`: local ceiling check for removing dynamic activation rescaling from the FP8 LM-head forward.
+  - setup:
+    - compared the current dynamic tensorwise `x_scale = amax(x)` path against a fixed precomputed `x_scale` on approximately training-like shapes (`M=98304, K=512, N=8192`)
+    - both paths kept the existing `_scaled_mm` projection and Triton CE kernels
+  - result:
+    - current total: about `0.005310 s`
+    - fixed-scale total: about `0.005272 s`
+  - implication:
+    - even a best-case removal of the per-forward `amax` only showed about a `0.7%` end-to-end ceiling locally
+    - useful to know, but not large enough to explain the next leap in speed by itself
+
+- `2026-04-12`: tried a more serious backward-side fusion for the FP8 LM head.
+  - attempt:
+    - wrapper path around `_scaled_mm` forward + Triton CE forward
+    - in backward, avoided the previous “quantize then transpose with PyTorch ops” approach
+    - instead, generated packed FP8 `grad_logits` layouts directly from the Triton CE backward math for fast `_scaled_mm` use
+  - variants checked:
+    - dual-packed FP8 backward for both `grad_input` and `grad_weight`
+    - narrower version that only packed a transposed FP8 path for `grad_weight`
+  - result:
+    - both variants were clearly slower in local end-to-end microbench than the current split path
+    - representative measurements:
+      - baseline total: about `0.00184 s`
+      - dual-packed FP8 backward: about `0.00261 s`
+      - `grad_weight`-only packed variant: about `0.00299 s`
+      - at a larger training-like shape, dual-packed FP8 backward was about `0.00770 s` vs baseline `0.00549 s`
+  - conclusion:
+    - the remaining layout/packing work in Triton still costs more than it saves from the faster FP8 GEMMs
+    - backward-side fusion remains the right conceptual target, but these packing-based implementations are not the next win
+
+- `2026-04-12`: revisited rowwise activation scaling with a cleaner implementation.
+  - setup:
+    - `FP8_LM_HEAD_ROWWISE=1` enabled per-row activation scales for the LM-head forward
+    - cached the `(1, vocab)` `scale_b` tensor once in the model instead of rebuilding it each forward
+    - optional Triton rowwise quantizer was used to avoid the eager broadcast-divide/cast path
+  - 500-step run:
+    - run log: `logs/fp8_rowwise_triton_quant_500_20260412.txt`
+    - `500/500 train_loss: 3.2554 train_time: 0.8m tok/s: 8321268`
+    - `500/500 val_loss: 3.3003 val_bpb: 1.2776`
+  - full capped run:
+    - `500/20000 train_loss: 3.2572 train_time: 0.8m tok/s: 8324041`
+    - `4887/20000 val_loss: 2.7720 val_bpb: 1.0731`
+    - `diagnostic pre-quantization post-ema val_loss: 2.77022295`
+    - `diagnostic quantized val_loss: 2.79949592`
+  - comparison:
+    - slower than the current kept tensorwise stack throughout the run
+    - no meaningful accuracy gain; final pre-quant and quantized losses were both slightly worse
+  - read:
+    - the cleaner implementation reduced avoidable overhead, but the rowwise `_scaled_mm` regime itself is still slower enough to matter
+    - finer activation scaling alone is not improving the real objective in this codepath
+
+## Current kept state
+
+- Keep the active logits/loss path at:
+  - `FP8_LM_HEAD=1`
+  - `FUSED_SOFTCAP_CE=1`
+  - tensorwise FP8 LM-head scaling
+  - no rowwise scaling
+  - no TorchAO float8 integration
+- Current read:
+  - the major win in this lane was the Triton fused softcap+CE path
+  - the LM-head forward is now close enough to saturated that cheap local tweaks mostly trade tiny speed differences against small numeric changes without improving the capped result
+
+## Follow-ups
+
+- Profile a real training step and rank the next non-LM-head bottlenecks before spending more time in this lane.
+- If staying in the logits/loss lane, only revisit backward-side fusion if the design avoids explicit layout packing and transpose materialization.
+- If revisiting finer-grained scaling, treat `_scaled_mm` rowwise as closed for this repo and require a different kernel path from the start.
+
+## Unexplored Big Gains
+
+- A true GEMM-class custom kernel for LM-head projection with on-the-fly local scaling.
+  - This is the only plausible route left for “finer-than-tensorwise scaling without paying the rowwise `_scaled_mm` penalty”.
+- A real cuBLASLt outer-vector/block-scaling prototype.
+  - This remains the most credible external-kernel path if we want per-row or per-block scaling and do not want to write a full GEMM kernel ourselves.
+- Re-profiling the broader model.
+  - The next meaningful speed leap may simply be outside the LM-head path at this point.
+
+## External checks
+
+- `2026-04-12`: TorchAO float8 was checked as a possible packaged rowwise/blockwise alternative.
+  - On `torch==2.9.1`, the compatible TorchAO release is `0.15.0`.
+  - Direct local training-shape benchmarks still came in much slower than the current `_scaled_mm` path:
+    - `_scaled_mm` tensorwise: about `0.01020 s`
+    - `_scaled_mm` rowwise: about `0.01084 s`
+    - TorchAO tensorwise: about `0.03734 s`
+    - TorchAO axiswise: about `0.03834 s`
+    - TorchAO axiswise with higher-precision grad-weight style config: about `0.03827 s`
+  - Decision:
+    - TorchAO is not a viable speed path on this stack.
