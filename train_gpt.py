@@ -39,6 +39,8 @@ class Hyperparameters:
     skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 3e1))
+    fp8_lm_head = bool(int(os.environ.get("FP8_LM_HEAD", "0")))
+    train_ce_float = bool(int(os.environ.get("TRAIN_CE_FLOAT", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 1e4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     rope_train_seq_len = int(os.environ.get("ROPE_TRAIN_SEQ_LEN", 2048))
@@ -440,6 +442,38 @@ class CastedLinear(nn.Linear):
         return F.linear(x, w, bias)
 
 
+class FP8LinearTensorwiseFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight):
+        x_2d = x.reshape(-1, x.size(-1))
+        x_scale = x_2d.detach().abs().amax().float().clamp_min(1e-12) / 448.0
+        w_scale = weight.detach().abs().amax().float().clamp_min(1e-12) / 448.0
+        x_fp8 = (x_2d / x_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+        w_fp8 = (weight / w_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+        y = torch._scaled_mm(
+            x_fp8,
+            w_fp8.t(),
+            scale_a=x_scale,
+            scale_b=w_scale,
+            out_dtype=x.dtype,
+        )
+        ctx.input_shape = x.shape
+        ctx.save_for_backward(x_2d, weight)
+        return y.view(*x.shape[:-1], weight.size(0))
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_2d, weight = ctx.saved_tensors
+        grad_2d = grad_output.reshape(-1, grad_output.size(-1))
+        grad_input = grad_2d @ weight.to(grad_2d.dtype)
+        grad_weight = grad_2d.transpose(0, 1) @ x_2d.to(grad_2d.dtype)
+        return grad_input.view(ctx.input_shape), grad_weight.to(weight.dtype)
+
+
+def fp8_linear_tensorwise(x, weight):
+    return FP8LinearTensorwiseFn.apply(x, weight)
+
+
 @triton.jit
 def linear_leaky_relu_square_kernel(
     a_desc,
@@ -733,9 +767,13 @@ class GPT(nn.Module):
         super().__init__()
         if h.logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {h.logit_softcap}")
+        if h.fp8_lm_head and not h.tie_embeddings:
+            raise ValueError("fp8_lm_head currently only supports tied embeddings")
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
+        self.fp8_lm_head = h.fp8_lm_head
+        self.train_ce_float = h.train_ce_float
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
@@ -960,7 +998,10 @@ class GPT(nn.Module):
         if self.head_proj is not None:
             x = self.head_proj(x)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            if self.training and self.fp8_lm_head:
+                logits_proj = fp8_linear_tensorwise(x, self.tok_emb.weight)
+            else:
+                logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
@@ -969,8 +1010,11 @@ class GPT(nn.Module):
         logits = self.forward_logits(
             input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
         )
+        logits_flat = logits.reshape(-1, logits.size(-1))
+        if self.train_ce_float:
+            logits_flat = logits_flat.float()
         return F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)).float(),
+            logits_flat,
             target_ids.reshape(-1),
             reduction="mean",
         )
