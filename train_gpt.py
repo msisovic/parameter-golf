@@ -473,31 +473,135 @@ def fp8_linear_tensorwise(x, weight, weight_fp8_t, w_scale):
     return FP8LinearTensorwiseFn.apply(x, weight, weight_fp8_t, w_scale)
 
 
+@triton.jit
+def fused_softcap_ce_fwd_kernel(
+    logits_ptr,
+    losses_ptr,
+    lse_ptr,
+    targets_ptr,
+    stride_logits_n,
+    stride_logits_v,
+    n_rows,
+    n_cols,
+    A,
+    C,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+    max_val = -float("inf")
+    sum_exp = 0.0
+    inv_C = 1.0 / C
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float("inf")).to(tl.float32)
+        z = A * tl.sigmoid(val * inv_C)
+        z = tl.where(mask, z, -float("inf"))
+        curr_max = tl.max(z, axis=0)
+        new_max = tl.maximum(max_val, curr_max)
+        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
+        max_val = new_max
+    lse = max_val + tl.log(sum_exp)
+    tl.store(lse_ptr + row_idx, lse)
+    target = tl.load(targets_ptr + row_idx).to(tl.int32)
+    val_target = tl.load(logits_row_ptr + target).to(tl.float32)
+    z_target = A * tl.sigmoid(val_target * inv_C)
+    tl.store(losses_ptr + row_idx, lse - z_target)
+
+
+@triton.jit
+def fused_softcap_ce_bwd_kernel(
+    grad_input_ptr,
+    grad_output_ptr,
+    lse_ptr,
+    logits_ptr,
+    targets_ptr,
+    stride_logits_n,
+    stride_logits_v,
+    stride_grad_n,
+    stride_grad_v,
+    n_rows,
+    n_cols,
+    A,
+    C,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+    grad_row_ptr = grad_input_ptr + row_idx * stride_grad_n
+    lse = tl.load(lse_ptr + row_idx)
+    grad_loss = tl.load(grad_output_ptr + row_idx)
+    target = tl.load(targets_ptr + row_idx).to(tl.int32)
+    inv_C = 1.0 / C
+    inv_C_A = inv_C * A
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        sigmoid_u = tl.sigmoid(val * inv_C)
+        z = A * sigmoid_u
+        p = tl.exp(z - lse)
+        grad_z = grad_loss * (p - tl.where(cols == target, 1.0, 0.0))
+        grad_x = grad_z * (inv_C_A * sigmoid_u * (1.0 - sigmoid_u))
+        tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
+
+
 class FusedSoftcapCrossEntropyFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, targets, softcap):
         logits_2d = logits.reshape(-1, logits.size(-1))
         targets_1d = targets.reshape(-1)
-        tanh_out = torch.tanh(logits_2d / softcap)
-        soft_logits = (softcap * tanh_out).float()
-        logsumexp = torch.logsumexp(soft_logits, dim=-1)
-        target_logits = soft_logits.gather(1, targets_1d[:, None]).squeeze(1)
-        loss = (logsumexp - target_logits).mean()
+        logits_2d = logits_2d.contiguous()
+        targets_1d = targets_1d.contiguous()
+        losses = torch.empty(logits_2d.size(0), dtype=torch.float32, device=logits.device)
+        lse = torch.empty_like(losses)
+        # c * tanh(x / c) is CE-equivalent to 2c * sigmoid(2x / c) up to a row-wise constant.
+        A = float(2.0 * softcap)
+        C = float(softcap / 2.0)
+        fused_softcap_ce_fwd_kernel[(logits_2d.size(0),)](
+            logits_2d,
+            losses,
+            lse,
+            targets_1d,
+            logits_2d.stride(0),
+            logits_2d.stride(1),
+            logits_2d.size(0),
+            logits_2d.size(1),
+            A,
+            C,
+            BLOCK_SIZE=2048,
+            num_warps=2,
+        )
         ctx.input_shape = logits.shape
-        ctx.softcap = softcap
-        ctx.num_targets = targets_1d.numel()
-        ctx.save_for_backward(tanh_out, targets_1d)
-        return loss
+        ctx.save_for_backward(logits_2d, targets_1d, lse)
+        ctx.A = A
+        ctx.C = C
+        return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        tanh_out, targets_1d = ctx.saved_tensors
-        soft_logits = (ctx.softcap * tanh_out).float()
-        probs = torch.softmax(soft_logits, dim=-1)
-        probs[torch.arange(targets_1d.numel(), device=targets_1d.device), targets_1d] -= 1.0
-        grad_logits = probs.mul_(1.0 - tanh_out.float().square())
-        grad_logits.mul_(grad_output.float() / ctx.num_targets)
-        return grad_logits.view(ctx.input_shape).to(tanh_out.dtype), None, None
+        logits_2d, targets_1d, lse = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty_like(logits_2d, dtype=torch.bfloat16)
+        fused_softcap_ce_bwd_kernel[(logits_2d.size(0),)](
+            grad_input,
+            grad_output,
+            lse,
+            logits_2d,
+            targets_1d,
+            logits_2d.stride(0),
+            logits_2d.stride(1),
+            grad_input.stride(0),
+            grad_input.stride(1),
+            logits_2d.size(0),
+            logits_2d.size(1),
+            ctx.A,
+            ctx.C,
+            BLOCK_SIZE=1024,
+            num_warps=4,
+        )
+        return grad_input.view(ctx.input_shape), None, None
 
 
 def fused_softcap_cross_entropy(logits, targets, softcap):
@@ -1081,7 +1185,7 @@ class GPT(nn.Module):
         )
         logits = self._project_logits(x)
         if self.training and self.fused_softcap_ce:
-            return fused_softcap_cross_entropy(logits, target_ids, self.logit_softcap)
+            return fused_softcap_cross_entropy(logits, target_ids, self.logit_softcap).mean()
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         logits_flat = logits.reshape(-1, logits.size(-1))
         if self.train_ce_float:
