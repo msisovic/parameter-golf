@@ -18,6 +18,12 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - `TRAIN_CE_FLOAT=0` removes the training-only FP32 cast before CE. Eval stays FP32.
 - `FP8_LM_HEAD=1` enables the training-only tied LM-head FP8 forward path. Eval stays on the reference path.
 - `TTT_ENABLED=0` is used for these speed runs to avoid post-train TTT work contaminating wallclock.
+- Compile latency note:
+  - this model often has a long `torch.compile` / Inductor phase even on known-good baselines
+  - capped wallclock starts after compilation in this setup
+  - do not treat long compilation by itself as evidence that an experiment regressed
+  - only judge experiments from post-compile training checkpoints and capped-run results
+  - caveat: if a new variant repeatedly shows compile time that is clearly at least `2x` a comparable recent run, that is a real concern worth noting, but still not enough by itself to reject the variant without post-compile data
 
 ## Results
 
@@ -106,3 +112,70 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - Follow-up worth trying next:
   - Port the deeper modded-nanogpt `#207` idea: fuse LM-head quantization into the Triton loss path instead of keeping “FP8 head” and “fused softcap+CE” as separate stages.
   - That is the clearest remaining path if we want to push beyond the current `+2.54%` stacked win in the logits/loss lane.
+
+## Current iteration
+
+- `2026-04-12`: tried switching the training-only FP8 tied LM head from tensorwise activation scaling to rowwise activation scaling.
+- Result: rejected due to throughput regression on the active stack `FP8_LM_HEAD=1 FUSED_SOFTCAP_CE=1`.
+- Early-run throughput comparison:
+  - previous kept stack: `500/1000/1500 tok/s = 8415493 / 8364411 / 8349760`
+  - rowwise attempt: `500/1000/1500 tok/s = 8333582 / 8284839 / 8268338`
+  - plain baseline without logits/loss kernels: `8241348 / 8211974 / 8210145`
+- Takeaway:
+  - rowwise `_scaled_mm` scaling is materially slower here and gives back too much of the head-path speedup
+  - even though it may improve FP8 approximation quality, it is not a viable direction unless the projection is fused more deeply than the current standalone `_scaled_mm` path
+- Decision:
+  - revert to tensorwise FP8 LM-head scaling
+  - keep the Triton fused softcap+CE path
+  - next worthwhile direction remains full Triton fusion of FP8 projection plus loss rather than a slower rowwise `_scaled_mm` variant
+- Why it was slower:
+  - the rowwise attempt did not just change numerical granularity; it changed both the pre-matmul quantization work and the `_scaled_mm` scaling mode
+  - compared with tensorwise scaling, rowwise scaling adds:
+    - a per-row `amax(dim=1, keepdim=True)` reduction instead of one global `amax`
+    - materialization of an `(M, 1)` activation-scale tensor
+    - broadcast divide by per-row scales before the FP8 cast
+    - rowwise `_scaled_mm` inputs with `(M, 1)` `scale_a` and `(1, vocab)` `scale_b`
+  - targeted GPU microbenchmarks on this stack showed the slowdown comes from both pieces:
+    - at approximately training-like shapes (`M=98304, K=512, N=8192`), `_scaled_mm` alone was about `0.000864 s` tensorwise vs `0.001434 s` rowwise
+    - the scale+quantize step was about `0.000334 s` tensorwise vs `0.000462 s` rowwise
+  - interpretation:
+    - rowwise quantization is slower because it adds extra unfused memory traffic before the matmul
+    - rowwise `_scaled_mm` also appears to take a materially slower kernel path than scalar-scale `_scaled_mm` on Hopper/PyTorch in this setup
+  - implication for future work:
+    - if finer-grained scaling is still desirable, it should likely be done inside a deeper Triton fusion of FP8 LM-head projection plus softcap+CE, rather than via standalone rowwise `_scaled_mm`
+
+- `2026-04-12`: first full FP8-head + fused softcap+CE integration attempt was much slower at the first checkpoint:
+  - `500/20000 train_loss: 3.2521 train_time: 1.4m tok/s: 4640985`
+  - this is an implementation regression, not a verdict on fusion in general; the initial kernel shape is being reworked
+
+- `2026-04-12`: after fixing the worst kernel-shape issue and reusing forward logits in backward, the 500-step fused check recovered most of the lost speed:
+  - run log: `logs/fused_fp8_softcap_ce_storelogits_500_20260412.txt`
+  - `500/500 train_loss: 3.2556 train_time: 0.8m tok/s: 8323715`
+  - `500/500 val_loss: 3.2993 val_bpb: 1.2772`
+  - comparison:
+    - much better than the broken first fused attempt (`4640985 tok/s`)
+    - still a bit behind the current kept stack at the same point (`8415493 tok/s`)
+  - current read:
+    - the catastrophic regression came from the original one-row-per-program forward kernel shape
+    - fusion is now in the right performance neighborhood, but there is still a remaining gap before it beats the kept non-fused stack
+
+- `2026-04-12`: simplified the experimental fusion into a wrapper around the current fast pieces (`_scaled_mm` projection + existing Triton softcap CE kernels) to isolate autograd-boundary overhead.
+  - run log: `logs/fused_fp8_softcap_ce_wrapper_500_20260412.txt`
+  - `500/500 train_loss: 3.2558 train_time: 0.8m tok/s: 8409948`
+  - `500/500 val_loss: 3.2991 val_bpb: 1.2771`
+  - read:
+    - this is the fastest result so far in the experimental fused-LM-head sub-track
+    - speed is still just under the kept stack (`8415493 tok/s`), so the wrapper itself does not create a real win
+    - the remaining gap is likely from small composition overhead, not from the CE kernels themselves
+
+- `2026-04-12`: replaced the eager tensorwise FP8 activation quantization (`div -> clamp -> cast -> contiguous`) with a Triton tensorwise quantizer behind `FP8_LM_HEAD_TRITON_QUANT=1`.
+  - run log: `logs/fused_ce_fp8_triton_quant_500_20260412b.txt`
+  - `500/500 train_loss: 3.2487 train_time: 0.8m tok/s: 8399429`
+  - `500/500 val_loss: 3.2994 val_bpb: 1.2773`
+  - comparison vs wrapper:
+    - slightly slower throughput (`8399429` vs `8409948`)
+    - materially better early train loss (`3.2487` vs `3.2558`)
+  - interpretation:
+    - the Triton quantizer is not numerically identical to the eager PyTorch FP8 cast path
+    - on local checks it changed logits and gradients slightly, so this is acting as a different quantization/noise regime rather than a pure implementation cleanup
+    - promising for optimization signal, but not yet a speed win and not enough by itself to claim a better capped result
