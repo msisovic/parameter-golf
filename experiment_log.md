@@ -33,6 +33,7 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - Throughput: `119.98 ms/step`, `6.55M tok/s`
 - Final capped validation: `4894/20000 val_loss: 2.7728 val_bpb: 1.0734`
 - Delta vs baseline: `+56` steps, about `+1.14%`
+- Updated expectation after Stage 1: FP8 tied head looks like a real but modest win here; revise head-only expectation to roughly `+0.5%` to `+1.5%`, centered near `+1.1%`
 
 ### Stage 1 + Stage 2: FP8 tied LM head + BF16 training CE
 
@@ -47,3 +48,4 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - Final capped validation: `4893/20000 val_loss: 2.7731 val_bpb: 1.0735`
 - Delta vs baseline: `+55` steps, about `+1.14%`
 - Delta vs Stage 1: `-1` step, so this does not improve the stack and should be left off for now
+- Updated expectation after Stage 1+2: the stacked target should come down materially; with CE-cast removal not helping, the currently supported stack is still about `+1%`, not `+3%` to `+5%`
