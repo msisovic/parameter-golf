@@ -1018,10 +1018,7 @@ class GPT(nn.Module):
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            if i >= psl and psl > 0:
-                if lane0 is None:
-                    lane0 = x
-                    lane1 = x
+            if lane0 is None:
                 if skip_idx < self.num_skip_weights and skips:
                     x = self._apply_skip_single(x, skips.pop(), skip_idx)
                 if i >= psl and psl > 0:
@@ -1126,10 +1123,7 @@ class GPT(nn.Module):
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            if i >= psl and psl > 0:
-                if lane0 is None:
-                    lane0 = x
-                    lane1 = x
+            if lane0 is None:
                 if skip_idx < self.num_skip_weights and skips:
                     x = self._apply_skip_single(x, skips.pop(), skip_idx)
                 if i >= psl and psl > 0:
