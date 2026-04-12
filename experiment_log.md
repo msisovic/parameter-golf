@@ -35,6 +35,20 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - Delta vs baseline: `+56` steps, about `+1.14%`
 - Updated expectation after Stage 1: FP8 tied head looks like a real but modest win here; revise head-only expectation to roughly `+0.5%` to `+1.5%`, centered near `+1.1%`
 
+### Stage 1a: cached FP8 tied-head weight refresh per optimizer step
+
+```bash
+TTT_ENABLED=0 SEED=0 PARALLEL_RESIDUAL_START=8 GPTQ_RESERVE_SECONDS=13 FP8_LM_HEAD=1 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+- Run log: `logs/da02ed03-abb5-4e05-95a0-cea890874231.txt`
+- Result: `4894` steps in `587186 ms`
+- Throughput: `119.98 ms/step`, `6.55M tok/s`
+- Final capped validation: `4894/20000 val_loss: 2.7737 val_bpb: 1.0738`
+- Delta vs prior Stage 1: no measurable speed improvement in capped wallclock terms
+- Conclusion: quantizing the tied weight once per optimizer step is cleaner, but it does not improve end-to-end step count over the original FP8-head prototype
+
 ### Stage 1 + Stage 2: FP8 tied LM head + BF16 training CE
 
 ```bash

@@ -444,15 +444,13 @@ class CastedLinear(nn.Linear):
 
 class FP8LinearTensorwiseFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight):
+    def forward(ctx, x, weight, weight_fp8_t, w_scale):
         x_2d = x.reshape(-1, x.size(-1))
         x_scale = x_2d.detach().abs().amax().float().clamp_min(1e-12) / 448.0
-        w_scale = weight.detach().abs().amax().float().clamp_min(1e-12) / 448.0
         x_fp8 = (x_2d / x_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
-        w_fp8 = (weight / w_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
         y = torch._scaled_mm(
             x_fp8,
-            w_fp8.t(),
+            weight_fp8_t,
             scale_a=x_scale,
             scale_b=w_scale,
             out_dtype=x.dtype,
@@ -467,11 +465,11 @@ class FP8LinearTensorwiseFn(torch.autograd.Function):
         grad_2d = grad_output.reshape(-1, grad_output.size(-1))
         grad_input = grad_2d @ weight.to(grad_2d.dtype)
         grad_weight = grad_2d.transpose(0, 1) @ x_2d.to(grad_2d.dtype)
-        return grad_input.view(ctx.input_shape), grad_weight.to(weight.dtype)
+        return grad_input.view(ctx.input_shape), grad_weight.to(weight.dtype), None, None
 
 
-def fp8_linear_tensorwise(x, weight):
-    return FP8LinearTensorwiseFn.apply(x, weight)
+def fp8_linear_tensorwise(x, weight, weight_fp8_t, w_scale):
+    return FP8LinearTensorwiseFn.apply(x, weight, weight_fp8_t, w_scale)
 
 
 @triton.jit
@@ -774,6 +772,8 @@ class GPT(nn.Module):
         self.logit_softcap = h.logit_softcap
         self.fp8_lm_head = h.fp8_lm_head
         self.train_ce_float = h.train_ce_float
+        self.register_buffer("fp8_lm_head_weight_t", None, persistent=False)
+        self.register_buffer("fp8_lm_head_weight_scale", None, persistent=False)
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
@@ -891,6 +891,18 @@ class GPT(nn.Module):
                 ):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
+    @torch.no_grad()
+    def refresh_fp8_lm_head_cache(self):
+        if not (self.tie_embeddings and self.fp8_lm_head):
+            self.fp8_lm_head_weight_t = None
+            self.fp8_lm_head_weight_scale = None
+            return
+        weight = self.tok_emb.weight.detach()
+        w_scale = weight.abs().amax().float().clamp_min(1e-12) / 448.0
+        w_fp8 = (weight / w_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+        self.fp8_lm_head_weight_t = w_fp8.t()
+        self.fp8_lm_head_weight_scale = w_scale
+
     def _bank_weights(self, i):
         n = self.num_layers
         return (
@@ -999,7 +1011,14 @@ class GPT(nn.Module):
             x = self.head_proj(x)
         if self.tie_embeddings:
             if self.training and self.fp8_lm_head:
-                logits_proj = fp8_linear_tensorwise(x, self.tok_emb.weight)
+                if self.fp8_lm_head_weight_t is None or self.fp8_lm_head_weight_scale is None:
+                    self.refresh_fp8_lm_head_cache()
+                logits_proj = fp8_linear_tensorwise(
+                    x,
+                    self.tok_emb.weight,
+                    self.fp8_lm_head_weight_t,
+                    self.fp8_lm_head_weight_scale,
+                )
             else:
                 logits_proj = F.linear(x, self.tok_emb.weight)
         else:
@@ -2442,6 +2461,7 @@ def timed_eval(label, fn, *args, **kwargs):
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
+    base_model.refresh_fp8_lm_head_cache()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     compiled_forward_logits = torch.compile(
         base_model.forward_logits, dynamic=False, fullgraph=True
@@ -2499,6 +2519,7 @@ def train_model(h, device, val_data):
         if h.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
         optimizers.step(distributed=h.distributed)
+        base_model.refresh_fp8_lm_head_cache()
         return train_loss
 
     if h.warmup_steps > 0:
@@ -2564,6 +2585,7 @@ def train_model(h, device, val_data):
         for (opt, state) in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         optimizers.zero_grad_all()
+        base_model.refresh_fp8_lm_head_cache()
         train_loader = DocumentPackingLoader(h, device)
     ema_state = {
         name: t.detach().float().clone()
