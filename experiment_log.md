@@ -79,3 +79,18 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - Partial validation:
   - `4000/20000 val_loss: 2.8677 val_bpb: 1.1101`
 - Conclusion: this Python-level custom autograd fusion is not a viable speed path; it loses to the optimized stock CE kernel
+
+### Stage 1 + Stage 3b: Triton fused softcap + CE
+
+```bash
+TTT_ENABLED=0 SEED=0 PARALLEL_RESIDUAL_START=8 GPTQ_RESERVE_SECONDS=13 FP8_LM_HEAD=1 FUSED_SOFTCAP_CE=1 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+- Run log: `logs/fb5d3d09-4bb9-4fa0-9fb7-44785a8df84f.txt`
+- Result: `4961` steps in `587107 ms`
+- Throughput: `118.34 ms/step`, `6.65M tok/s`
+- Final capped validation: `4961/20000 val_loss: 2.7724 val_bpb: 1.0732`
+- Delta vs baseline: `+123` steps, about `+2.54%`
+- Delta vs kept Stage 1 stack: `+67` steps, about `+1.37%`
+- Conclusion: unlike the Python-level fusion, the Triton kernel is a real stacked win here and should stay in the active stack
