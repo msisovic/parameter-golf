@@ -1160,23 +1160,13 @@ class GPT(nn.Module):
                 x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
-        x = self.final_norm(x)
-        if self.head_proj is not None:
-            x = self.head_proj(x)
-        if self.tie_embeddings:
-            if self.training and self.fp8_lm_head:
-                if self.fp8_lm_head_weight_t is None or self.fp8_lm_head_weight_scale is None:
-                    self.refresh_fp8_lm_head_cache()
-                logits_proj = fp8_linear_tensorwise(
-                    x,
-                    self.tok_emb.weight,
-                    self.fp8_lm_head_weight_t,
-                    self.fp8_lm_head_weight_scale,
-                )
-            else:
-                logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
+        return x
+
+    def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
+        x = self._forward_features(
+            input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+        )
+        logits_proj = self._project_logits(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids, target_ids, cu_seqlens=None, max_seqlen=0):
