@@ -1,0 +1,267 @@
+
+NOTICE: Existing SQLite export found: nsys_exp_fused_fp8_softcap_ce.sqlite
+        It is assumed file was previously exported from: nsys_exp_fused_fp8_softcap_ce.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [nsys_exp_fused_fp8_softcap_ce.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+
+ ** CUDA GPU Kernel Summary (cuda_gpu_kern_sum):
+
+ Time (%)  Total Time (ns)  Instances  Avg (ns)   Med (ns)   Min (ns)  Max (ns)  StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  ---------  ---------  --------  --------  -----------  ----------------------------------------------------------------------------------------------------
+     13.2       3742306366       3520  1063155.2  1058209.5    948515   1315457      46833.9  void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnBwdSm90<flash::CollectiveMa…
+     12.9       3670113475       7040   521322.9   519490.0    491970    592288      12048.2  linear_leaky_relu_square_kernel                                                                     
+      8.3       2370368693      17920   132275.0    87168.0     55424   1084547     151594.8  nvjet_tst_256x128_64x4_1x2_h_bz_coopA_NNT                                                           
+      6.6       1866174993       7040   265081.7   264864.0    252896    306272       4080.9  nvjet_tst_256x128_64x4_1x2_h_bz_coopA_splitK_NTT                                                    
+      5.6       1600195761      10560   151533.7    88064.0     83488    314401      90833.5  nvjet_tst_256x128_64x4_1x2_h_bz_coopA_TNT                                                           
+      5.3       1511346049       3520   429359.7   426305.0    362881    520928      29478.1  void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMa…
+      2.0        580662918       1280   453642.9    87312.0     37184  16036903    1207649.5  ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)         
+      1.9        550470297       7040    78191.8    78816.0     70432     89761       2502.5  nvjet_tst_128x128_64x6_2x1_v_bz_splitK_NTT                                                          
+      1.9        543452675       3520   154390.0   154976.0    149409    158880       2081.4  void cutlass::device_kernel<flash::FlashAttnBwdPreprocess<cute::tuple<cute::C<(int)128>, cute::C<(i…
+      1.4        401377986       7040    57013.9    56864.0     54112     62784       1315.7  nvjet_tst_128x256_64x4_2x1_v_bz_coopA_TNN                                                           
+      1.4        392779785       7040    55792.6    55328.0     53376     63616       1746.3  nvjet_tst_128x64_64x8_1x2_h_bz_splitK_NTT                                                           
+      1.4        385745222       7040    54793.4    54784.0     51968     57920        983.7  void cutlass::device_kernel<flash::FlashAttnBwdPostprocessConvertdQ<cute::tuple<cute::C<(int)128>, …
+      1.4        384159517       3200   120049.8   119296.0    116448    126432       2144.6  triton_per_fused__to_copy__unsafe_view_add_clamp_min_div_empty_like_eq_expand_ge_masked_fill_mul_ne…
+      1.3        379012249       3520   107673.9   108448.0    102624    112320       2287.5  void cutlass::device_kernel<flash::FlashAttnBwdPostprocessConvertdQ<cute::tuple<cute::C<(int)128>, …
+      1.3        374444784       3520   106376.4   106336.0    103776    109760        769.3  triton_per_fused__fused_rms_norm_backward__to_copy__unsafe_view_add_empty_like_mul_select_backward_…
+      1.3        356647527       3520   101320.3   101344.0     99136    102688        347.3  triton_per_fused__to_copy__unsafe_view_add_empty_like_expand_mul_neg_select_squeeze_sum_unsqueeze_v…
+      1.2        350961614        320  1096755.0  1096770.0   1094467   1099556        865.6  fused_softcap_ce_bwd_kernel                                                                         
+      1.2        340262965       4800    70888.1    70048.0     67392     77376       2165.8  triton_red_fused_mul_sum_view_3                                                                     
+      1.2        328425875        320  1026330.9  1028690.5    987172   1066371      10024.4  nvjet_tst_256x128_64x4_1x2_h_bz_coopA_NTT                                                           
+      1.1        326789577       3520    92837.9    92896.0     90816     95168        509.7  triton_poi_fused__to_copy__unsafe_view_clamp_min_div_expand_mul_sub_unsqueeze_view_15               
+      1.0        279735650        320   874173.9   873552.5    843267    930849      11239.2  nvjet_qqtst_128x160_128x5_2x1_v_bz_coopA_algo2_TNT                                                  
+      0.9        268346848       8320    32253.2    37632.0       960     41792      13361.1  void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<c…
+      0.9        266357346       3520    75669.7    75904.0     74112     76864        630.5  triton_per_fused__unsafe_view_clamp_min_div_expand_mul_sum_unsqueeze_view_14                        
+      0.9        247304825        320   772827.6   769313.0    722402    851298      19726.5  fused_softcap_ce_fwd_kernel                                                                         
+      0.9        243753735       3520    69248.2    68736.0     66144     74945       1886.7  triton_red_fused_empty_like_mul_select_backward_sum_12                                              
+      0.8        234926058       3520    66740.4    67008.0     65088     68193        723.1  triton_poi_fused__to_copy_mul_unsqueeze_10                                                          
+      0.7        208392744       3520    59202.5    59328.0     57632     61056        697.9  triton_poi_fused__to_copy__unsafe_view_cat_mul_slice_view_9                                         
+      0.6        184354152       3520    52373.3    52224.0     50176     54080        711.2  triton_per_fused__fused_rms_norm_backward__unsafe_view_add_empty_like_select_backward_slice_view_8  
+      0.6        181620165        320   567563.0   567553.0    565600    569889        721.9  triton_per_fused__fused_rms_norm_backward__to_copy__unsafe_view_add_fill_mul_select_sigmoid_sub_sum…
+      0.6        166657381       3520    47345.8    47328.0     45632     49376        574.4  triton_per_fused__unsafe_view_clamp_min_div_expand_linalg_vector_norm_view_13                       
+      0.6        157144284        320   491075.9   491041.5    489664    492993        505.7  triton_per_fused__fused_rms_norm_backward__to_copy__unsafe_view_add_fill_lerp_mul_select_sigmoid_su…
+      0.5        149607081       3520    42502.0    42208.0     41568     43840        558.6  triton_per_fused__to_copy__unsafe_view_add_mean_pow_rsqrt_view_7                                    
+      0.5        149202999        320   466259.4   466273.0    464096    468449        739.0  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_select_unsqueeze_view_11                 
+      0.5        142680059        320   445875.2   445872.5    443968    447969        766.0  triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_select_unsqueeze_view_79              
+      0.5        135423799        320   423199.4   423040.5    422561    424768        492.9  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_select_unsqueeze_view_35                 
+      0.5        135032976        320   421978.0   421376.5    415264    438144       3047.0  triton_red_fused__to_copy_add_mul_select_sum_unsqueeze_view_48                                      
+      0.5        132352365        320   413601.1   413489.0    411521    420768       1072.8  triton_per_fused__to_copy__unsafe_view_add_lerp_mean_mul_pow_rsqrt_select_sigmoid_sub_unsqueeze_vie…
+      0.4        125188013        320   391212.5   391281.0    389762    392191        479.8  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_select_sigmoid_unsqueeze_view_27         
+      0.4        124533071       3520    35378.7    35232.0     34048     39168        686.0  triton_poi_fused__to_copy_add_empty_like_mul_neg_select_backward_slice_slice_backward_unsqueeze_9   
+      0.4        123097778        320   384680.6   384177.0    376160    409280       3853.0  triton_red_fused__to_copy_fill_mul_select_sigmoid_sub_sum_unsqueeze_view_41                         
+      0.4        120027697       3520    34098.8    33920.0     32960     36992        647.8  triton_poi_fused__to_copy__unsafe_view_add_cat_mul_neg_slice_view_8                                 
+      0.4        118494527       1280    92573.8    96368.5     35968    162400      41483.6  ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)                      
+      0.4        109553326        320   342354.1   342242.0    340800    344416        719.7  triton_per_fused__to_copy_add_lerp_mean_mul_pow_rsqrt_select_sigmoid_unsqueeze_view_67              
+      0.4        106949440      18560     5762.4     1504.0      1248     49984      12043.2  void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::arr…
+      0.4        106786436        320   333707.6   333601.0    332128    337089        747.0  triton_per_fused__fused_rms_norm_backward__to_copy__unsafe_view_add_mul_select_sum_unsqueeze_view_1 
+      0.4        106685420        320   333391.9   332912.5    328225    346112       2620.7  triton_red_fused__to_copy__unsafe_view_add_lerp_mul_select_sigmoid_sub_sum_unsqueeze_view_23        
+      0.4        104993886        320   328105.9   328448.0    314432    339617       4236.3  triton_per_fused__fused_rms_norm_backward__to_copy_add_embedding_dense_backward_mul_select_unsqueez…
+      0.4        101776669        320   318052.1   317664.0    313441    324865       1972.3  triton_red_fused__to_copy__unsafe_view_add_mul_select_sum_unsqueeze_view_19                         
+      0.4        101322071       3520    28784.7    28544.0     27872     30528        562.7  triton_poi_fused__to_copy__unsafe_view_cat_mul_slice_view_4                                         
+      0.3         95566131        320   298644.2   298608.5    297024    300129        491.1  triton_per_fused__fused_rms_norm_backward__to_copy_add_fill_mul_select_sigmoid_sub_unsqueeze_view_33
+      0.3         95203249        320   297510.2   297505.0    296161    298848        436.3  triton_per_fused__fused_rms_norm_backward__to_copy_add_fill_mul_select_sigmoid_sub_unsqueeze_view_31
+      0.3         84839016       3520    24102.0    23904.0     23136     25568        507.4  triton_per_fused__to_copy__unsafe_view_add_mean_pow_rsqrt_view_2                                    
+      0.3         83686579        320   261520.6   261057.0    254273    279873       2990.3  triton_red_fused__to_copy_add_fill_lerp_mul_select_sigmoid_sub_sum_unsqueeze_view_43                
+      0.3         83668481        320   261464.0   261695.5    260320    262561        599.1  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_select_unsqueeze_view_37                 
+      0.3         82821678      18560     4462.4     1536.0      1152     32960       7939.7  void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, floa…
+      0.3         76708623        320   239714.4   239344.5    234049    249920       2230.0  triton_red_fused__to_copy_mul_sum_47                                                                
+      0.3         75431133       3520    21429.3    21696.0     15808     24128       1679.7  triton_poi_fused__to_copy_add_empty_like_mul_neg_select_backward_slice_slice_backward_7             
+      0.3         74775154      21120     3540.5     3136.0      2080      5920       1210.0  void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat1…
+      0.3         74465713        320   232705.4   232688.5    231073    235009        788.4  triton_per_fused__to_copy_add_lerp_mean_mul_pow_rsqrt_select_sigmoid_unsqueeze_view_60              
+      0.3         74300099        320   232187.8   232097.0    230720    234976        706.1  triton_per_fused__to_copy_add_lerp_mean_mul_pow_rsqrt_select_sigmoid_unsqueeze_view_53              
+      0.3         73558241        320   229869.5   229632.0    228992    231264        594.2  triton_per_fused__fused_rms_norm_backward__to_copy_add_fill_mul_select_sigmoid_sub_unsqueeze_view_29
+      0.3         73476855        320   229615.2   229408.0    228769    231136        527.2  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_select_sigmoid_unsqueeze_view_25         
+      0.2         64100052        320   200312.7   200352.0    198720    202496        573.7  triton_per_fused__to_copy_add_lerp_mean_mul_pow_rsqrt_select_sigmoid_unsqueeze_view_46              
+      0.2         63793308        320   199354.1   199360.0    197760    201056        474.3  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_select_unsqueeze_view_18                           
+      0.2         63752918        320   199227.9   199232.0    197728    200544        446.7  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_select_unsqueeze_view_25                           
+      0.2         63706774        320   199083.7   199072.0    197632    200288        440.6  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_select_unsqueeze_view_32                           
+      0.2         63610867        320   198784.0   198785.0    197280    200640        526.2  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_select_unsqueeze_view_39                           
+      0.2         62831384       3520    17849.8    17600.0     17120     20320        593.0  triton_poi_fused__to_copy__unsafe_view_add_cat_mul_neg_slice_view_3                                 
+      0.2         62626964        320   195709.3   195680.0    193889    198080        627.6  triton_per_fused__to_copy__unsafe_view_abs_add_amax_mean_mul_pow_rsqrt_select_unsqueeze_view_84     
+      0.2         62502065        320   195319.0   195328.0    193728    196512        416.0  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_select_unsqueeze_view_38                 
+      0.2         62446159        320   195144.2   195169.0    193696    197056        469.0  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_select_unsqueeze_view_36                 
+      0.2         54137226        320   169178.8   169343.5    167680    170561        664.9  triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_select_unsqueeze_view_16              
+      0.2         54136228        320   169175.7   169296.5    167328    171232        710.9  triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_unsqueeze_view_44                     
+      0.2         53982046        320   168693.9   168832.0    167105    170528        724.1  triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_unsqueeze_view_23                     
+      0.2         53970306        320   168657.2   168784.5    167104    170880        740.5  triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_unsqueeze_view_65                     
+      0.2         53955045        320   168609.5   168768.0    167072    170721        699.3  triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_unsqueeze_view_30                     
+      0.2         53864195        320   168325.6   168512.0    166817    170017        701.6  triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_unsqueeze_view_37                     
+      0.2         53808486        320   168151.5   168416.0    166784    169377        669.9  triton_poi_fused__to_copy_add_mul_select_sub_unsqueeze_view_91                                      
+      0.2         53523584        320   167261.2   167424.0    162048    171553       1417.8  triton_red_fused__to_copy_fill_mul_select_sigmoid_sub_sum_unsqueeze_view_42                         
+      0.2         53168989        320   166153.1   166144.0    164769    168897        674.0  triton_per_fused__fused_rms_norm_backward__to_copy_add_fill_mul_select_sigmoid_sub_unsqueeze_view_30
+      0.2         52723803        320   164761.9   164896.5    163617    166112        556.8  triton_poi_fused__to_copy_add_mul_select_sub_unsqueeze_view_90                                      
+      0.2         52517118        320   164116.0   164208.0    162849    165504        574.3  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_select_sigmoid_unsqueeze_view_28         
+      0.2         52316542        320   163489.2   163680.0    162336    164672        565.0  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_select_sigmoid_unsqueeze_view_26         
+      0.2         52149667        320   162967.7   163056.5    161825    164416        581.3  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_unsqueeze_view_24                        
+      0.2         52093409        320   162791.9   162816.5    161472    164448        633.4  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_unsqueeze_view_32                        
+      0.2         52083263        320   162760.2   162880.0    161344    164032        628.4  triton_per_fused__fused_rms_norm_backward__to_copy_add_mul_unsqueeze_view_34                        
+      0.2         50144855        320   156702.7   156880.5    155041    158176        750.9  triton_per_fused__to_copy__unsafe_view_add_clamp_min_div_empty_like_eq_expand_ge_masked_fill_mul_ne…
+      0.2         48236438       3520    13703.5     6720.0      1376     43200      13711.0  void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator…
+      0.2         42777115        320   133678.5   133552.0    132256    135584        716.6  triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_unsqueeze_view_51                     
+      0.2         42763325        320   133635.4   133441.0    132352    135392        722.8  triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_unsqueeze_view_58                     
+      0.1         40724583        320   127264.3   127168.0    124865    130304        837.7  triton_red_fused__to_copy_mul_sum_14                                                                
+      0.1         37684787        320   117765.0   117440.0    111072    131584       2842.4  triton_red_fused__to_copy_add_embedding_mean_mul_pow_rsqrt_select_unsqueeze_1                       
+      0.1         37568804        320   117402.5   117344.0    115648    120449        698.5  triton_red_fused__to_copy_mul_sum_51                                                                
+      0.1         36823844       5120     7192.2     7168.0      6592      8672        261.9  triton_red_fused__fused_rms_norm_backward__to_copy_mul_sum_unsqueeze_view_2                         
+      0.1         30520688        640    47688.6    46240.0     43040     57184       3347.6  triton_poi_fused__to_copy_add_select_backward_45                                                    
+      0.1         30060216        640    46969.1    47280.0     35840     59744      10187.5  void at::native::<unnamed>::multi_tensor_apply_kernel<at::native::<unnamed>::TensorListMetadata<(in…
+      0.1         27176274       2560    10615.7     4624.0      1120    177409      12441.1  void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::Te…
+      0.1         26028294        320    81338.4    81056.0     76768     91040       2063.1  ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)             
+      0.1         24953987       3200     7798.1     7808.0      7072      8640        262.5  nvjet_tst_64x64_64x13_2x1_v_bz_TNT                                                                  
+      0.1         20434464       9920     2059.9     1984.0      1792      3136        179.1  triton_red_fused__to_copy_mul_sum_15                                                                
+      0.1         20310855       3200     6347.1     6304.0      5792      7488        203.0  nvjet_tst_128x128_64x6_2x1_v_bz_NNT                                                                 
+      0.1         19073698       3520     5418.7     5376.0      4480      7136        352.4  void flash::prepare_varlen_num_blocks_kernel<(int)8, (bool)1>(int, int, int, const int *, const int…
+      0.1         18245569        640    28508.7    29072.5     19680     39232       8173.3  void at::native::<unnamed>::multi_tensor_apply_kernel<at::native::<unnamed>::TensorListMetadata<(in…
+      0.1         17592386        320    54976.2    54752.0     52192     61984       1369.8  void at::native::<unnamed>::multi_tensor_apply_kernel<at::native::<unnamed>::FusedOptimizerTensorLi…
+      0.1         16794392        320    52482.5    52672.0     51200     54816        742.0  triton_poi_fused__scaled_mm__to_copy_clamp_clamp_min_div_mul_view_86                                
+      0.0         14092535       3200     4403.9     4352.0      3936      5728        223.0  nvjet_tst_128x48_64x9_2x1_v_bz_NNT                                                                  
+      0.0         14058970       7040     1997.0     1952.0      1632      3232        147.9  triton_red_fused__to_copy_mul_squeeze_sum_view_4                                                    
+      0.0         13056338       3200     4080.1     4064.0      3680      5184        162.8  nvjet_tst_64x64_64x13_2x1_v_bz_NNT                                                                  
+      0.0         12220463        312    39168.2    35632.0     14592    164224      23680.7  ncclDevKernel_AllReduce_Sum_u64_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)              
+      0.0         11280336       1280     8812.8     4128.0      1056    181536      27120.4  void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std:…
+      0.0         10767475        320    33648.4    33136.0     29024     49921       3322.1  ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)              
+      0.0         10411055        320    32534.5    32480.0     31136     33952        448.4  triton_poi_fused__to_copy_add_select_backward_39                                                    
+      0.0          9777717       4800     2037.0     2080.0      1408      2816        426.5  triton_poi_fused_add_mul_3                                                                          
+      0.0          8934580        320    27920.6    27968.0     26816     28897        351.1  void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::n…
+      0.0          8751317       3520     2486.2     2464.0      2336      3232         82.3  triton_poi_fused_clone_89                                                                           
+      0.0          7864304       1280     6144.0     6128.0      3008     11872       2602.7  void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::n…
+      0.0          7635632       2560     2982.7     2912.0      1408      5632       1041.3  void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, …
+      0.0          7549898       1600     4718.7     4672.0      4256      5568        212.3  nvjet_tst_128x48_64x9_2x1_v_bz_TNT                                                                  
+      0.0          7160942        960     7459.3     4864.0      2976     16736       4900.3  triton_red_fused_linalg_vector_norm_0                                                               
+      0.0          6584937       1600     4115.6     3712.0      2496      6912       1186.2  void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::NormTwoOps…
+      0.0          6353296        320    19854.0    19776.0     18080     23328        669.7  void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl<at::native::…
+      0.0          6143628        320    19198.8    19136.0     17888     21760        527.7  void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl<at::native::…
+      0.0          5917894       1600     3698.7     3680.0      3392      4320        120.6  nvjet_tst_64x32_64x16_2x4_v_bz_TNT                                                                  
+      0.0          5578793       1600     3486.7     3488.0      3104      4160        121.0  nvjet_tst_64x64_64x13_4x2_v_bz_NNT                                                                  
+      0.0          5324933       1600     3328.1     3328.0      3072      3840        110.3  nvjet_tst_64x40_64x16_2x4_v_bz_NNT                                                                  
+      0.0          5203432        320    16260.7    15968.0     14240     21632       1562.9  triton_poi_fused__to_copy_add_select_backward_40                                                    
+      0.0          4799689        960     4999.7     4000.0      2528      9600       2412.2  triton_poi_fused_add_div_linalg_vector_norm_mul_6                                                   
+      0.0          4661293       3520     1324.2     1312.0      1152      2176         71.1  triton_per_fused__to_copy_empty_like_mul_select_backward_squeeze_sum_13                             
+      0.0          4570250        960     4760.7     3840.0      2432      9088       2237.3  triton_poi_fused_add_div_linalg_vector_norm_mul_5                                                   
+      0.0          4413098       1280     3447.7     4080.0      1984      5665       1012.6  void at::native::vectorized_elementwise_kernel<(int)8, at::native::AUnaryFunctor<c10::BFloat16, c10…
+      0.0          4286599        960     4465.2     3648.0      2336      8512       2037.0  triton_poi_fused_add_div_linalg_vector_norm_mul_4                                                   
+      0.0          4268521        960     4446.4     3648.0      1728      9536       2632.3  triton_poi_fused_add_mul_7                                                                          
+      0.0          4143363        640     6474.0     6560.0      4736      8928       1341.1  void at::native::<unnamed>::multi_tensor_apply_kernel<at::native::<unnamed>::FusedOptimizerTensorLi…
+      0.0          3984806        960     4150.8     3392.0      2144      7808       1870.5  triton_poi_fused_add_div_linalg_vector_norm_2                                                       
+      0.0          3922981       1280     3064.8     2720.0      1824      5152       1072.1  triton_poi_fused_add_mul_8                                                                          
+      0.0          3726309       3200     1164.5     1152.0       992      1792         68.3  triton_poi_fused__to_copy_add_select_backward_squeeze_16                                            
+      0.0          3142084        320     9819.0     9760.0      9088     11168        283.2  void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<c10::BFloat16, at::native::fu…
+      0.0          3110309        320     9719.7     9664.0      9376     11136        247.3  triton_poi_fused_add_embedding_dense_backward_53                                                    
+      0.0          2813888       1600     1758.7     1808.0      1568      2016        115.9  triton_poi_fused_add_mul_4                                                                          
+      0.0          2771429        640     4330.4     4288.0      4032      5984        281.1  triton_poi_fused__to_copy_select_t_45                                                               
+      0.0          2752196        320     8600.6     8576.0      8128      9440        176.5  void at::native::<unnamed>::multi_tensor_apply_kernel<at::native::<unnamed>::TensorListMetadata<(in…
+      0.0          2747235        640     4292.6     4224.0      3968      5984        312.1  triton_poi_fused__to_copy_select_t_24                                                               
+      0.0          2744611        640     4288.5     4256.0      3936      6112        300.3  triton_poi_fused__to_copy_select_t_17                                                               
+      0.0          2742916        640     4285.8     4224.0      3936      6016        332.3  triton_poi_fused__to_copy_select_t_66                                                               
+      0.0          2741225        640     4283.2     4224.0      3968      6080        321.7  triton_poi_fused__to_copy_select_t_31                                                               
+      0.0          2733446        640     4271.0     4224.0      3968      5952        285.4  triton_poi_fused__to_copy_select_t_38                                                               
+      0.0          2728515       1920     1421.1     1376.0      1184      2176        120.4  void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::launch_clamp_scalar(a…
+      0.0          2704034        640     4225.1     4192.0      3840      6176        318.6  triton_poi_fused__to_copy_select_t_52                                                               
+      0.0          2699813        640     4218.5     4160.0      3904      5952        291.5  triton_poi_fused__to_copy_select_t_59                                                               
+      0.0          2531849        640     3956.0     3904.0      3712      5440        207.5  triton_poi_fused__to_copy_select_t_72                                                               
+      0.0          2529731        320     7905.4     7840.0      7296      9216        313.3  triton_red_fused__to_copy_abs_amax_clamp_min_div_mul_view_85                                        
+      0.0          2514628        640     3929.1     3904.0      3744      5216        183.0  triton_poi_fused__to_copy_select_t_83                                                               
+      0.0          2494883        640     3898.3     3872.0      3712      5152        172.5  triton_poi_fused__to_copy_select_t_78                                                               
+      0.0          2247943        320     7024.8     6976.0      6752      7872        198.6  void at::native::vectorized_elementwise_kernel<(int)8, at::native::AbsFunctor<c10::BFloat16>, std::…
+      0.0          1708547        320     5339.2     5312.0      4960      6112        158.8  void at::native::vectorized_elementwise_kernel<(int)4, at::native::float8_copy_kernel_cuda(at::Tens…
+      0.0          1690177       1280     1320.5     1312.0      1152      2304        133.2  void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<float, float, floa…
+      0.0          1690021        320     5281.3     5184.0      4992      6465        298.9  triton_poi_fused_embedding_dense_backward_49                                                        
+      0.0          1519682        320     4749.0     4768.0      4448      5184        108.1  void at::native::vectorized_elementwise_kernel<(int)8, at::native::<unnamed>::launch_clamp_scalar(a…
+      0.0          1424807        320     4452.5     4416.0      4192      5024        159.4  triton_poi_fused_add_div_linalg_vector_norm_mul_transpose_7                                         
+      0.0          1175138        320     3672.3     3680.0      3488      3968         77.6  triton_per_fused_linalg_vector_norm_transpose_0                                                     
+      0.0          1145126        960     1192.8     1152.0      1088      1792         74.9  triton_per_fused_linalg_vector_norm_1                                                               
+      0.0          1136386        320     3551.2     3552.0      3424      3808         65.1  triton_poi_fused_add_div_linalg_vector_norm_mul_transpose_6                                         
+      0.0          1079491        640     1686.7     1696.0      1408      2368        158.9  void at::native::<unnamed>::multi_tensor_apply_kernel<at::native::<unnamed>::TensorListMetadata<(in…
+      0.0          1025601        320     3205.0     3168.0      3040      3616         95.2  triton_poi_fused_add_mul_9                                                                          
+      0.0           987425        320     3085.7     3040.0      2784      3584        120.6  triton_poi_fused_add_div_linalg_vector_norm_mul_transpose_5                                         
+      0.0           955009        320     2984.4     2976.0      2816      3360         74.4  triton_poi_fused_add_div_linalg_vector_norm_transpose_3                                             
+      0.0           868352        320     2713.6     2720.0      2624      3008         48.8  triton_poi_fused_add_mul_transpose_10                                                               
+      0.0           708644        320     2214.5     2176.0      1824      3392        213.4  triton_poi_fused__to_copy_select_t_6                                                                
+      0.0           703618        320     2198.8     2176.0      1824      3456        170.3  triton_poi_fused__to_copy_select_t_20                                                               
+      0.0           698560        320     2183.0     2176.0      1888      3360        119.4  triton_poi_fused__to_copy_select_t_81                                                               
+      0.0           697856        320     2180.8     2144.0      1824      3520        197.6  triton_poi_fused__to_copy_select_t_48                                                               
+      0.0           696194        320     2175.6     2176.0      1824      2944        114.0  triton_poi_fused__to_copy_select_t_34                                                               
+      0.0           688993        320     2153.1     2144.0      1760      3552        163.7  triton_poi_fused__to_copy_select_t_27                                                               
+      0.0           688513        320     2151.6     2144.0      1728      3424        171.2  triton_poi_fused__to_copy_select_t_55                                                               
+      0.0           685377        320     2141.8     2112.0      1760      3456        140.8  triton_poi_fused__to_copy_select_t_69                                                               
+      0.0           684929        320     2140.4     2144.0      1728      3328        128.5  triton_poi_fused__to_copy_select_t_41                                                               
+      0.0           683552        320     2136.1     2112.0      1952      3360        150.2  triton_poi_fused__to_copy_select_t_62                                                               
+      0.0           682592        320     2133.1     2144.0      1760      3424        176.0  triton_poi_fused__to_copy_select_t_75                                                               
+      0.0           667459        320     2085.8     2080.0      1888      2592         90.9  triton_poi_fused__to_copy_select_t_12                                                               
+      0.0           664512        320     2076.6     2080.0      1824      2912         83.7  triton_poi_fused__to_copy_select_t_50                                                               
+      0.0           661505        320     2067.2     2048.0      1888      2624         88.8  triton_poi_fused__to_copy_select_t_22                                                               
+      0.0           660449        320     2063.9     2048.0      1792      2944        107.7  triton_poi_fused__to_copy_select_t_29                                                               
+      0.0           658048        320     2056.4     2016.0      1728      2464        148.9  triton_poi_fused__to_copy_select_t_82                                                               
+      0.0           657216        320     2053.8     2048.0      1792      2528         89.8  triton_poi_fused__to_copy_select_t_36                                                               
+      0.0           656257        320     2050.8     2048.0      1888      2848        108.5  triton_poi_fused__to_copy_select_t_64                                                               
+      0.0           654752        320     2046.1     2048.0      1856      2304         78.4  triton_poi_fused__to_copy_select_t_43                                                               
+      0.0           653987        320     2043.7     2048.0      1856      2464         95.8  triton_poi_fused__to_copy_select_t_71                                                               
+      0.0           653282        320     2041.5     2032.0      1856      2688         89.1  triton_poi_fused__to_copy_select_t_57                                                               
+      0.0           653186        320     2041.2     2048.0      1824      2688        123.7  void at::native::lpnorm_cleanup<float, (at::native::NormType)1, float, float>(const T4 *, at::nativ…
+      0.0           651680        320     2036.5     2016.0      1888      2528         79.6  triton_poi_fused__to_copy_select_t_77                                                               
+      0.0           631777        320     1974.3     1952.0      1824      3136        155.5  triton_poi_fused__to_copy_select_t_26                                                               
+      0.0           629986        320     1968.7     1952.0      1792      3104        152.5  triton_poi_fused__to_copy_select_t_40                                                               
+      0.0           627840        320     1962.0     1952.0      1792      2912        118.7  triton_poi_fused__to_copy_select_t_5                                                                
+      0.0           627682        320     1961.5     1952.0      1536      2496        183.1  triton_poi_fused__to_copy_select_t_11                                                               
+      0.0           627552        320     1961.1     1952.0      1824      2912        111.4  triton_poi_fused__to_copy_select_t_33                                                               
+      0.0           627202        320     1960.0     1952.0      1824      3136        120.6  triton_poi_fused__to_copy_select_t_61                                                               
+      0.0           627010        320     1959.4     1920.0      1824      3104        150.1  triton_poi_fused__to_copy_select_t_68                                                               
+      0.0           626977        320     1959.3     1952.0      1792      3168        139.1  triton_poi_fused__to_copy_select_t_54                                                               
+      0.0           625216        320     1953.8     1920.0      1824      3040        128.2  triton_poi_fused__to_copy_select_t_47                                                               
+      0.0           623651        320     1948.9     1920.0      1792      3072        101.3  triton_poi_fused__to_copy_select_t_19                                                               
+      0.0           621281        320     1941.5     1920.0      1792      2976        106.1  triton_poi_fused__to_copy_select_t_80                                                               
+      0.0           620512        320     1939.1     1920.0      1792      3008        132.8  triton_poi_fused__to_copy_select_t_74                                                               
+      0.0           617248        320     1928.9     1920.0      1792      2240         68.0  triton_red_fused_mean_87                                                                            
+      0.0           613732        320     1917.9     1888.0      1568      2336        154.1  triton_poi_fused__to_copy_select_t_56                                                               
+      0.0           608000        320     1900.0     1888.0      1760      2304         68.7  triton_poi_fused__to_copy_select_t_0                                                                
+      0.0           607392        320     1898.1     1888.0      1504      2368        162.5  triton_poi_fused__to_copy_select_t_28                                                               
+      0.0           607264        320     1897.7     1888.0      1568      2400        163.9  triton_poi_fused__to_copy_select_t_35                                                               
+      0.0           606817        320     1896.3     1888.0      1440      2304        171.2  triton_poi_fused__to_copy_select_t_63                                                               
+      0.0           606113        320     1894.1     1888.0      1504      2368        166.8  triton_poi_fused__to_copy_select_t_49                                                               
+      0.0           604801        320     1890.0     1856.0      1568      2400        152.2  triton_poi_fused__to_copy_select_t_42                                                               
+      0.0           603809        320     1886.9     1888.0      1504      2464        156.4  triton_poi_fused__to_copy_select_t_21                                                               
+      0.0           597666        320     1867.7     1856.0      1504      2400        150.0  triton_poi_fused__to_copy_select_t_76                                                               
+      0.0           596929        320     1865.4     1856.0      1504      2368        151.6  triton_poi_fused__to_copy_select_t_70                                                               
+      0.0           542560        320     1695.5     1664.0      1536      1984         82.1  triton_poi_fused__to_copy_add_select_select_backward_sigmoid_sigmoid_backward_squeeze_44            
+      0.0           507392        320     1585.6     1600.0      1408      1856         89.4  triton_per_fused_linalg_vector_norm_transpose_1                                                     
+      0.0           479970        320     1499.9     1472.0      1376      2176         84.9  void at::native::lpnorm_cleanup<c10::BFloat16, (at::native::NormType)1, c10::BFloat16, float>(const…
+      0.0           478016        320     1493.8     1472.0      1408      1728         54.8  void at::native::vectorized_elementwise_kernel<(int)4, at::native::reciprocal_kernel_cuda(at::Tenso…
+      0.0           477568        320     1492.4     1472.0      1376      1856         76.5  triton_poi_fused__to_copy_add_select_backward_21                                                    
+      0.0           461152        320     1441.1     1408.0      1344      2016         90.8  triton_poi_fused_add_select_backward_22                                                             
+      0.0           452256        320     1413.3     1376.0      1280      1696         73.7  void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctorOnSelf_add<float>, st…
+      0.0           451776        320     1411.8     1408.0      1248      1632         86.9  triton_poi_fused__to_copy_add_select_backward_squeeze_46                                            
+      0.0           434880        320     1359.0     1312.0      1248      2496        132.9  triton_poi_fused_div_empty_like_expand_0                                                            
+      0.0           429184        320     1341.2     1312.0      1248      1696         74.9  triton_per_fused_mean_88                                                                            
+      0.0           425185        320     1328.7     1344.0      1216      1504         62.4  triton_per_fused_linalg_vector_norm_transpose_2                                                     
+      0.0           382946        320     1196.7     1184.0      1088      1536         59.1  triton_poi_fused__to_copy_add_select_backward_squeeze_52                                            
+
+Processing [nsys_exp_fused_fp8_softcap_ce.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-linux-x64/reports/cuda_api_sum.py]... 
+
+ ** CUDA API Summary (cuda_api_sum):
+
+ Time (%)  Total Time (ns)  Num Calls   Avg (ns)     Med (ns)    Min (ns)  Max (ns)   StdDev (ns)                     Name                   
+ --------  ---------------  ---------  -----------  -----------  --------  ---------  -----------  ------------------------------------------
+     76.9      14049503496        631   22265457.2      98014.0      4170   67135852   22935097.1  cudaStreamSynchronize                     
+      5.3        969866102     153280       6327.4       4795.0      2517    3365950       9233.3  cuLaunchKernel                            
+      4.1        749210715          7  107030102.1  105541101.0  94593236  119097439    9780261.5  cudaProfilerStop                          
+      4.1        741676724     111680       6641.1       5299.0      2756     409798       4321.8  cudaLaunchKernel                          
+      3.7        674213757      91199       7392.8       7872.0      2958      54708       3704.2  cuLaunchKernelEx                          
+      1.8        333862529          8   41732816.1   42157927.0  39018179   44393800    1968645.8  cudaDeviceSynchronize                     
+      1.5        269767547      50238       5369.8       4639.0      3759      68679       2233.9  cudaMemcpyAsync                           
+      1.2        225870241      36160       6246.4       5668.0      2289     116439       3618.0  cudaMemsetAsync                           
+      0.2         42575744     152960        278.3        250.0        86      28942        473.5  cuKernelGetAttribute                      
+      0.2         38942936       9562       4072.7       3450.0       792     396856       4958.5  cudaEventQuery                            
+      0.2         27569287      59840        460.7        390.0       138      23583        580.5  cuTensorMapEncodeTiled                    
+      0.1         26569948      10176       2611.0       1134.0       358    7600157      89290.4  cudaThreadExchangeStreamCaptureMode_v10010
+      0.1         20630383      31680        651.2        568.0       222      41349        680.3  cudaGetDriverEntryPoint_v11030            
+      0.1         18890012      12798       1476.0       1208.0       574      18669       1027.5  cudaStreamWaitEvent                       
+      0.1         16643844       3520       4728.4       4327.0      3450      16383       1395.1  cudaLaunchKernelExC_v11060                
+      0.1         15528204       7359       2110.1       1714.0       652      30263       1406.9  cudaEventRecordWithFlags_v11010           
+      0.1         15281276      10557       1447.5       1097.0       526      33145       1343.0  cudaEventRecord                           
+      0.1          9857179      17278        570.5        420.0       313      41381        701.9  cudaStreamIsCapturing_v10000              
+      0.0          4428974       3519       1258.6       1287.0       483       9957        637.0  cudaEventCreateWithFlags                  
+      0.0          3323144       3519        944.3        933.0       377       9824        542.6  cudaEventDestroy                          
+      0.0          2796356       3519        794.6        827.0       292       8326        501.4  cudaStreamGetCaptureInfo_v2_v11030        
+      0.0          1380272       3519        392.2        414.0       148       6102        202.3  cudaGetFuncBySymbol_v11000                
+      0.0           155472          8      19434.0      18228.0      9005      31748       8066.1  cuProfilerStart                           
+

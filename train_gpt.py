@@ -42,8 +42,14 @@ class Hyperparameters:
     fp8_lm_head = bool(int(os.environ.get("FP8_LM_HEAD", "0")))
     fp8_lm_head_bwd = bool(int(os.environ.get("FP8_LM_HEAD_BWD", "0")))
     fp8_lm_head_triton_quant = bool(int(os.environ.get("FP8_LM_HEAD_TRITON_QUANT", "0")))
+    experimental_fused_fp8_softcap_ce = bool(
+        int(os.environ.get("EXPERIMENTAL_FUSED_FP8_SOFTCAP_CE", "0"))
+    )
     train_ce_float = bool(int(os.environ.get("TRAIN_CE_FLOAT", "1")))
     fused_softcap_ce = bool(int(os.environ.get("FUSED_SOFTCAP_CE", "0")))
+    profile_cuda_range = bool(int(os.environ.get("PROFILE_CUDA_RANGE", "0")))
+    profile_cuda_start_step = int(os.environ.get("PROFILE_CUDA_START_STEP", 0))
+    profile_cuda_steps = int(os.environ.get("PROFILE_CUDA_STEPS", 20))
     rope_base = float(os.environ.get("ROPE_BASE", 1e4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     rope_train_seq_len = int(os.environ.get("ROPE_TRAIN_SEQ_LEN", 2048))
@@ -153,6 +159,16 @@ def log(msg, console=True):
         if _logger_hparams.logfile is not None:
             with open(_logger_hparams.logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
+
+
+def _cuda_profiler_start():
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStart()
+
+
+def _cuda_profiler_stop():
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
 
 
 class ValidationData:
@@ -1262,6 +1278,7 @@ class GPT(nn.Module):
         self.fp8_lm_head = h.fp8_lm_head
         self.fp8_lm_head_bwd = h.fp8_lm_head_bwd
         self.fp8_lm_head_triton_quant = h.fp8_lm_head_triton_quant
+        self.experimental_fused_fp8_softcap_ce = h.experimental_fused_fp8_softcap_ce
         self.train_ce_float = h.train_ce_float
         self.fused_softcap_ce = h.fused_softcap_ce
         self.register_buffer("fp8_lm_head_weight_t", None, persistent=False)
@@ -1545,6 +1562,22 @@ class GPT(nn.Module):
             input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
         )
         x = self._head_input(x)
+        if (
+            self.training
+            and self.experimental_fused_fp8_softcap_ce
+            and self.tie_embeddings
+            and self.fp8_lm_head
+        ):
+            if self.fp8_lm_head_weight_t is None or self.fp8_lm_head_weight_scale is None:
+                self.refresh_fp8_lm_head_cache()
+            return fused_fp8_softcap_cross_entropy(
+                x,
+                target_ids,
+                self.tok_emb.weight,
+                self.fp8_lm_head_weight_t,
+                self.fp8_lm_head_weight_scale,
+                self.logit_softcap,
+            ).mean()
         logits = self._project_head_input(x)
         if self.training and self.fused_softcap_ce:
             return fused_softcap_cross_entropy(logits, target_ids, self.logit_softcap).mean()
@@ -3114,6 +3147,9 @@ def train_model(h, device, val_data):
     ema_decay = h.ema_decay
     training_time_ms = 0.0
     stop_after_step = None
+    profiler_active = False
+    profiler_start_step = max(h.profile_cuda_start_step, 0)
+    profiler_stop_step = profiler_start_step + max(h.profile_cuda_steps, 1)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -3146,6 +3182,10 @@ def train_model(h, device, val_data):
         elapsed_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
+        if h.profile_cuda_range and not profiler_active and step == profiler_start_step:
+            log(f"profile:cuda_range_start step:{step} steps:{profiler_stop_step - profiler_start_step}")
+            _cuda_profiler_start()
+            profiler_active = True
         if (
             h.num_loops > 0
             and not base_model.looping_active
@@ -3162,6 +3202,10 @@ def train_model(h, device, val_data):
                     t.detach().float(), alpha=1.0 - ema_decay
                 )
         step += 1
+        if h.profile_cuda_range and profiler_active and step >= profiler_stop_step:
+            _cuda_profiler_stop()
+            profiler_active = False
+            log(f"profile:cuda_range_stop step:{step}")
         approx_training_time_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
         should_log_train = h.train_log_every > 0 and (
             step <= 5 or step % h.train_log_every == 0 or stop_after_step is not None
@@ -3180,6 +3224,9 @@ def train_model(h, device, val_data):
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+    if h.profile_cuda_range and profiler_active:
+        _cuda_profiler_stop()
+        log(f"profile:cuda_range_stop step:{step}")
     log(
         f"peak memory allocated: {torch.cuda.max_memory_allocated()//1024//1024} MiB reserved: {torch.cuda.max_memory_reserved()//1024//1024} MiB"
     )
