@@ -10,7 +10,21 @@ from flash_attn_interface import (
 from concurrent.futures import ThreadPoolExecutor
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice as tl_libdevice
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+
+@triton.jit
+def _ptx_tanh(x):
+    # Hardware MUFU.TANH on sm_90+ via PTX tanh.approx.f32 (single SFU op).
+    return tl.inline_asm_elementwise(
+        asm="tanh.approx.f32 $0, $1;",
+        constraints="=f,f",
+        args=[x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
 
 
 class Hyperparameters:
@@ -44,6 +58,12 @@ class Hyperparameters:
     fp8_lm_head_triton_quant = bool(int(os.environ.get("FP8_LM_HEAD_TRITON_QUANT", "0")))
     experimental_fused_fp8_softcap_ce = bool(
         int(os.environ.get("EXPERIMENTAL_FUSED_FP8_SOFTCAP_CE", "0"))
+    )
+    experimental_fused_fp8_softcap_ce_direct_bwd = bool(
+        int(os.environ.get("EXPERIMENTAL_FUSED_FP8_SOFTCAP_CE_DIRECT_BWD", "0"))
+    )
+    experimental_nologit_fused_fp8_softcap_ce = bool(
+        int(os.environ.get("EXPERIMENTAL_NOLOGIT_FUSED_FP8_SOFTCAP_CE", "0"))
     )
     train_ce_float = bool(int(os.environ.get("TRAIN_CE_FLOAT", "1")))
     fused_softcap_ce = bool(int(os.environ.get("FUSED_SOFTCAP_CE", "0")))
@@ -739,6 +759,1174 @@ def fused_fp8_softcap_cross_entropy(x, targets, weight, weight_fp8_t, w_scale, s
 
 
 @triton.jit
+def fused_fp8_softcap_ce_stats_nologits_kernel(
+    x_fp8_ptr,
+    weight_fp8_t_ptr,
+    scale_ab_ptr,
+    partial_max_ptr,
+    partial_sum_ptr,
+    target_logit_ptr,
+    targets_ptr,
+    stride_x_m,
+    stride_x_k,
+    stride_w_k,
+    stride_w_v,
+    stride_partials_m,
+    stride_partials_t,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    row_pid = tl.program_id(0).to(tl.int64)
+    tile_pid = tl.program_id(1).to(tl.int64)
+    row_offsets = row_pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    vocab = tile_pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = row_offsets < n_rows
+    vocab_mask = vocab < n_cols
+    targets = tl.load(targets_ptr + row_offsets, mask=row_mask, other=0).to(tl.int32)
+    scale_ab = tl.load(scale_ab_ptr)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    k_offsets = tl.arange(0, BLOCK_SIZE_K)
+    for off_k in range(0, k_dim, BLOCK_SIZE_K):
+        k_idx = off_k + k_offsets
+        k_mask = k_idx < k_dim
+        x_ptrs = x_fp8_ptr + row_offsets[:, None] * stride_x_m + k_idx[None, :] * stride_x_k
+        x = tl.load(x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+        w_ptrs = weight_fp8_t_ptr + k_idx[:, None] * stride_w_k + vocab[None, :] * stride_w_v
+        w = tl.load(w_ptrs, mask=k_mask[:, None] & vocab_mask[None, :], other=0.0)
+        acc = tl.dot(x, w, acc)
+    logits = acc * scale_ab
+    valid = row_mask[:, None] & vocab_mask[None, :]
+    inv_C = 1.0 / C
+    z = A * tl.sigmoid(logits * inv_C)
+    z = tl.where(valid, z, -float("inf"))
+    tile_max = tl.max(z, axis=1)
+    tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+    tile_target = tl.sum(tl.where(vocab[None, :] == targets[:, None], logits, 0.0), axis=1)
+    partial_ptrs = row_offsets[:, None] * stride_partials_m + tile_pid * stride_partials_t
+    tl.store(partial_max_ptr + partial_ptrs, tile_max[:, None], mask=row_mask[:, None])
+    tl.store(partial_sum_ptr + partial_ptrs, tile_sum[:, None], mask=row_mask[:, None])
+    tile_start = tile_pid * BLOCK_SIZE_N
+    has_target = row_mask & (targets >= tile_start) & (targets < tile_start + BLOCK_SIZE_N)
+    tl.store(target_logit_ptr + row_offsets, tile_target, mask=has_target)
+
+
+@triton.jit
+def fused_fp8_softcap_ce_stats_nologits_blockptr_kernel(
+    x_fp8_ptr,
+    weight_fp8_t_ptr,
+    scale_ab_ptr,
+    partial_max_ptr,
+    partial_sum_ptr,
+    target_logit_ptr,
+    targets_ptr,
+    stride_x_m,
+    stride_x_k,
+    stride_w_k,
+    stride_w_v,
+    stride_partials_m,
+    stride_partials_t,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0).to(tl.int32)
+    pid_n = tl.program_id(1).to(tl.int32)
+    row_offsets = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    vocab = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = row_offsets < n_rows
+    vocab_mask = vocab < n_cols
+    targets = tl.load(targets_ptr + row_offsets, mask=row_mask, other=0).to(tl.int32)
+    scale_ab = tl.load(scale_ab_ptr)
+    a_block_ptr = tl.make_block_ptr(
+        base=x_fp8_ptr,
+        shape=(n_rows, k_dim),
+        strides=(stride_x_m, stride_x_k),
+        offsets=(pid_m * BLOCK_SIZE_M, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0),
+    )
+    b_block_ptr = tl.make_block_ptr(
+        base=weight_fp8_t_ptr,
+        shape=(k_dim, n_cols),
+        strides=(stride_w_k, stride_w_v),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(0, k_dim, BLOCK_SIZE_K):
+        x = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        w = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        acc = tl.dot(x, w, acc)
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+    logits = acc * scale_ab
+    valid = row_mask[:, None] & vocab_mask[None, :]
+    inv_C = 1.0 / C
+    z = A * tl.sigmoid(logits * inv_C)
+    z = tl.where(valid, z, -float("inf"))
+    tile_max = tl.max(z, axis=1)
+    tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+    tile_target = tl.sum(tl.where(vocab[None, :] == targets[:, None], logits, 0.0), axis=1)
+    partial_ptrs = row_offsets[:, None] * stride_partials_m + pid_n * stride_partials_t
+    tl.store(partial_max_ptr + partial_ptrs, tile_max[:, None], mask=row_mask[:, None])
+    tl.store(partial_sum_ptr + partial_ptrs, tile_sum[:, None], mask=row_mask[:, None])
+    has_target = row_mask & (targets >= pid_n * BLOCK_SIZE_N) & (targets < (pid_n + 1) * BLOCK_SIZE_N)
+    tl.store(target_logit_ptr + row_offsets, tile_target, mask=has_target)
+
+
+def _fused_fp8_softcap_ce_blockptr_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": bk,
+                "GROUP_SIZE_M": gm,
+            },
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for bm in [128]
+        for bk in [128, 256]
+        for gm in [8, 16]
+        for stages in [3, 4]
+        for warps in [8]
+    ]
+
+
+def _fused_fp8_softcap_ce_desc_persistent_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": bk,
+                "GROUP_SIZE_M": gm,
+            },
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for bm in [128]
+        for bk in [64, 128]
+        for gm in [8, 16]
+        for stages in [3, 4]
+        for warps in [8]
+    ]
+
+
+def _fused_fp8_softcap_ce_rowreduce_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": bn,
+                "BLOCK_SIZE_K": bk,
+            },
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for bm in [64, 128]
+        for bn in [128, 256]
+        for bk in [64, 128]
+        for stages in [3, 4]
+        for warps in [4, 8]
+    ]
+
+
+_TRITON_DESC_ALLOCATOR_READY = False
+
+
+def _ensure_triton_descriptor_allocator():
+    global _TRITON_DESC_ALLOCATOR_READY
+    if _TRITON_DESC_ALLOCATOR_READY:
+        return
+
+    def _alloc_fn(size: int, alignment: int, stream: int | None):
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+
+    triton.set_allocator(_alloc_fn)
+    _TRITON_DESC_ALLOCATOR_READY = True
+
+
+@triton.autotune(
+    configs=_fused_fp8_softcap_ce_blockptr_configs(),
+    key=["n_rows", "n_cols", "k_dim"],
+)
+@triton.jit
+def fused_fp8_softcap_ce_stats_nologits_blockptr_grouped_kernel(
+    x_fp8_ptr,
+    weight_fp8_t_ptr,
+    scale_ab_ptr,
+    partial_max_ptr,
+    partial_sum_ptr,
+    target_logit_ptr,
+    targets_ptr,
+    stride_x_m,
+    stride_x_k,
+    stride_w_k,
+    stride_w_v,
+    stride_partials_m,
+    stride_partials_t,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0).to(tl.int32)
+    num_pid_m = tl.cdiv(n_rows, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(n_cols, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    row_offsets = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    vocab = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = row_offsets < n_rows
+    vocab_mask = vocab < n_cols
+    targets = tl.load(targets_ptr + row_offsets, mask=row_mask, other=0).to(tl.int32)
+    scale_ab = tl.load(scale_ab_ptr)
+    a_block_ptr = tl.make_block_ptr(
+        base=x_fp8_ptr,
+        shape=(n_rows, k_dim),
+        strides=(stride_x_m, stride_x_k),
+        offsets=(pid_m * BLOCK_SIZE_M, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0),
+    )
+    b_block_ptr = tl.make_block_ptr(
+        base=weight_fp8_t_ptr,
+        shape=(k_dim, n_cols),
+        strides=(stride_w_k, stride_w_v),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(0, k_dim, BLOCK_SIZE_K):
+        x = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        w = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        acc = tl.dot(x, w, acc)
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+    logits = acc * scale_ab
+    valid = row_mask[:, None] & vocab_mask[None, :]
+    inv_C = 1.0 / C
+    z = A * tl.sigmoid(logits * inv_C)
+    z = tl.where(valid, z, -float("inf"))
+    tile_max = tl.max(z, axis=1)
+    tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+    tile_target = tl.sum(tl.where(vocab[None, :] == targets[:, None], logits, 0.0), axis=1)
+    partial_ptrs = row_offsets[:, None] * stride_partials_m + pid_n * stride_partials_t
+    tl.store(partial_max_ptr + partial_ptrs, tile_max[:, None], mask=row_mask[:, None])
+    tl.store(partial_sum_ptr + partial_ptrs, tile_sum[:, None], mask=row_mask[:, None])
+    has_target = row_mask & (targets >= pid_n * BLOCK_SIZE_N) & (targets < (pid_n + 1) * BLOCK_SIZE_N)
+    tl.store(target_logit_ptr + row_offsets, tile_target, mask=has_target)
+
+
+@triton.autotune(
+    configs=_fused_fp8_softcap_ce_rowreduce_configs(),
+    key=["n_rows", "n_cols", "k_dim"],
+)
+@triton.jit
+def fused_fp8_softcap_ce_rowreduce_nologits_kernel(
+    x_fp8_ptr,
+    weight_fp8_t_ptr,
+    scale_ab_ptr,
+    losses_ptr,
+    lse_ptr,
+    targets_ptr,
+    stride_x_m,
+    stride_x_k,
+    stride_w_k,
+    stride_w_v,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0).to(tl.int32)
+    rows = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    row_mask = rows < n_rows
+    targets = tl.load(targets_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+    scale_ab = tl.load(scale_ab_ptr)
+    softcap = A * 0.5
+    inv_softcap = 1.0 / softcap
+    row_max = tl.full((BLOCK_SIZE_M,), -float("inf"), dtype=tl.float32)
+    row_sum = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    target_logit = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    for off_n in range(0, n_cols, BLOCK_SIZE_N):
+        cols = off_n + tl.arange(0, BLOCK_SIZE_N)
+        col_mask = cols < n_cols
+        a_block_ptr = tl.make_block_ptr(
+            base=x_fp8_ptr,
+            shape=(n_rows, k_dim),
+            strides=(stride_x_m, stride_x_k),
+            offsets=(pid_m * BLOCK_SIZE_M, 0),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+            order=(1, 0),
+        )
+        b_block_ptr = tl.make_block_ptr(
+            base=weight_fp8_t_ptr,
+            shape=(k_dim, n_cols),
+            strides=(stride_w_k, stride_w_v),
+            offsets=(0, off_n),
+            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+            order=(0, 1),
+        )
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for _ in range(0, k_dim, BLOCK_SIZE_K):
+            x = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            w = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            acc = tl.dot(x, w, acc)
+            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+        logits = acc * scale_ab
+        valid = row_mask[:, None] & col_mask[None, :]
+        z = softcap * _ptx_tanh(logits * inv_softcap)
+        z = tl.where(valid, z, -float("inf"))
+        tile_max = tl.max(z, axis=1)
+        tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+        new_max = tl.maximum(row_max, tile_max)
+        row_sum = row_sum * tl.exp(row_max - new_max) + tile_sum * tl.exp(tile_max - new_max)
+        row_max = new_max
+        tile_target = tl.sum(tl.where(cols[None, :] == targets[:, None], logits, 0.0), axis=1)
+        has_target = row_mask & (targets >= off_n) & (targets < off_n + BLOCK_SIZE_N)
+        target_logit = tl.where(has_target, tile_target, target_logit)
+    lse = row_max + tl.log(row_sum)
+    z_target = softcap * _ptx_tanh(target_logit * inv_softcap)
+    tl.store(lse_ptr + rows, lse, mask=row_mask)
+    tl.store(losses_ptr + rows, lse - z_target, mask=row_mask)
+
+
+def _fused_fp8_softcap_ce_rowreduce_ws_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": bn,
+                "BLOCK_SIZE_K": bk,
+            },
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for bm in [64, 128]
+        for bn in [128, 256]
+        for bk in [64, 128]
+        for stages in [3, 4]
+        for warps in [4, 8]
+    ]
+
+
+@triton.autotune(
+    configs=_fused_fp8_softcap_ce_rowreduce_ws_configs(),
+    key=["n_rows", "n_cols", "k_dim", "WARP_SPECIALIZE"],
+)
+@triton.jit
+def fused_fp8_softcap_ce_rowreduce_desc_ws_kernel(
+    x_fp8_ptr,
+    weight_fp8_cm_ptr,
+    scale_ab_ptr,
+    losses_ptr,
+    lse_ptr,
+    targets_ptr,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0).to(tl.int32)
+    offs_m = pid_m * BLOCK_SIZE_M
+    rows = offs_m + tl.arange(0, BLOCK_SIZE_M)
+    row_mask = rows < n_rows
+    targets = tl.load(targets_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+    scale_ab = tl.load(scale_ab_ptr)
+    softcap = A * 0.5
+    inv_softcap = 1.0 / softcap
+    x_desc = tl.make_tensor_descriptor(
+        x_fp8_ptr,
+        shape=[n_rows, k_dim],
+        strides=[k_dim, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+    w_desc = tl.make_tensor_descriptor(
+        weight_fp8_cm_ptr,
+        shape=[n_cols, k_dim],
+        strides=[k_dim, 1],
+        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+    )
+    row_max = tl.full((BLOCK_SIZE_M,), -float("inf"), dtype=tl.float32)
+    row_sum = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    target_logit = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    k_tiles = tl.cdiv(k_dim, BLOCK_SIZE_K)
+    for off_n in tl.range(0, n_cols, BLOCK_SIZE_N, warp_specialize=WARP_SPECIALIZE):
+        cols = off_n + tl.arange(0, BLOCK_SIZE_N)
+        col_mask = cols < n_cols
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            x = x_desc.load([offs_m, offs_k])
+            w = w_desc.load([off_n, offs_k])
+            acc = tl.dot(x, w.T, acc)
+        logits = acc * scale_ab
+        valid = row_mask[:, None] & col_mask[None, :]
+        z = softcap * _ptx_tanh(logits * inv_softcap)
+        z = tl.where(valid, z, -float("inf"))
+        tile_max = tl.max(z, axis=1)
+        tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+        new_max = tl.maximum(row_max, tile_max)
+        row_sum = row_sum * tl.exp(row_max - new_max) + tile_sum * tl.exp(tile_max - new_max)
+        row_max = new_max
+        tile_target = tl.sum(tl.where(cols[None, :] == targets[:, None], logits, 0.0), axis=1)
+        has_target = row_mask & (targets >= off_n) & (targets < off_n + BLOCK_SIZE_N)
+        target_logit = tl.where(has_target, tile_target, target_logit)
+    lse = row_max + tl.log(row_sum)
+    z_target = softcap * _ptx_tanh(target_logit * inv_softcap)
+    tl.store(lse_ptr + rows, lse, mask=row_mask)
+    tl.store(losses_ptr + rows, lse - z_target, mask=row_mask)
+
+
+@triton.jit
+def _fused_fp8_softcap_ce_grouped_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton.autotune(
+    configs=_fused_fp8_softcap_ce_desc_persistent_configs(),
+    key=["n_rows", "n_cols", "k_dim", "WARP_SPECIALIZE", "FLATTEN"],
+)
+@triton.jit
+def fused_fp8_softcap_ce_stats_nologits_desc_persistent_kernel(
+    x_fp8_ptr,
+    weight_fp8_cm_ptr,
+    scale_ab_ptr,
+    partial_max_ptr,
+    partial_sum_ptr,
+    target_logit_ptr,
+    targets_ptr,
+    stride_partials_m,
+    stride_partials_t,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+    FLATTEN: tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(n_rows, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(n_cols, BLOCK_SIZE_N)
+    num_tiles = num_pid_m * num_pid_n
+    k_tiles = tl.cdiv(k_dim, BLOCK_SIZE_K)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    scale_ab = tl.load(scale_ab_ptr)
+    x_desc = tl.make_tensor_descriptor(
+        x_fp8_ptr,
+        shape=[n_rows, k_dim],
+        strides=[k_dim, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+    w_desc = tl.make_tensor_descriptor(
+        weight_fp8_cm_ptr,
+        shape=[n_cols, k_dim],
+        strides=[k_dim, 1],
+        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+    )
+    inv_C = 1.0 / C
+    for tile_id in tl.range(
+        start_pid,
+        num_tiles,
+        NUM_SMS,
+        flatten=FLATTEN,
+        warp_specialize=WARP_SPECIALIZE,
+    ):
+        pid_m, pid_n = _fused_fp8_softcap_ce_grouped_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M
+        )
+        offs_m = pid_m * BLOCK_SIZE_M
+        offs_n = pid_n * BLOCK_SIZE_N
+        rows = offs_m + tl.arange(0, BLOCK_SIZE_M)
+        cols = offs_n + tl.arange(0, BLOCK_SIZE_N)
+        row_mask = rows < n_rows
+        col_mask = cols < n_cols
+        targets = tl.load(targets_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            x = x_desc.load([offs_m, offs_k])
+            w = w_desc.load([offs_n, offs_k])
+            acc = tl.dot(x, w.T, acc)
+        logits = acc * scale_ab
+        valid = row_mask[:, None] & col_mask[None, :]
+        softcap = A * 0.5
+        inv_softcap = 1.0 / softcap
+        z = softcap * _ptx_tanh(logits * inv_softcap)
+        z = tl.where(valid, z, -float("inf"))
+        tile_max = tl.max(z, axis=1)
+        tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+        tile_target = tl.sum(tl.where(cols[None, :] == targets[:, None], logits, 0.0), axis=1)
+        partial_ptrs = rows[:, None] * stride_partials_m + pid_n * stride_partials_t
+        tl.store(partial_max_ptr + partial_ptrs, tile_max[:, None], mask=row_mask[:, None])
+        tl.store(partial_sum_ptr + partial_ptrs, tile_sum[:, None], mask=row_mask[:, None])
+        has_target = row_mask & (targets >= offs_n) & (targets < offs_n + BLOCK_SIZE_N)
+        tl.store(target_logit_ptr + rows, tile_target, mask=has_target)
+
+
+@triton.jit
+def fused_fp8_softcap_ce_stats_nologits_blockptr_inlinequant_kernel(
+    x_ptr,
+    x_scale_ptr,
+    weight_fp8_t_ptr,
+    w_scale_ptr,
+    partial_max_ptr,
+    partial_sum_ptr,
+    target_logit_ptr,
+    targets_ptr,
+    stride_x_m,
+    stride_x_k,
+    stride_w_k,
+    stride_w_v,
+    stride_partials_m,
+    stride_partials_t,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0).to(tl.int32)
+    pid_n = tl.program_id(1).to(tl.int32)
+    row_offsets = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    vocab = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = row_offsets < n_rows
+    vocab_mask = vocab < n_cols
+    targets = tl.load(targets_ptr + row_offsets, mask=row_mask, other=0).to(tl.int32)
+    x_scale = tl.load(x_scale_ptr)
+    w_scale = tl.load(w_scale_ptr)
+    a_block_ptr = tl.make_block_ptr(
+        base=x_ptr,
+        shape=(n_rows, k_dim),
+        strides=(stride_x_m, stride_x_k),
+        offsets=(pid_m * BLOCK_SIZE_M, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0),
+    )
+    b_block_ptr = tl.make_block_ptr(
+        base=weight_fp8_t_ptr,
+        shape=(k_dim, n_cols),
+        strides=(stride_w_k, stride_w_v),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(0, k_dim, BLOCK_SIZE_K):
+        x = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+        x = tl.maximum(tl.minimum(x / x_scale, 448.0), -448.0).to(tl.float8e4nv)
+        w = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        acc = tl.dot(x, w, acc)
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+    logits = acc * (x_scale * w_scale)
+    valid = row_mask[:, None] & vocab_mask[None, :]
+    inv_C = 1.0 / C
+    z = A * tl.sigmoid(logits * inv_C)
+    z = tl.where(valid, z, -float("inf"))
+    tile_max = tl.max(z, axis=1)
+    tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+    tile_target = tl.sum(tl.where(vocab[None, :] == targets[:, None], logits, 0.0), axis=1)
+    partial_ptrs = row_offsets[:, None] * stride_partials_m + pid_n * stride_partials_t
+    tl.store(partial_max_ptr + partial_ptrs, tile_max[:, None], mask=row_mask[:, None])
+    tl.store(partial_sum_ptr + partial_ptrs, tile_sum[:, None], mask=row_mask[:, None])
+    has_target = row_mask & (targets >= pid_n * BLOCK_SIZE_N) & (targets < (pid_n + 1) * BLOCK_SIZE_N)
+    tl.store(target_logit_ptr + row_offsets, tile_target, mask=has_target)
+
+
+@triton.jit
+def fused_fp8_softcap_ce_stats_nologits_persistent_kernel(
+    x_fp8_ptr,
+    weight_fp8_t_ptr,
+    scale_ab_ptr,
+    partial_max_ptr,
+    partial_sum_ptr,
+    target_logit_ptr,
+    targets_ptr,
+    stride_x_m,
+    stride_x_k,
+    stride_w_k,
+    stride_w_v,
+    stride_partials_m,
+    stride_partials_t,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(n_rows, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(n_cols, BLOCK_SIZE_N)
+    num_tiles = num_pid_m * num_pid_n
+    scale_ab = tl.load(scale_ab_ptr)
+    k_offsets = tl.arange(0, BLOCK_SIZE_K)
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        row_offsets = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        vocab = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        row_mask = row_offsets < n_rows
+        vocab_mask = vocab < n_cols
+        targets = tl.load(targets_ptr + row_offsets, mask=row_mask, other=0).to(tl.int32)
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for off_k in range(0, k_dim, BLOCK_SIZE_K):
+            k_idx = off_k + k_offsets
+            k_mask = k_idx < k_dim
+            x_ptrs = x_fp8_ptr + row_offsets[:, None] * stride_x_m + k_idx[None, :] * stride_x_k
+            x = tl.load(x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+            w_ptrs = weight_fp8_t_ptr + k_idx[:, None] * stride_w_k + vocab[None, :] * stride_w_v
+            w = tl.load(w_ptrs, mask=k_mask[:, None] & vocab_mask[None, :], other=0.0)
+            acc = tl.dot(x, w, acc)
+        logits = acc * scale_ab
+        valid = row_mask[:, None] & vocab_mask[None, :]
+        inv_C = 1.0 / C
+        z = A * tl.sigmoid(logits * inv_C)
+        z = tl.where(valid, z, -float("inf"))
+        tile_max = tl.max(z, axis=1)
+        tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+        tile_target = tl.sum(tl.where(vocab[None, :] == targets[:, None], logits, 0.0), axis=1)
+        partial_ptrs = row_offsets[:, None] * stride_partials_m + pid_n * stride_partials_t
+        tl.store(partial_max_ptr + partial_ptrs, tile_max[:, None], mask=row_mask[:, None])
+        tl.store(partial_sum_ptr + partial_ptrs, tile_sum[:, None], mask=row_mask[:, None])
+        has_target = row_mask & (targets >= pid_n * BLOCK_SIZE_N) & (targets < (pid_n + 1) * BLOCK_SIZE_N)
+        tl.store(target_logit_ptr + row_offsets, tile_target, mask=has_target)
+
+
+@triton.jit
+def fused_fp8_softcap_ce_stats_nologits_desc_kernel(
+    x_desc,
+    w_desc,
+    scale_ab_ptr,
+    partial_max_ptr,
+    partial_sum_ptr,
+    target_logit_ptr,
+    targets_ptr,
+    stride_partials_m,
+    stride_partials_t,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(n_rows, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(n_cols, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(k_dim, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+    scale_ab = tl.load(scale_ab_ptr)
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_m = pid_m * BLOCK_SIZE_M
+        offs_n = pid_n * BLOCK_SIZE_N
+        rows = offs_m + tl.arange(0, BLOCK_SIZE_M)
+        cols = offs_n + tl.arange(0, BLOCK_SIZE_N)
+        row_mask = rows < n_rows
+        col_mask = cols < n_cols
+        targets = tl.load(targets_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            x = x_desc.load([offs_m, offs_k])
+            w = w_desc.load([offs_n, offs_k])
+            acc = tl.dot(x, w.T, acc)
+        logits = acc * scale_ab
+        valid = row_mask[:, None] & col_mask[None, :]
+        inv_C = 1.0 / C
+        z = A * tl.sigmoid(logits * inv_C)
+        z = tl.where(valid, z, -float("inf"))
+        tile_max = tl.max(z, axis=1)
+        tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+        tile_target = tl.sum(tl.where(cols[None, :] == targets[:, None], logits, 0.0), axis=1)
+        partial_ptrs = rows[:, None] * stride_partials_m + pid_n * stride_partials_t
+        tl.store(partial_max_ptr + partial_ptrs, tile_max[:, None], mask=row_mask[:, None])
+        tl.store(partial_sum_ptr + partial_ptrs, tile_sum[:, None], mask=row_mask[:, None])
+        has_target = row_mask & (targets >= offs_n) & (targets < offs_n + BLOCK_SIZE_N)
+        tl.store(target_logit_ptr + rows, tile_target, mask=has_target)
+
+
+@triton.jit
+def fused_fp8_softcap_ce_finalize_nologits_kernel(
+    losses_ptr,
+    lse_ptr,
+    partial_max_ptr,
+    partial_sum_ptr,
+    target_logit_ptr,
+    stride_partials_m,
+    stride_partials_t,
+    n_rows,
+    num_tiles,
+    A,
+    C,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    if row_idx >= n_rows:
+        return
+    tile_offsets = tl.arange(0, BLOCK_SIZE_T)
+    max_val = -float("inf")
+    sum_exp = 0.0
+    target_logit = tl.load(target_logit_ptr + row_idx)
+    for off_t in range(0, num_tiles, BLOCK_SIZE_T):
+        tiles = off_t + tile_offsets
+        mask = tiles < num_tiles
+        base = row_idx * stride_partials_m + tiles * stride_partials_t
+        tile_max = tl.load(partial_max_ptr + base, mask=mask, other=-float("inf"))
+        tile_sum = tl.load(partial_sum_ptr + base, mask=mask, other=0.0)
+        curr_max = tl.max(tile_max, axis=0)
+        new_max = tl.maximum(max_val, curr_max)
+        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tile_sum * tl.exp(tile_max - new_max), axis=0)
+        max_val = new_max
+    lse = max_val + tl.log(sum_exp)
+    tl.store(lse_ptr + row_idx, lse)
+    z_target = A * tl.sigmoid(target_logit * (1.0 / C))
+    tl.store(losses_ptr + row_idx, lse - z_target)
+
+
+@triton.jit
+def fused_fp8_softcap_ce_dx_recompute_kernel(
+    grad_input_ptr,
+    grad_output_ptr,
+    lse_ptr,
+    targets_ptr,
+    x_fp8_ptr,
+    weight_ptr,
+    weight_fp8_t_ptr,
+    scale_ab_ptr,
+    stride_dx_m,
+    stride_dx_k,
+    stride_xfp8_m,
+    stride_xfp8_k,
+    stride_w_v,
+    stride_w_k,
+    stride_wfp8_k,
+    stride_wfp8_v,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0).to(tl.int64)
+    pid_k = tl.program_id(1).to(tl.int64)
+    rows = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    ks = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    row_mask = rows < n_rows
+    k_mask = ks < k_dim
+    lse = tl.load(lse_ptr + rows, mask=row_mask, other=0.0)
+    grad_loss = tl.load(grad_output_ptr + rows, mask=row_mask, other=0.0)
+    targets = tl.load(targets_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+    scale_ab = tl.load(scale_ab_ptr)
+    inv_C = 1.0 / C
+    inv_C_A = inv_C * A
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
+    hidden_offsets = tl.arange(0, BLOCK_SIZE_K)
+    for off_v in range(0, n_cols, BLOCK_SIZE_N):
+        cols = off_v + tl.arange(0, BLOCK_SIZE_N)
+        col_mask = cols < n_cols
+        logits_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for off_h in range(0, k_dim, BLOCK_SIZE_K):
+            hidden = off_h + hidden_offsets
+            hidden_mask = hidden < k_dim
+            x_ptrs = x_fp8_ptr + rows[:, None] * stride_xfp8_m + hidden[None, :] * stride_xfp8_k
+            x_fp8 = tl.load(x_ptrs, mask=row_mask[:, None] & hidden_mask[None, :], other=0.0)
+            w_ptrs = weight_fp8_t_ptr + hidden[:, None] * stride_wfp8_k + cols[None, :] * stride_wfp8_v
+            w_fp8 = tl.load(w_ptrs, mask=hidden_mask[:, None] & col_mask[None, :], other=0.0)
+            logits_acc = tl.dot(x_fp8, w_fp8, logits_acc)
+        logits = logits_acc * scale_ab
+        sigmoid_u = tl.sigmoid(logits * inv_C)
+        z = A * sigmoid_u
+        p = tl.exp(z - lse[:, None])
+        grad_z = grad_loss[:, None] * (p - tl.where(cols[None, :] == targets[:, None], 1.0, 0.0))
+        grad_logits = (grad_z * (inv_C_A * sigmoid_u * (1.0 - sigmoid_u))).to(tl.bfloat16)
+        w_ptrs = weight_ptr + cols[:, None] * stride_w_v + ks[None, :] * stride_w_k
+        w = tl.load(w_ptrs, mask=col_mask[:, None] & k_mask[None, :], other=0.0)
+        acc = tl.dot(grad_logits, w, acc)
+    grad_input_ptrs = grad_input_ptr + rows[:, None] * stride_dx_m + ks[None, :] * stride_dx_k
+    tl.store(grad_input_ptrs, acc.to(tl.bfloat16), mask=row_mask[:, None] & k_mask[None, :])
+
+
+@triton.jit
+def fused_fp8_softcap_ce_dw_recompute_kernel(
+    grad_weight_ptr,
+    grad_output_ptr,
+    lse_ptr,
+    targets_ptr,
+    x_ptr,
+    x_fp8_ptr,
+    weight_fp8_t_ptr,
+    scale_ab_ptr,
+    stride_dw_v,
+    stride_dw_k,
+    stride_x_m,
+    stride_x_k,
+    stride_xfp8_m,
+    stride_xfp8_k,
+    stride_wfp8_k,
+    stride_wfp8_v,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0).to(tl.int64)
+    pid_k = tl.program_id(1).to(tl.int64)
+    cols = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    ks = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    col_mask = cols < n_cols
+    k_mask = ks < k_dim
+    scale_ab = tl.load(scale_ab_ptr)
+    inv_C = 1.0 / C
+    inv_C_A = inv_C * A
+    acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=tl.float32)
+    hidden_offsets = tl.arange(0, BLOCK_SIZE_K)
+    for off_m in range(0, n_rows, BLOCK_SIZE_M):
+        rows = off_m + tl.arange(0, BLOCK_SIZE_M)
+        row_mask = rows < n_rows
+        lse = tl.load(lse_ptr + rows, mask=row_mask, other=0.0)
+        grad_loss = tl.load(grad_output_ptr + rows, mask=row_mask, other=0.0)
+        targets = tl.load(targets_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+        logits_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for off_h in range(0, k_dim, BLOCK_SIZE_K):
+            hidden = off_h + hidden_offsets
+            hidden_mask = hidden < k_dim
+            x_ptrs = x_fp8_ptr + rows[:, None] * stride_xfp8_m + hidden[None, :] * stride_xfp8_k
+            x_fp8 = tl.load(x_ptrs, mask=row_mask[:, None] & hidden_mask[None, :], other=0.0)
+            w_ptrs = weight_fp8_t_ptr + hidden[:, None] * stride_wfp8_k + cols[None, :] * stride_wfp8_v
+            w_fp8 = tl.load(w_ptrs, mask=hidden_mask[:, None] & col_mask[None, :], other=0.0)
+            logits_acc = tl.dot(x_fp8, w_fp8, logits_acc)
+        logits = logits_acc * scale_ab
+        sigmoid_u = tl.sigmoid(logits * inv_C)
+        z = A * sigmoid_u
+        p = tl.exp(z - lse[:, None])
+        grad_z = grad_loss[:, None] * (p - tl.where(cols[None, :] == targets[:, None], 1.0, 0.0))
+        grad_logits = (grad_z * (inv_C_A * sigmoid_u * (1.0 - sigmoid_u))).to(tl.bfloat16)
+        x_ptrs = x_ptr + rows[:, None] * stride_x_m + ks[None, :] * stride_x_k
+        x = tl.load(x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+        acc = tl.dot(tl.trans(grad_logits), x, acc)
+    grad_weight_ptrs = grad_weight_ptr + cols[:, None] * stride_dw_v + ks[None, :] * stride_dw_k
+    tl.store(grad_weight_ptrs, acc, mask=col_mask[:, None] & k_mask[None, :])
+
+
+class NoLogitFusedFP8SoftcapCrossEntropyFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, targets, weight, weight_fp8_t, weight_fp8_cm, w_scale, softcap, triton_quant):
+        x_2d = x.reshape(-1, x.size(-1)).contiguous()
+        targets_1d = targets.reshape(-1).contiguous()
+        x_scale = x_2d.detach().abs().amax().float().clamp_min(1e-12) / 448.0
+        if triton_quant:
+            x_fp8 = torch.empty_like(x_2d, dtype=torch.float8_e4m3fn)
+            quantize_fp8_tensorwise_kernel[(triton.cdiv(x_2d.numel(), 1024),)](
+                x_2d,
+                x_fp8,
+                x_scale,
+                x_2d.numel(),
+                BLOCK_SIZE=1024,
+            )
+        else:
+            x_fp8 = (x_2d / x_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+        n_rows = x_2d.size(0)
+        n_cols = weight.size(0)
+        losses = torch.empty(n_rows, dtype=torch.float32, device=x.device)
+        lse = torch.empty_like(losses)
+        scale_ab = x_scale * w_scale
+        A = float(2.0 * softcap)
+        C = float(softcap / 2.0)
+        fused_fp8_softcap_ce_rowreduce_nologits_kernel[
+            lambda meta: (triton.cdiv(n_rows, meta["BLOCK_SIZE_M"]),)
+        ](
+            x_fp8,
+            weight_fp8_t,
+            scale_ab,
+            losses,
+            lse,
+            targets_1d,
+            x_fp8.stride(0),
+            x_fp8.stride(1),
+            weight_fp8_t.stride(0),
+            weight_fp8_t.stride(1),
+            n_rows,
+            n_cols,
+            x_2d.size(1),
+            A,
+            C,
+        )
+        ctx.input_shape = x.shape
+        ctx.weight_dtype = weight.dtype
+        ctx.save_for_backward(x_2d, x_fp8, weight, weight_fp8_t, targets_1d, lse, scale_ab)
+        ctx.A = A
+        ctx.C = C
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_2d, x_fp8, weight, weight_fp8_t, targets_1d, lse, scale_ab = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty_like(x_2d, dtype=torch.bfloat16)
+        grad_weight = torch.empty_like(weight, dtype=torch.float32)
+        grid_dx = (triton.cdiv(x_2d.size(0), 8), triton.cdiv(x_2d.size(1), 64))
+        fused_fp8_softcap_ce_dx_recompute_kernel[grid_dx](
+            grad_input,
+            grad_output,
+            lse,
+            targets_1d,
+            x_fp8,
+            weight,
+            weight_fp8_t,
+            scale_ab,
+            grad_input.stride(0),
+            grad_input.stride(1),
+            x_fp8.stride(0),
+            x_fp8.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            weight_fp8_t.stride(0),
+            weight_fp8_t.stride(1),
+            x_2d.size(0),
+            weight.size(0),
+            x_2d.size(1),
+            ctx.A,
+            ctx.C,
+            BLOCK_SIZE_M=8,
+            BLOCK_SIZE_N=256,
+            BLOCK_SIZE_K=64,
+            num_warps=4,
+        )
+        grid_dw = (triton.cdiv(weight.size(0), 128), triton.cdiv(x_2d.size(1), 64))
+        fused_fp8_softcap_ce_dw_recompute_kernel[grid_dw](
+            grad_weight,
+            grad_output,
+            lse,
+            targets_1d,
+            x_2d,
+            x_fp8,
+            weight_fp8_t,
+            scale_ab,
+            grad_weight.stride(0),
+            grad_weight.stride(1),
+            x_2d.stride(0),
+            x_2d.stride(1),
+            x_fp8.stride(0),
+            x_fp8.stride(1),
+            weight_fp8_t.stride(0),
+            weight_fp8_t.stride(1),
+            x_2d.size(0),
+            weight.size(0),
+            x_2d.size(1),
+            ctx.A,
+            ctx.C,
+            BLOCK_SIZE_M=32,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=64,
+            num_warps=8,
+        )
+        return grad_input.view(ctx.input_shape), None, grad_weight.to(ctx.weight_dtype), None, None, None, None, None
+
+
+def nologit_fused_fp8_softcap_cross_entropy(
+    x,
+    targets,
+    weight,
+    weight_fp8_t,
+    weight_fp8_cm,
+    w_scale,
+    softcap,
+    triton_quant=False,
+):
+    return NoLogitFusedFP8SoftcapCrossEntropyFn.apply(
+        x,
+        targets,
+        weight,
+        weight_fp8_t,
+        weight_fp8_cm,
+        w_scale,
+        softcap,
+        triton_quant,
+    )
+
+
+class FusedFP8SoftcapCrossEntropyDirectBwdFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, targets, weight, weight_fp8_t, w_scale, softcap):
+        x_2d = x.reshape(-1, x.size(-1)).contiguous()
+        targets_1d = targets.reshape(-1).contiguous()
+        x_scale = x_2d.detach().abs().amax().float().clamp_min(1e-12) / 448.0
+        x_fp8 = (x_2d / x_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+        losses = torch.empty(x_2d.size(0), dtype=torch.float32, device=x.device)
+        lse = torch.empty_like(losses)
+        logits = torch._scaled_mm(
+            x_fp8,
+            weight_fp8_t,
+            scale_a=x_scale,
+            scale_b=w_scale,
+            out_dtype=x_2d.dtype,
+        )
+        A = float(2.0 * softcap)
+        C = float(softcap / 2.0)
+        fused_softcap_ce_fwd_kernel[(logits.size(0),)](
+            logits,
+            losses,
+            lse,
+            targets_1d,
+            logits.stride(0),
+            logits.stride(1),
+            logits.size(0),
+            logits.size(1),
+            A,
+            C,
+            BLOCK_SIZE=2048,
+            num_warps=2,
+        )
+        ctx.input_shape = x.shape
+        ctx.weight_dtype = weight.dtype
+        ctx.save_for_backward(x_2d, weight, targets_1d, lse, logits)
+        ctx.A = A
+        ctx.C = C
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_2d, weight, targets_1d, lse, logits = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty_like(x_2d, dtype=torch.bfloat16)
+        grad_weight = torch.empty_like(weight, dtype=torch.float32)
+        grid_dx = (triton.cdiv(x_2d.size(0), 32), triton.cdiv(x_2d.size(1), 64))
+        fused_softcap_ce_dx_kernel[grid_dx](
+            grad_input,
+            grad_output,
+            lse,
+            logits,
+            targets_1d,
+            weight,
+            grad_input.stride(0),
+            grad_input.stride(1),
+            logits.stride(0),
+            logits.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            x_2d.size(0),
+            weight.size(0),
+            x_2d.size(1),
+            ctx.A,
+            ctx.C,
+            BLOCK_SIZE_M=32,
+            BLOCK_SIZE_N=256,
+            BLOCK_SIZE_K=64,
+            num_warps=8,
+        )
+        grid_dw = (triton.cdiv(weight.size(0), 128), triton.cdiv(x_2d.size(1), 64))
+        fused_softcap_ce_dw_kernel[grid_dw](
+            grad_weight,
+            grad_output,
+            lse,
+            logits,
+            targets_1d,
+            x_2d,
+            grad_weight.stride(0),
+            grad_weight.stride(1),
+            logits.stride(0),
+            logits.stride(1),
+            x_2d.stride(0),
+            x_2d.stride(1),
+            x_2d.size(0),
+            weight.size(0),
+            x_2d.size(1),
+            ctx.A,
+            ctx.C,
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=64,
+            num_warps=8,
+        )
+        return grad_input.view(ctx.input_shape), None, grad_weight.to(ctx.weight_dtype), None, None, None
+
+
+def fused_fp8_softcap_cross_entropy_direct_bwd(
+    x,
+    targets,
+    weight,
+    weight_fp8_t,
+    w_scale,
+    softcap,
+):
+    return FusedFP8SoftcapCrossEntropyDirectBwdFn.apply(
+        x,
+        targets,
+        weight,
+        weight_fp8_t,
+        w_scale,
+        softcap,
+    )
+
+
+@triton.jit
 def fused_softcap_ce_fwd_kernel(
     logits_ptr,
     losses_ptr,
@@ -1279,6 +2467,8 @@ class GPT(nn.Module):
         self.fp8_lm_head_bwd = h.fp8_lm_head_bwd
         self.fp8_lm_head_triton_quant = h.fp8_lm_head_triton_quant
         self.experimental_fused_fp8_softcap_ce = h.experimental_fused_fp8_softcap_ce
+        self.experimental_fused_fp8_softcap_ce_direct_bwd = h.experimental_fused_fp8_softcap_ce_direct_bwd
+        self.experimental_nologit_fused_fp8_softcap_ce = h.experimental_nologit_fused_fp8_softcap_ce
         self.train_ce_float = h.train_ce_float
         self.fused_softcap_ce = h.fused_softcap_ce
         self.register_buffer("fp8_lm_head_weight_t", None, persistent=False)
@@ -1562,6 +2752,40 @@ class GPT(nn.Module):
             input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
         )
         x = self._head_input(x)
+        if (
+            self.training
+            and self.experimental_nologit_fused_fp8_softcap_ce
+            and self.tie_embeddings
+            and self.fp8_lm_head
+        ):
+            if self.fp8_lm_head_weight_t is None or self.fp8_lm_head_weight_scale is None:
+                self.refresh_fp8_lm_head_cache()
+            return nologit_fused_fp8_softcap_cross_entropy(
+                x,
+                target_ids,
+                self.tok_emb.weight,
+                self.fp8_lm_head_weight_t,
+                self.fp8_lm_head_weight_cm,
+                self.fp8_lm_head_weight_scale,
+                self.logit_softcap,
+                self.fp8_lm_head_triton_quant,
+            ).mean()
+        if (
+            self.training
+            and self.experimental_fused_fp8_softcap_ce_direct_bwd
+            and self.tie_embeddings
+            and self.fp8_lm_head
+        ):
+            if self.fp8_lm_head_weight_t is None or self.fp8_lm_head_weight_scale is None:
+                self.refresh_fp8_lm_head_cache()
+            return fused_fp8_softcap_cross_entropy_direct_bwd(
+                x,
+                target_ids,
+                self.tok_emb.weight,
+                self.fp8_lm_head_weight_t,
+                self.fp8_lm_head_weight_scale,
+                self.logit_softcap,
+            ).mean()
         if (
             self.training
             and self.experimental_fused_fp8_softcap_ce

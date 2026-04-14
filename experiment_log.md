@@ -261,6 +261,263 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - If staying in the logits/loss lane, only revisit backward-side fusion if the design avoids explicit layout packing and transpose materialization.
 - If revisiting finer-grained scaling, treat `_scaled_mm` rowwise as closed for this repo and require a different kernel path from the start.
 
+## 2026-04-14 Iterations
+
+- Iteration 1: true no-dense-logits FP8 prototype added behind `EXPERIMENTAL_NOLOGIT_FUSED_FP8_SOFTCAP_CE=1`.
+  - Forward now computes FP8 projection tiles directly in Triton and stores only rowwise partial stats plus `lse`.
+  - Backward recomputes projection tiles inside Triton `dx` / `dw` kernels, so neither dense `logits` nor dense `grad_logits` hit HBM.
+  - Small CUDA correctness check vs the current wrapper path looked acceptable:
+    - loss delta about `0.00138`
+    - `grad_x` max abs diff about `9.77e-4`
+    - `grad_w` max abs diff about `7.32e-4`
+  - Training-shape local microbench (`M=98304, K=512, V=8192`) was not viable:
+    - wrapper forward+backward: about `0.00526 s`
+    - true no-logit forward+backward: about `0.14042 s`
+    - wrapper forward-only: about `0.00207 s`
+    - true no-logit forward-only: about `0.00923 s`
+  - Read:
+    - the direct Triton FP8 projection kernel is far slower than `_scaled_mm` on this stack
+    - the no-logit design is numerically reasonable, but this implementation is not remotely competitive
+
+- Iteration 2: direct backward path added behind `EXPERIMENTAL_FUSED_FP8_SOFTCAP_CE_DIRECT_BWD=1`.
+  - This keeps `_scaled_mm` forward and the existing fused CE forward, but replaces dense `grad_logits` materialization with the in-tree direct Triton `dx` / `dw` kernels.
+  - Small CUDA correctness check matched the wrapper exactly within the local test.
+  - Initial training-shape local microbench (`M=98304, K=512, V=8192`) still regressed badly:
+    - wrapper forward+backward: about `0.00526 s`
+    - direct-backward variant: about `0.02993 s`
+  - A small block-size sweep improved the direct Triton backward kernels materially but not enough:
+    - best direct `dx+dw` kernel pair in the local sweep: about `0.02114 s`
+    - tuned end-to-end direct-backward variant after taking the best local config: about `0.02398 s`
+  - Read:
+    - eliminating `grad_logits` traffic alone is not enough if the direct Triton reduction kernels give back much more than they save
+    - the current `fused_softcap_ce_dx_kernel` / `fused_softcap_ce_dw_kernel` implementations are not good enough as a real speed path here
+
+- Decision after these iterations:
+  - do not treat either new path as a throughput candidate yet
+  - the next credible logits/loss-lane attempt still needs a GEMM-class kernel path, not just more recompute or more direct reduction logic around the current Triton kernels
+
+- Iteration 3: narrowed scope to the no-logit forward microbenchmark only and tuned the forward stats kernel shape aggressively.
+  - Goal for this pass:
+    - stop optimizing the broken full path
+    - treat the no-logit forward as a standalone target
+    - push the FP8 tiled matmul + softcap-stats kernel down into the same rough regime as the current forward lane before touching backward again
+  - Real-shape forward-only microbench target:
+    - `M=98304, K=512, V=8192`
+  - Starting point for the public no-logit forward path:
+    - about `0.00923 s`
+  - Tile sweeps on the direct stats kernel found large headroom:
+    - early winner: `(BLOCK_M, BLOCK_N, BLOCK_K, warps) = (32, 128, 64, 4)` at about `0.00375 s`
+    - better winner: `(64, 128, 128, 8)` at about `0.00256 s` for the core stats+finalize kernel when the timed region included the actual kernel launches and output buffers
+  - Structural cleanup:
+    - removed the dense `partial_target` matrix from the no-logit forward path
+    - replaced it with a per-row `target_logit` vector, since each row’s target belongs to exactly one vocab tile
+    - widened the finalize reduction from `BLOCK_SIZE_T=16` to `32`
+  - Public no-logit forward timings after tuning:
+    - with eager FP8 quantization: about `0.00294 s`
+    - with Triton FP8 quantization: about `0.00267 s`
+  - Reference forward-only wrapper timing on the same setup:
+    - about `0.00206 s`
+  - Read:
+    - this was a real forward-side recovery: about `3.4x` faster than the original no-logit forward attempt (`0.00923 s` to `0.00267 s`)
+    - it is also now roughly at the “2x faster than `0.0053 s`” target scale, if that `0.0053 s` reference is used
+    - however, the tuned no-logit public forward is still slower than the current `_scaled_mm`-based wrapper forward (`0.00267 s` vs `0.00206 s`)
+    - the easy tile-shape wins in this kernel family look mostly harvested; the next forward-side win likely needs a more serious GEMM-class implementation, probably descriptor/TMA-style or otherwise more persistent than the current pointer-load kernel
+
+- Iteration 4: pushed harder on the no-logit forward toward the `< 0.001 s` target and mapped the current ceiling.
+  - Better non-persistent pointer-kernel config:
+    - switched the forward stats kernel to `(BLOCK_M, BLOCK_N, BLOCK_K, warps, stages) = (128, 256, 128, 8, 3)`
+    - public no-logit forward with Triton quantization improved from about `0.00267 s` to about `0.00256 s`
+    - public no-logit forward with eager quantization improved from about `0.00294 s` to about `0.00282 s`
+  - Tried a persistent pointer-kernel scheduler:
+    - result regressed to about `0.00362 s`
+    - decision: rejected
+  - Tried moving toward a descriptor/TMA-style GEMM skeleton:
+    - blocked on Triton tensor-descriptor alignment constraints for contiguous FP8 tensors in this setup
+    - specifically, the FP8 layouts here have inner stride `1` byte, which the current `TensorDescriptor` helper rejects because strides must be `16`-byte aligned
+    - decision: not a viable quick drop-in path from the current cached FP8 layouts
+  - Checked whether temp allocation reuse was the hidden remaining overhead:
+    - reusing `x_fp8`, `partial_max`, `partial_sum`, `target_logit`, `losses`, and `lse` did not materially change the forward timing
+    - tuned forward stayed at about `0.00256 s`
+  - Current read:
+    - the present Triton pointer-kernel family appears to have a practical floor around `2.5 ms` on this shape
+    - getting below `1.0 ms` does not look plausible from more block-size tuning, persistent scheduling in this form, or workspace reuse
+    - the next real move would need a different implementation class entirely, likely a Hopper-specific GEMM path that can consume FP8 efficiently without the descriptor-alignment issue of the current Triton helper route
+
+- Iteration 5: switched the no-logit forward stats kernel to `tl.make_block_ptr` loads.
+  - Rationale:
+    - descriptor/TMA via `TensorDescriptor` was blocked by FP8 stride-alignment constraints in this setup
+    - `tl.make_block_ptr` still gives a more GEMM-like block-load path without that specific helper limitation
+  - Best public forward-only result on the same shape after the switch:
+    - wrapper forward: about `0.00206 s`
+    - no-logit forward with eager FP8 quantization: about `0.00266 s`
+    - no-logit forward with separate Triton FP8 quantization: about `0.00241 s`
+  - Comparison vs previous best public no-logit forward:
+    - previous best: about `0.00256 s`
+    - `make_block_ptr` best: about `0.00241 s`
+    - gain: about `6%`
+  - Extra check:
+    - tried fusing activation quantization directly into the `make_block_ptr` GEMM tile loop
+    - result regressed to about `0.00314 s`
+    - decision: rejected; keep the separate Triton quantizer ahead of the block-pointer kernel
+  - Read:
+    - `make_block_ptr` is a real improvement and is now the best forward-only no-logit path checked here
+    - the gain is meaningful but still nowhere near the `< 0.001 s` target
+    - getting the next large jump will likely require a more Hopper-specialized MMA path than plain Triton block-pointer `tl.dot`
+
+- Iteration 6: fixed and wired a grouped block-pointer stats kernel, then re-measured the public forward path with CUDA events.
+  - Bug fix:
+    - the first grouped/autotuned version incorrectly let autotune vary `BLOCK_SIZE_N`, even though the partial-buffer layout assumes a fixed vocab tile width
+    - that could alias partial writes and give invalid speedups
+    - fixed by pinning `BLOCK_SIZE_N=256` and autotuning only `BLOCK_SIZE_M`, `BLOCK_SIZE_K`, `GROUP_SIZE_M`, stages, and warps
+  - Public forward-only timing on the real shape after wiring the corrected grouped kernel:
+    - no-logit forward: about `2.335 ms`
+    - wrapper forward: about `2.025 ms`
+  - Comparison vs previous best public no-logit forward:
+    - previous best: about `2.407 ms`
+    - grouped block-pointer best: about `2.335 ms`
+    - gain: about `3.0%`
+  - Kernel breakdown with CUDA events:
+    - Triton FP8 activation quantization: about `0.052 ms`
+    - grouped no-logit stats kernel: about `2.031 ms`
+    - finalize reduction over `partial_max` / `partial_sum`: about `0.063 ms`
+    - wrapper `_scaled_mm`: about `0.896 ms`
+    - wrapper fused CE over dense logits: about `0.873 ms`
+    - wrapper public forward total: about `2.100 ms`
+    - no-logit public forward total: about `2.375 ms`
+  - Read:
+    - the remaining blocker is the fused stats kernel itself, not quantization and not the second-pass finalize reduction
+    - removing the logits write is not enough if the replacement fused GEMM+softcap kernel is materially slower than `_scaled_mm`
+    - on this shape, the custom fused stats kernel is already slower than `_scaled_mm + CE` before quantization/finalize overheads are added
+
+- Iteration 7: tried a descriptor/TMA-style persistent forward kernel with contiguous `weight_fp8_cm`.
+  - Important correction:
+    - the earlier descriptor failure was not a universal FP8/TMA dead end
+    - a row-major contiguous weight cache (`weight_fp8_cm`, shape `[V, K]`) does satisfy the descriptor layout requirements for this problem shape
+  - New experiment:
+    - added a device-side `tl.make_tensor_descriptor` persistent kernel that builds descriptors for `x_fp8` and `weight_fp8_cm` inside the kernel and performs the same softcap+stats epilogue without storing logits
+    - checked the relevant Hopper scheduling modes:
+      - `warp_specialize=False, flatten=False`: about `2.472 ms`
+      - `warp_specialize=False, flatten=True`: about `2.431 ms`
+      - `warp_specialize=True, flatten=False`: about `2.486 ms`
+      - `warp_specialize=True, flatten=True`: about `2.425 ms`
+  - Read:
+    - this is a genuinely different implementation class from the block-pointer path, but on the current Triton 3.5.1 stack it still loses to the grouped block-pointer stats kernel (`~2.03 ms`)
+    - the dominant blocker is now very concrete:
+      - matching `_scaled_mm` requires a GEMM implementation that stays near cuBLASLt-class FP8 throughput even after adding the softcap epilogue
+      - the present Triton fused kernels are not there yet; they spend more time in the fused matmul+stats kernel than the wrapper spends in `_scaled_mm` plus a separate CE pass
+
+- Iteration 8: isolated the custom LM-head matmul from the fused softcap/CE epilogue.
+  - Method:
+    - benchmarked a fixed grouped Triton kernel with the same `make_block_ptr` loads and `tl.dot` mainloop as the fused stats kernel, but writing only one scalar sink per tile so the matmul work is retained and dense logits are never stored
+    - compared it directly against the same fixed grouped kernel with the full softcap+row-stats epilogue, and against `_scaled_mm`
+  - Real-shape CUDA-event timings:
+    - custom grouped matmul-only sink kernel: about `0.890 ms`
+    - `_scaled_mm`: about `0.865 ms`
+    - same grouped kernel with fused softcap+row-stats epilogue: about `2.164 ms`
+    - implied epilogue plus partial-stat overhead on top of the custom matmul: about `1.275 ms`
+  - Read:
+    - the custom FP8 LM-head matmul is not the main problem anymore; it is already close to `_scaled_mm`
+    - the current slowdown is dominated by the fused softcap/CE row-stat epilogue, not by the tiled matmul itself
+    - the next serious optimization target is the no-materialization CE/statistics design, especially how the rowwise reductions and partial writes are structured
+
+- Iteration 9: replaced the two-pass partial-stats forward with a row-owner online-LSE kernel.
+  - Design:
+    - one kernel owns a block of rows
+    - it streams all vocab tiles for those rows
+    - updates `row_max`, `row_sum`, and `target_logit` online in registers
+    - writes only final `losses` and `lse`
+    - this removes `partial_max`, `partial_sum`, and the finalize kernel from the forward path entirely
+  - First pass regressed:
+    - initial row-owner kernel: about `2.655 ms` public no-logit forward
+    - cause was mainly poor kernel shape for the online-reduction workload
+  - After retuning the row-owner kernel to allow smaller vocab tiles:
+    - public no-logit forward: about `2.293 ms`
+    - wrapper forward: about `2.030 ms`
+    - previous best no-logit public forward: about `2.335 ms`
+    - gain vs previous best no-logit forward: about `1.8%`
+  - Component breakdown after retuning:
+    - Triton FP8 quantization: about `0.055 ms`
+    - row-owner online-LSE kernel: about `2.076 ms`
+    - old two-pass grouped stats kernel: about `2.078 ms`
+    - old finalize kernel: about `0.064 ms`
+  - Read:
+    - the row-owner design did exactly what it was supposed to structurally: it eliminated the partial-stat round trip and the finalize kernel
+    - however, the partial-stat buffers and finalize kernel were only a small part of the total forward cost on this shape
+    - most of the remaining epilogue overhead is the in-kernel softcap/LSE/target work itself, not the old partial-buffer plumbing
+
+- Iteration 10: replaced sigmoid softcap with hardware-tanh softcap (PTX `tanh.approx.f32`).
+  - Motivation:
+    - Iteration 9 confirmed the dominant residual cost is the in-kernel softcap/LSE SFU work, not plumbing.
+    - `A*sigmoid(x/C)` with `A=2s`, `C=s/2` is CE-equivalent (up to a row-wise constant) to `s*tanh(x/s)` — one MUL, one MUFU.TANH, one MUL, instead of `mul+rcp+exp+add+mul` that `tl.sigmoid` lowers to.
+  - What went in:
+    - single-instruction PTX helper `_ptx_tanh` using `tanh.approx.f32` inline asm (this is the sm_90 MUFU.TANH path).
+    - row-owner online-LSE kernel now uses `softcap * _ptx_tanh(logits * inv_softcap)` for both the tile softcap and the `target_logit` softcap.
+  - Pitfall observed:
+    - `triton.language.extra.cuda.libdevice.tanh` compiles to `__nv_tanhf`, a software polynomial. Using it regressed the kernel to `~2.774 ms`. Only the PTX intrinsic hits the hardware SFU op.
+  - Apples-to-apples CUDA-event timings on the real training shape (`M=98304, K=512, V=8192`, softcap 30, tensorwise FP8):
+    - `_scaled_mm` alone (GEMM-only ceiling): `~0.946 ms`
+    - Wrapper: `_scaled_mm` + fused softcap+CE over materialized bf16 logits: `~1.661 ms`
+    - Previous best fused row-owner (sigmoid): `~2.076 ms`
+    - New fused row-owner (PTX tanh): `~1.502 ms`
+  - Read:
+    - First fused-kernel configuration that actually beats the wrapper: `1.502 ms` vs `1.661 ms` (~10% faster end-to-end fwd, ~28% faster than the sigmoid fused path).
+    - Ratio to `_scaled_mm`-only ceiling dropped from `~2.4x` (sigmoid) to `~1.59x` (tanh), confirming SFU throughput was the binding constraint.
+    - Autotune picked a larger tile after the swap (`M=128, N=256, K=64, warps=8, stages=3`), which is consistent with SFU pressure being the thing that used to force small N tiles.
+  - Accuracy of `tanh.approx.f32`:
+    - Isolated vs IEEE `torch.tanh` on the same FP8 GEMM output (so FP8 noise cancels):
+      - max `|loss - IEEE|`: `0.0087`, mean: `7.8e-4`
+      - max `|lse  - IEEE|`: `1.4e-4`, mean: `2e-5`
+    - Loss magnitude `~9.2` → worst-case relative error `~1e-3`, mean `~1e-4`. Well below bf16 noise and an order of magnitude below FP8 quantization noise.
+  - Caveat:
+    - Backward kernels (`fused_fp8_softcap_ce_dx_recompute_kernel`, `fused_fp8_softcap_ce_dw_recompute_kernel`) still use the sigmoid-form gradient `A * sigmoid_u * (1 - sigmoid_u) * inv_C`. They need to be ported to the tanh-form gradient `1 - tanh(x/s)^2` before end-to-end training on this kernel will produce correct grads.
+
+- Iteration 11: attempted warp-specialization; landed on TMA-descriptor row-owner instead.
+  - Warp-specialize attempt on the existing block-pointer row-owner kernel:
+    - adding `warp_specialize=True` to the inner N-tile `tl.range` triggered an internal MLIR assertion in `WSLowerToken.cpp:73` (Triton 3.5.1). WS lowering does not appear to support `tl.make_block_ptr` in this kernel shape.
+  - Ported the row-owner to `tl.make_tensor_descriptor` (TMA) loads — new kernel `fused_fp8_softcap_ce_rowreduce_desc_ws_kernel`.
+    - It takes `weight_fp8_cm` (row-major `[V, K]`) and does `tl.dot(x, w.T, acc)`, matching the descriptor pattern from the earlier desc-persistent kernel.
+    - With `WARP_SPECIALIZE=False` it compiled and ran cleanly at `~1.408 ms` — another `~7%` faster than the block-pointer row-owner at `~1.508 ms`.
+    - With `WARP_SPECIALIZE=True` compilation failed in `WSDataPartition.cpp:1196`: `reduceOp.getAxis() != dim && "reduce should not happen on the partitioned dimension"`.
+    - Root cause: the row-owner design reduces over `axis=1` (N, vocab) in `tl.max` / `tl.sum` / LSE rescale. WS's automatic data-partitioner picks N as the warp partition dim because it is the natural tile width, which collides with the reduction.
+  - Read:
+    - WS-inside-inner-loop is structurally incompatible with this row-owner design. To get WS we would need a 2D persistent `(M_block, N_block)` tile loop with partial stats and a finalize kernel (the desc-persistent design from Iteration 7), which trades away the row-owner single-pass property.
+    - Even without WS, moving the row-owner to TMA loads is a clean win over block pointers, so the TMA kernel becomes the new best single-pass forward.
+  - Apples-to-apples CUDA-event timings on the same real training shape:
+    - block-pointer row-owner + PTX tanh: `~1.508 ms`
+    - TMA-descriptor row-owner + PTX tanh (no WS): `~1.408 ms`
+    - wrapper (`_scaled_mm` + fused softcap+CE over bf16 logits): `~1.678 ms`
+    - `_scaled_mm` alone: `~0.968 ms`
+  - Cumulative win vs Codex's sigmoid block-pointer row-owner (`~2.076 ms`): **~32%** faster; vs wrapper: **~16%** faster.
+  - Follow-ups not yet taken:
+    - wire the TMA descriptor kernel into `NoLogitFusedFP8SoftcapCrossEntropyFn` so the training path uses it
+    - port backward kernels to the tanh gradient form so end-to-end training is correct on this kernel
+    - if WS is still desired, revisit the 2D persistent partial-stats kernel (now with PTX tanh swapped in) as a separate variant
+
+- Iteration 12: re-measured matmul-only floor. Iteration 8's number was badly under-tuned.
+  - Motivation:
+    - Iteration 8 claimed our no-write Triton matmul maxed out at ~`0.890 ms`, essentially matching `_scaled_mm` at `0.865 ms`, and used that to justify "no-write gives no GEMM-perf advantage on this shape."
+    - That conclusion shaped subsequent iterations — it is wrong.
+  - New experiment:
+    - fresh `bench_matmul_only.py` writes a persistent 2D tile kernel using `tl.make_tensor_descriptor` loads, grouped PID (`GROUP_SIZE_M`), `tl.range` with `flatten` and optional `warp_specialize`, and a single-scalar sink (each CTA writes one f32) so the compute work is preserved but no logits hit HBM.
+    - autotune over `BLOCK_SIZE_M ∈ {64,128,256}`, `BLOCK_SIZE_N ∈ {64,128,256}`, `BLOCK_SIZE_K ∈ {64,128}`, `GROUP_SIZE_M ∈ {4,8}`, stages ∈ {3,4}, warps ∈ {4,8}.
+  - CUDA-event timings on the real training shape (`M=98304, K=512, V=8192`, tensorwise FP8), same process as `_scaled_mm`:
+    - `_scaled_mm`: ~`0.921–0.939 ms` (~`45%` FP8 peak)
+    - matmul-only persistent, `WS=False, flatten=False`: ~`0.759 ms` (~`55%` peak)
+    - matmul-only persistent, `WS=False, flatten=True`: ~`0.656–0.694 ms` (~`60–64%` peak)
+    - matmul-only persistent, `WS=True,  flatten=False`: ~`0.764–0.774 ms`
+    - matmul-only persistent, `WS=True,  flatten=True`: ~`0.668–0.713 ms`
+  - Winning config in both runs: `BLOCK_M=256, BLOCK_N=128, BLOCK_K∈{64,128}, GROUP_SIZE_M=8, num_warps=8, num_stages=3`.
+  - Read:
+    - Our no-write Triton GEMM runs **~25–30% faster** than `_scaled_mm` on this shape. The claim "the write is fully hidden by WGMMA on H100 at K=512, so no-write gives no GEMM-perf advantage" was empirically false.
+    - Missing levers that Codex never tried:
+      - `BLOCK_M=256` (gave the biggest single win — `flatten` picked it in both runs)
+      - `flatten=True` on the persistent outer loop (consistently ~`0.1 ms` faster than `flatten=False`)
+    - WS did not help the matmul-only kernel (`0.694` vs `0.713`, basically a wash). Triton's default async pipeline with `num_stages=3 + flatten` already hides load latency on this shape. WS is only useful if there is a fat epilogue stalling the pipeline.
+  - Implication for the fused kernel target:
+    - Fused floor is now `~0.66 ms` (matmul-only at `WS=False, flatten=True`), not `~0.87 ms`.
+    - Sub-`1 ms` fused forward is achievable even with `~0.25–0.3 ms` of *exposed* epilogue cost.
+    - Correct target design is **2D persistent + flatten + TMA** with partial-stats + a cheap finalize kernel, plus the PTX tanh softcap. WS is optional polish, not on the critical path.
+
 ## Unexplored Big Gains
 
 - A true GEMM-class custom kernel for LM-head projection with on-the-fly local scaling.
