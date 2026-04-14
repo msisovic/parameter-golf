@@ -518,6 +518,55 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
     - Sub-`1 ms` fused forward is achievable even with `~0.25–0.3 ms` of *exposed* epilogue cost.
     - Correct target design is **2D persistent + flatten + TMA** with partial-stats + a cheap finalize kernel, plus the PTX tanh softcap. WS is optional polish, not on the critical path.
 
+- Iteration 13: tried to actually transfer the matmul-only ceiling to the fused kernel. Result: it does not compose cleanly.
+  - Motivation:
+    - Iteration 12 showed a `0.66 ms` matmul-only ceiling. Transferring that win into the fused forward was the whole point.
+  - What was tried (all with `WS=False` and PTX tanh throughout):
+    1. **2D persistent stats (BLOCK_M=256) + finalize**: widened `_fused_fp8_softcap_ce_desc_persistent_configs` to include `BLOCK_M ∈ {128, 256}` and `BLOCK_N ∈ {64, 128, 256}`. Swapped sigmoid for PTX tanh in both the stats kernel and the existing finalize kernel.
+    2. **Row-owner in persistent grid**: new kernel `fused_fp8_softcap_ce_rowreduce_desc_persistent_kernel` that keeps the row-owner single-pass online-LSE (registers only, no partials) but puts the outer row-block iteration inside a persistent `tl.range(start_pid, num_row_blocks, NUM_SMS, flatten=FLATTEN)` so it can use the flatten scheduling hint.
+    3. **Row-owner autotune** also widened to `BLOCK_M ∈ {64, 128, 256}` and `BLOCK_N ∈ {64, 128, 256}`.
+  - CUDA-event timings on the real training shape:
+    - 2D persistent stats+finalize, `flatten=False`, best config `BLOCK_M=256, BLOCK_N=128, BLOCK_K=128, GROUP=8`: `~1.568 ms`
+    - 2D persistent stats+finalize, `flatten=True`, best config `BLOCK_M=128, BLOCK_N=128, BLOCK_K=128`: `~1.685 ms` (flatten hurt here)
+    - Persistent row-owner, `flatten=False`, best `BLOCK_M=128, BLOCK_N=256, BLOCK_K=128`: `~1.514 ms`
+    - Persistent row-owner, `flatten=True`, best `BLOCK_M=256, BLOCK_N=128, BLOCK_K=128`: `~1.484 ms`
+    - Non-persistent row-owner TMA (Iteration 11's best, unchanged): `~1.405 ms`
+    - Matmul-only ceiling (Iteration 12): `~0.656 ms`
+  - Read — why the matmul-only win did not transfer:
+    - `flatten=True` speeds up outer-loop pipelining *per SM*. Amortization ratios:
+      - Matmul-only 2D tiles: `24,576 ÷ 132 ≈ 186` iterations per SM → big pipeline amortization → `~0.10 ms` saved.
+      - Persistent row-owner over row-blocks only: `768 ÷ 132 ≈ 6` iterations per SM → almost nothing to pipeline → only `~0.03 ms` saved (`1.514 → 1.484`).
+      - 2D persistent stats has the same `186` tiles/SM, but `flatten=True` actively hurt it (`1.568 → 1.685 ms`): a nontrivial per-tile epilogue (`tanh + max + sum + target-search + 3 stores`) steals compute from the next tile's WGMMA that flatten tries to overlap with it.
+    - Net: the matmul-only ceiling is an epilogue-free artifact. With any meaningful per-tile epilogue, the effective fused ceiling is significantly higher.
+    - Register pressure confirmation: the 2D stats kernel with `flatten=True` fell back to `BLOCK_M=128, BLOCK_N=128` once the full epilogue was compiled in, even though `BLOCK_M=256, BLOCK_N=128` was available in the config space. The `tl.where` target-search (full `BLOCK_M × BLOCK_N` mask + gather) is a plausible prime contributor.
+  - Candidates to unlock the matmul-only ceiling:
+    - Slim the per-tile epilogue so it composes with `flatten`. Prime suspect: remove the target-logit `tl.where` from the per-tile path (it needs a full `BLOCK_M × BLOCK_N` mask), and recover the target logit via a separate cheap gather kernel on the side.
+    - Split the fused kernel into: `(a)` a raw GEMM + softcap + LSE-stats kernel shaped to match matmul-only (`BLOCK_M=256, flatten=True`), and `(b)` a tiny targets-only pass.
+    - WS is still off the table for the row-owner's reduction axis; revisit only if a layout change makes WS's auto-partitioner pick a non-reduced axis.
+
+- Iteration 14: slim 2D persistent stats + separate targets kernel + finalize — `flatten=True` becomes a real win.
+  - Design:
+    - `fused_fp8_softcap_ce_slim_stats_kernel`: 2D persistent, grouped PID, TMA descriptors, PTX tanh softcap, per-tile online stats (`tile_max`, `tile_sum`). **No** target-logit `tl.where` in the hot loop — removed the full `BLOCK_M × BLOCK_N` mask that had been forcing the autotuner to fall back to smaller tiles.
+    - `fused_fp8_softcap_ce_targets_kernel`: one program per row, dot-products `x[row]` with `w[targets[row]]` (K=512). Trivial FLOPs, ~100 MB of HBM reads mostly served from L2 (w is only 4 MB so it's L2-resident). Writes `target_logit[M]`.
+    - Existing `fused_fp8_softcap_ce_finalize_nologits_kernel` reduces partials and subtracts the PTX-tanh'd target logit to produce `losses`, `lse`.
+  - CUDA-event timings on the real training shape (same harness as prior iterations, no FP8 quantization in the timed region — the `x_fp8` is precomputed once; all row-owner / wrapper numbers in this iteration's table are under the same protocol and are directly comparable):
+    - Wrapper `_scaled_mm + fused softcap+CE`: `~1.68 ms`
+    - Row-owner non-persistent TMA (prior best, Iteration 11): `~1.405 ms`
+    - Slim `flatten=False`, best `BLOCK_M=128, BLOCK_N=256, BLOCK_K=64, GROUP=8`: `~1.390 ms`
+    - **Slim `flatten=True`**, best `BLOCK_M=128, BLOCK_N=256, BLOCK_K=128, GROUP=8`: **`~1.169 ms`**
+    - Matmul-only ceiling (Iteration 12): `~0.656 ms`
+  - Progress:
+    - `~17%` faster than the previous best fused kernel (`1.405 → 1.169 ms`).
+    - `~30%` faster than the wrapper under the same no-quant timing protocol (`1.68 → 1.17 ms`).
+    - Gap to matmul-only ceiling shrunk from `~2.15x` (row-owner) to `~1.78x` (slim).
+  - Public-forward note for apples-to-apples against Codex's earlier numbers:
+    - Codex's wrapper/fused measurements (`~2.03 ms` / `~2.29 ms`) were taken through the public `apply` paths that include the Triton FP8 quantization pass (`~0.055 ms`) plus autograd.Function overhead.
+    - Adding that same overhead back to this iteration's slim path gives a projected public forward of `~1.22 ms` vs Codex's `2.29 ms` — about `~46%` faster end-to-end for the no-logit public forward if these microbench wins transfer.
+  - Read:
+    - Removing the target `tl.where` from the per-tile hot path was the key unlock, exactly as hypothesized in Iteration 13: `flatten=True` could not overlap next-tile WGMMA with a fat epilogue, but a slim epilogue lets the overlap actually land.
+    - Autotune picked `BLOCK_M=128` (not `256`) under the slim epilogue with `flatten=True`. `BLOCK_N=256` was preferred — suggests the freed register budget went into wider N tiles rather than taller M tiles. Worth a follow-up probe explicitly forcing `BLOCK_M=256` to check whether autotune under-explored it.
+    - The separate targets kernel is cheap (K=512 dot per row, ~100 MB of HBM reads with most of `w` hot in L2) and did not dominate the total time; a component breakdown would confirm exactly where the 1.17 ms is spent.
+
 ## Unexplored Big Gains
 
 - A true GEMM-class custom kernel for LM-head projection with on-the-fly local scaling.

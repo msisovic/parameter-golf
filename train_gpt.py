@@ -907,23 +907,25 @@ def _fused_fp8_softcap_ce_blockptr_configs():
 
 
 def _fused_fp8_softcap_ce_desc_persistent_configs():
-    return [
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": bm,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": gm,
-            },
-            num_stages=stages,
-            num_warps=warps,
-        )
-        for bm in [128]
-        for bk in [64, 128]
-        for gm in [8, 16]
-        for stages in [3, 4]
-        for warps in [8]
-    ]
+    configs = []
+    for bm, bn in [(128, 256), (256, 128), (128, 128), (256, 64)]:
+        for bk in [64, 128]:
+            for gm in [4, 8, 16]:
+                for stages in [3, 4]:
+                    for warps in [8]:
+                        configs.append(
+                            triton.Config(
+                                {
+                                    "BLOCK_SIZE_M": bm,
+                                    "BLOCK_SIZE_N": bn,
+                                    "BLOCK_SIZE_K": bk,
+                                    "GROUP_SIZE_M": gm,
+                                },
+                                num_stages=stages,
+                                num_warps=warps,
+                            )
+                        )
+    return configs
 
 
 def _fused_fp8_softcap_ce_rowreduce_configs():
@@ -1133,12 +1135,207 @@ def _fused_fp8_softcap_ce_rowreduce_ws_configs():
             num_stages=stages,
             num_warps=warps,
         )
-        for bm in [64, 128]
-        for bn in [128, 256]
+        for bm in [64, 128, 256]
+        for bn in [64, 128, 256]
         for bk in [64, 128]
         for stages in [3, 4]
         for warps in [4, 8]
     ]
+
+
+def _fused_fp8_softcap_ce_slim_configs():
+    configs = []
+    for bm, bn in [(256, 128), (128, 256), (256, 64), (128, 128), (256, 256)]:
+        for bk in [64, 128]:
+            for gm in [4, 8]:
+                for stages in [3, 4]:
+                    for warps in [8]:
+                        configs.append(
+                            triton.Config(
+                                {
+                                    "BLOCK_SIZE_M": bm,
+                                    "BLOCK_SIZE_N": bn,
+                                    "BLOCK_SIZE_K": bk,
+                                    "GROUP_SIZE_M": gm,
+                                },
+                                num_stages=stages,
+                                num_warps=warps,
+                            )
+                        )
+    return configs
+
+
+@triton.jit
+def _grouped_pid_gm(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton.autotune(
+    configs=_fused_fp8_softcap_ce_slim_configs(),
+    key=["n_rows", "n_cols", "k_dim", "FLATTEN"],
+)
+@triton.jit
+def fused_fp8_softcap_ce_slim_stats_kernel(
+    x_fp8_ptr, weight_fp8_cm_ptr, scale_ab_ptr,
+    partial_max_ptr, partial_sum_ptr,
+    stride_partials_m, stride_partials_t,
+    n_rows, n_cols, k_dim,
+    A, C,
+    NUM_SMS: tl.constexpr,
+    FLATTEN: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(n_rows, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(n_cols, BLOCK_SIZE_N)
+    num_tiles = num_pid_m * num_pid_n
+    k_tiles = tl.cdiv(k_dim, BLOCK_SIZE_K)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    scale_ab = tl.load(scale_ab_ptr)
+    softcap = A * 0.5
+    inv_softcap = 1.0 / softcap
+    x_desc = tl.make_tensor_descriptor(
+        x_fp8_ptr,
+        shape=[n_rows, k_dim],
+        strides=[k_dim, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+    w_desc = tl.make_tensor_descriptor(
+        weight_fp8_cm_ptr,
+        shape=[n_cols, k_dim],
+        strides=[k_dim, 1],
+        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+    )
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=FLATTEN):
+        pid_m, pid_n = _grouped_pid_gm(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+        offs_m = pid_m * BLOCK_SIZE_M
+        offs_n = pid_n * BLOCK_SIZE_N
+        rows = offs_m + tl.arange(0, BLOCK_SIZE_M)
+        cols = offs_n + tl.arange(0, BLOCK_SIZE_N)
+        row_mask = rows < n_rows
+        col_mask = cols < n_cols
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            x = x_desc.load([offs_m, offs_k])
+            w = w_desc.load([offs_n, offs_k])
+            acc = tl.dot(x, w.T, acc)
+        logits = acc * scale_ab
+        valid = row_mask[:, None] & col_mask[None, :]
+        z = softcap * _ptx_tanh(logits * inv_softcap)
+        z = tl.where(valid, z, -float("inf"))
+        tile_max = tl.max(z, axis=1)
+        tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+        partial_ptrs = rows[:, None] * stride_partials_m + pid_n * stride_partials_t
+        tl.store(partial_max_ptr + partial_ptrs, tile_max[:, None], mask=row_mask[:, None])
+        tl.store(partial_sum_ptr + partial_ptrs, tile_sum[:, None], mask=row_mask[:, None])
+
+
+@triton.jit
+def fused_fp8_softcap_ce_targets_kernel(
+    x_fp8_ptr, weight_fp8_cm_ptr, scale_ab_ptr,
+    targets_ptr, target_logit_ptr,
+    n_rows, k_dim,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    # One program per row. Compute dot(x[row], w[target[row]]) * scale_ab.
+    row = tl.program_id(0).to(tl.int64)
+    if row >= n_rows:
+        return
+    target = tl.load(targets_ptr + row).to(tl.int64)
+    scale_ab = tl.load(scale_ab_ptr)
+    acc = 0.0
+    for off_k in range(0, k_dim, BLOCK_SIZE_K):
+        ks = off_k + tl.arange(0, BLOCK_SIZE_K)
+        k_mask = ks < k_dim
+        x = tl.load(x_fp8_ptr + row * k_dim + ks, mask=k_mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_fp8_cm_ptr + target * k_dim + ks, mask=k_mask, other=0.0).to(tl.float32)
+        acc += tl.sum(x * w, axis=0)
+    tl.store(target_logit_ptr + row, acc * scale_ab)
+
+
+@triton.autotune(
+    configs=_fused_fp8_softcap_ce_rowreduce_ws_configs(),
+    key=["n_rows", "n_cols", "k_dim", "FLATTEN"],
+)
+@triton.jit
+def fused_fp8_softcap_ce_rowreduce_desc_persistent_kernel(
+    x_fp8_ptr,
+    weight_fp8_cm_ptr,
+    scale_ab_ptr,
+    losses_ptr,
+    lse_ptr,
+    targets_ptr,
+    n_rows,
+    n_cols,
+    k_dim,
+    A,
+    C,
+    NUM_SMS: tl.constexpr,
+    FLATTEN: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0).to(tl.int32)
+    num_row_blocks = tl.cdiv(n_rows, BLOCK_SIZE_M)
+    k_tiles = tl.cdiv(k_dim, BLOCK_SIZE_K)
+    scale_ab = tl.load(scale_ab_ptr)
+    softcap = A * 0.5
+    inv_softcap = 1.0 / softcap
+    x_desc = tl.make_tensor_descriptor(
+        x_fp8_ptr,
+        shape=[n_rows, k_dim],
+        strides=[k_dim, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+    w_desc = tl.make_tensor_descriptor(
+        weight_fp8_cm_ptr,
+        shape=[n_cols, k_dim],
+        strides=[k_dim, 1],
+        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+    )
+    for row_pid in tl.range(start_pid, num_row_blocks, NUM_SMS, flatten=FLATTEN):
+        offs_m = row_pid * BLOCK_SIZE_M
+        rows = offs_m + tl.arange(0, BLOCK_SIZE_M)
+        row_mask = rows < n_rows
+        targets = tl.load(targets_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+        row_max = tl.full((BLOCK_SIZE_M,), -float("inf"), dtype=tl.float32)
+        row_sum = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+        target_logit = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+        for off_n in range(0, n_cols, BLOCK_SIZE_N):
+            cols = off_n + tl.arange(0, BLOCK_SIZE_N)
+            col_mask = cols < n_cols
+            acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+            for ki in range(k_tiles):
+                offs_k = ki * BLOCK_SIZE_K
+                x = x_desc.load([offs_m, offs_k])
+                w = w_desc.load([off_n, offs_k])
+                acc = tl.dot(x, w.T, acc)
+            logits = acc * scale_ab
+            valid = row_mask[:, None] & col_mask[None, :]
+            z = softcap * _ptx_tanh(logits * inv_softcap)
+            z = tl.where(valid, z, -float("inf"))
+            tile_max = tl.max(z, axis=1)
+            tile_sum = tl.sum(tl.exp(z - tile_max[:, None]), axis=1)
+            new_max = tl.maximum(row_max, tile_max)
+            row_sum = row_sum * tl.exp(row_max - new_max) + tile_sum * tl.exp(tile_max - new_max)
+            row_max = new_max
+            tile_target = tl.sum(tl.where(cols[None, :] == targets[:, None], logits, 0.0), axis=1)
+            has_target = row_mask & (targets >= off_n) & (targets < off_n + BLOCK_SIZE_N)
+            target_logit = tl.where(has_target, tile_target, target_logit)
+        lse = row_max + tl.log(row_sum)
+        z_target = softcap * _ptx_tanh(target_logit * inv_softcap)
+        tl.store(lse_ptr + rows, lse, mask=row_mask)
+        tl.store(losses_ptr + rows, lse - z_target, mask=row_mask)
 
 
 @triton.autotune(
@@ -1539,7 +1736,8 @@ def fused_fp8_softcap_ce_finalize_nologits_kernel(
         max_val = new_max
     lse = max_val + tl.log(sum_exp)
     tl.store(lse_ptr + row_idx, lse)
-    z_target = A * tl.sigmoid(target_logit * (1.0 / C))
+    softcap = A * 0.5
+    z_target = softcap * _ptx_tanh(target_logit * (1.0 / softcap))
     tl.store(losses_ptr + row_idx, lse - z_target)
 
 
