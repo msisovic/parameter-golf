@@ -588,3 +588,54 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
     - TorchAO axiswise with higher-precision grad-weight style config: about `0.03827 s`
   - Decision:
     - TorchAO is not a viable speed path on this stack.
+
+## Backward optimization (2026-04-15)
+
+- **Baseline**: nologit fused backward with original tile shapes (`dx BM=8,BN=256,BK=64`, `dw BM=32,BN=128,BK=64`): **125 ms** — catastrophically slow, 5.9× the split-path's **21 ms** (Triton dx/dw over stored logits).
+  - Root cause: tiny BLOCK_SIZE_M=8 for dx → 12K programs each recomputing full logits.
+  - Revealed that 500-step training at 3.6M tok/s vs 8.4M baseline was entirely caused by backward.
+
+- **Tile shape tuning**: bump dx to BM=64,BV=128,BK=256,w=8; dw to BM=64,BN=128,BK=256,w=8 → combined **14.9 ms**. 8.4× improvement.
+  - 500-step training: 7.48M tok/s, val_loss 3.3026. Still ~1M tok/s behind split-path baseline (8.4M).
+
+- **Discovering the real split-path backward**: `FusedFP8SoftcapCrossEntropyFn.backward` uses `fused_softcap_ce_bwd_kernel` (row-wise CE grad) + **cuBLAS** `@` for the two grad matmuls. Not the Triton dx/dw kernels (those are `FusedFP8SoftcapCrossEntropyDirectBwdFn`).
+  - Actual split-path bwd: **3.2 ms** (CE bwd 0.7ms + cuBLAS dx 1.2ms + cuBLAS dw 1.1ms, overlapped).
+  - Default (non-FP8) full path: fwd 10.1ms + bwd 11.6ms = 21.7ms.
+
+- **Persistent TMA slim backward kernels**: dx and dw with TMA descriptors, persistent scheduling, target comparison pulled out of hot loop. Best dx: BM=128,BV=128,BK=256,w=8,s=3 → **4.09 ms**. Best dw: BM=64,BV=128,BK=256,w=8,s=4 → **5.56 ms**. Combined + corrections: **10.0 ms**.
+
+- **Component decomposition** (dx at BM=128,BV=128,BK=256):
+  - FP8 recompute only: 1.86ms
+  - FP8 + bf16 grad matmul (no epilogue): 3.27ms (+1.41ms for bf16)
+  - Full (+ epilogue): 4.08ms (+0.81ms for epilogue)
+  - Key insight: dx and dw **independently recompute logits** — 2× FP8 GEMM waste.
+
+- **Forward logit writeback**: added `fused_fp8_softcap_ce_slim_stats_writeback_kernel` that stores bf16 logits to HBM during the epilogue (overlapped with tanh/exp compute).
+  - Writeback fwd: 1.45ms (vs 1.18ms no-writeback). Overhead: **+0.27ms**.
+  - Writeback fwd + cuBLAS bwd: **4.83 ms** total.
+  - Split-path (mm + CE + cuBLAS bwd): **5.00 ms** total.
+  - Memory cost: 1.6 GB logits buffer (same as split-path).
+  - Strictly better than split-path on both speed (−0.17ms) and memory (same).
+
+- **Fused dx+dw kernel attempt**: wrote `fused_fp8_softcap_ce_dxdw_kernel` — persistent TMA kernel tiling over (M, K_out), inner V-loop recomputes logits once (shared), dx via GEMM accumulation, dw via atomicAdd.
+  - **v1 (4-way K unroll)**: 4 dx accumulators + 4 dw GEMMs per V-tile. Best: 64ms. Register pressure + 8 bf16 GEMMs per V-tile killed occupancy.
+  - **v2 (dx_slim + atomicAdd dw)**: tile over (M, K_out) like dx_slim, 1 dx acc + 1 dw atomicAdd per V-tile. Best: BM=128,BV=128,BK=128,w=8,s=4 → **33 ms**. atomicAdd contention from 768 M-tiles writing to 64 V-tile slots destroyed performance.
+  - Root cause: Triton tile-based bf16 GEMM reduction (64 tiny [BM,BV]×[BV,BK] matmuls per output tile) is ~5× slower than cuBLAS's single large [98304,8192]×[8192,512] GEMM.
+
+- **FP8 backward GEMMs exploration**: FP8 dx+dw GEMMs alone: **1.15 ms** (vs 2.25ms bf16). 2× speedup.
+  - But quantizing grad_logits [98304,8192] to FP8: 10.6ms. Contiguous transpose for dw: 6.8ms.
+  - Full pipeline (CE bwd + quant + transpose + FP8 GEMMs): **18.6 ms** vs bf16 path's 3.2ms.
+  - Verdict: quantization/transpose overhead on the 1.6 GB tensor overwhelms the GEMM speedup.
+
+- **cuBLAS GEMM breakdown**:
+  - bf16 dx [98304,8192]@[8192,512]: 1.05ms
+  - bf16 dw [8192,98304]@[98304,512]: 1.04ms
+  - bf16 dx+dw combined: 2.37ms (CE bwd ~0.8ms → total 3.2ms)
+  - FP8 fwd mm [98304,512]@[512,8192]: 0.87ms
+
+- **Conclusion**: recompute-based Triton backward cannot compete with cuBLAS for these shapes. cuBLAS bf16 backward at 3.2ms is the floor. Best practical path:
+  - **Writeback approach**: nologit fwd with logit writeback (2.1ms) + cuBLAS bwd (3.2ms) = **5.3ms total**.
+  - **Split-path**: FP8 mm + CE fwd (1.2ms) + cuBLAS bwd (3.2ms) = **4.4ms total**.
+  - The 3ms bwd target is essentially at the cuBLAS floor — not achievable via Triton recompute.
+
+- **Next**: wire the winning backward approach (cuBLAS) into `NoLogitFusedFP8SoftcapCrossEntropyFn.backward` and run a training comparison.
