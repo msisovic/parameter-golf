@@ -40,6 +40,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 3e1))
     fp8_lm_head = bool(int(os.environ.get("FP8_LM_HEAD", "0")))
+    fp8_mlp = bool(int(os.environ.get("FP8_MLP", "0")))
     train_ce_float = bool(int(os.environ.get("TRAIN_CE_FLOAT", "1")))
     fused_softcap_ce = bool(int(os.environ.get("FUSED_SOFTCAP_CE", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 1e4))
@@ -615,6 +616,7 @@ def linear_leaky_relu_square_kernel(
     b_desc,
     c_desc,
     aux_desc,
+    scale_ab,
     M,
     N,
     K,
@@ -623,6 +625,7 @@ def linear_leaky_relu_square_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     NUM_SMS: tl.constexpr,
     FORWARD: tl.constexpr,
+    FP8_GEMM: tl.constexpr,
 ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -631,6 +634,8 @@ def linear_leaky_relu_square_kernel(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
     tile_id_c = start_pid - NUM_SMS
+    if FP8_GEMM:
+        s = tl.load(scale_ab)
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m = tile_id // num_pid_n
         pid_n = tile_id % num_pid_n
@@ -642,6 +647,8 @@ def linear_leaky_relu_square_kernel(
             a = a_desc.load([offs_am, offs_k])
             b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
+        if FP8_GEMM:
+            accumulator = accumulator * s
         tile_id_c += NUM_SMS
         offs_am_c = offs_am
         offs_bn_c = offs_bn
@@ -664,19 +671,34 @@ def linear_leaky_relu_square_kernel(
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], aux1 * aux1)
 
 
-def linear_leaky_relu_square(a, b, aux=None):
+# Default FP8 scale for MLP activations (used until first delayed-scale update)
+_MLP_FP8_DEFAULT_ACT_SCALE = 6.0 / 448.0
+
+
+def linear_leaky_relu_square(a, b, aux=None, fp8_gemm=False, w_fp8=None, scale_ab=None):
     M, K = a.shape
-    N, K2 = b.shape
-    assert K == K2
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    N = (w_fp8 if w_fp8 is not None else b).shape[0]
+    assert K == (w_fp8 if w_fp8 is not None else b).shape[1]
+    c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     forward = aux is None
     if aux is None:
-        aux = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        aux = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
     BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 256, 64
     num_stages = 4 if forward else 3
-    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
-    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+
+    if fp8_gemm and forward:
+        # FP8 forward: quantize x with fixed scale (post-RMSNorm activations)
+        act_scale = _MLP_FP8_DEFAULT_ACT_SCALE
+        a_fp8 = (a / act_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+        scale_ab = act_scale * scale_ab
+        a_desc = TensorDescriptor.from_tensor(a_fp8, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor.from_tensor(w_fp8, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    else:
+        scale_ab = torch.empty(1, device=a.device, dtype=torch.float32)  # dummy
+        a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+
     c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
     aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
     grid = lambda _meta: (
@@ -687,6 +709,7 @@ def linear_leaky_relu_square(a, b, aux=None):
         b_desc,
         c_desc,
         aux_desc,
+        scale_ab,
         M,
         N,
         K,
@@ -695,6 +718,7 @@ def linear_leaky_relu_square(a, b, aux=None):
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         NUM_SMS=num_sms,
         FORWARD=forward,
+        FP8_GEMM=fp8_gemm and forward,
         num_stages=num_stages,
         num_warps=8,
     )
@@ -705,9 +729,12 @@ def linear_leaky_relu_square(a, b, aux=None):
 
 class FusedLinearLeakyReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w1, w2):
+    def forward(ctx, x, w1, w2, w1_fp8=None, scale_ab=None):
         x_flat = x.reshape(-1, x.shape[-1])
-        pre, post = linear_leaky_relu_square(x_flat, w1)
+        fp8_gemm = w1_fp8 is not None
+        pre, post = linear_leaky_relu_square(
+            x_flat, w1, fp8_gemm=fp8_gemm, w_fp8=w1_fp8, scale_ab=scale_ab,
+        )
         out = F.linear(post, w2)
         ctx.save_for_backward(x, w1, w2, pre, post)
         return out.view(*x.shape[:-1], out.shape[-1])
@@ -721,7 +748,7 @@ class FusedLinearLeakyReLUSquareFunction(torch.autograd.Function):
         dpre = linear_leaky_relu_square(grad_output_flat, w2.T.contiguous(), aux=pre)
         dw1 = dpre.T @ x_flat
         dx = dpre @ w1
-        return dx.view_as(x), dw1, dw2
+        return dx.view_as(x), dw1, dw2, None, None
 
 
 FusedLeakyReLUSquareMLP = FusedLinearLeakyReLUSquareFunction.apply
@@ -845,10 +872,15 @@ class MLP(nn.Module):
     def __init__(self, dim, mlp_mult):
         super().__init__()
         self.use_fused = True
+        self.up_w_fp8 = None  # set by GPT model when FP8_MLP=1
+        self.up_w_scale = None
 
     def forward(self, x, up_w, down_w):
         if self.training and self.use_fused:
-            return FusedLeakyReLUSquareMLP(x, up_w.to(x.dtype), down_w.to(x.dtype))
+            return FusedLeakyReLUSquareMLP(
+                x, up_w.to(x.dtype), down_w.to(x.dtype),
+                self.up_w_fp8, self.up_w_scale,
+            )
         hidden = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5).square()
         self._last_down_input = hidden.detach() if getattr(self, "_calib", False) else None
         return F.linear(hidden, down_w.to(x.dtype))
@@ -912,6 +944,9 @@ class GPT(nn.Module):
         self.fused_softcap_ce = h.fused_softcap_ce
         self.register_buffer("fp8_lm_head_weight_t", None, persistent=False)
         self.register_buffer("fp8_lm_head_weight_scale", None, persistent=False)
+        self.fp8_mlp = h.fp8_mlp
+        self._mlp_up_fp8 = None  # cached FP8 up-proj weights [num_layers, hidden, model_dim]
+        self._mlp_up_scale = None  # per-layer scale [num_layers]
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
@@ -1040,6 +1075,22 @@ class GPT(nn.Module):
         w_fp8 = (weight / w_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
         self.fp8_lm_head_weight_t = w_fp8.t()
         self.fp8_lm_head_weight_scale = w_scale
+
+    @torch.no_grad()
+    def refresh_fp8_mlp_cache(self):
+        if not self.fp8_mlp:
+            for block in self.blocks:
+                block.mlp.up_w_fp8 = None
+                block.mlp.up_w_scale = None
+            return
+        # Quantize each layer's up_w [hidden, model_dim] to FP8 tensorwise
+        up = self.mlp_up_bank.detach()  # [num_layers, hidden, model_dim]
+        for i, block in enumerate(self.blocks):
+            w = up[i]
+            w_scale = w.abs().amax().float().clamp_min(1e-12) / 448.0
+            w_fp8 = (w / w_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+            block.mlp.up_w_fp8 = w_fp8
+            block.mlp.up_w_scale = w_scale  # scalar tensor on GPU
 
     def _project_logits(self, x):
         x = self.final_norm(x)
@@ -2611,6 +2662,7 @@ def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
     base_model.refresh_fp8_lm_head_cache()
+    base_model.refresh_fp8_mlp_cache()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     compiled_forward_logits = torch.compile(
         base_model.forward_logits, dynamic=False, fullgraph=True
@@ -2669,6 +2721,7 @@ def train_model(h, device, val_data):
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
         optimizers.step(distributed=h.distributed)
         base_model.refresh_fp8_lm_head_cache()
+        base_model.refresh_fp8_mlp_cache()
         return train_loss
 
     if h.warmup_steps > 0:
@@ -2735,6 +2788,7 @@ def train_model(h, device, val_data):
             opt.load_state_dict(state)
         optimizers.zero_grad_all()
         base_model.refresh_fp8_lm_head_cache()
+        base_model.refresh_fp8_mlp_cache()
         train_loader = DocumentPackingLoader(h, device)
     ema_state = {
         name: t.detach().float().clone()
