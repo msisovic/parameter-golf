@@ -1,0 +1,449 @@
+{
+  "assumptions": {
+    "doc_boundaries": "BOS-delimited documents recovered from validation shard",
+    "doc_length_definition": "document tokens including BOS",
+    "position_definition": "scored token position within document, starting at 1 after BOS",
+    "analysis_eval_mode": "doc-aware sliding window with left context restricted to the same document",
+    "eval_seq_len": 2048,
+    "eval_stride": 64,
+    "world_size": 8
+  },
+  "scalar_metrics": {
+    "pre_quant_post_ema": {
+      "val_loss": 2.8158411266045547,
+      "val_bpb": 1.0900998502031691
+    },
+    "quantized": {
+      "val_loss": 2.845295462893789,
+      "val_bpb": 1.1015025416666062
+    },
+    "quantized_sliding_window": {
+      "val_loss": 2.80234738264241,
+      "val_bpb": 1.0848760014097
+    }
+  },
+  "doc_aware_total": {
+    "val_loss": 2.803426796749825,
+    "val_bpb": 1.0839533987212133,
+    "token_count": 40490803,
+    "byte_count": 151080891.0
+  },
+  "doc_length_buckets": [
+    {
+      "label": "0-1024",
+      "token_count": 16485733,
+      "byte_count": 62102086.0,
+      "loss_sum": 46917424.10556301,
+      "token_fraction": 0.40714759349178625,
+      "val_loss": 2.845941039173873,
+      "val_bpb": 1.089939798292445,
+      "doc_count": 39393
+    },
+    {
+      "label": "1025-2048",
+      "token_count": 10350398,
+      "byte_count": 39198962.0,
+      "loss_sum": 29046811.515697382,
+      "token_fraction": 0.2556234313258742,
+      "val_loss": 2.806347303330498,
+      "val_bpb": 1.069051035773168,
+      "doc_count": 7425
+    },
+    {
+      "label": "2049-4096",
+      "token_count": 6259778,
+      "byte_count": 23317522.0,
+      "loss_sum": 17464766.252357524,
+      "token_fraction": 0.1545975267519392,
+      "val_loss": 2.7899977047680484,
+      "val_bpb": 1.0805750140414203,
+      "doc_count": 2257
+    },
+    {
+      "label": "4097-8192",
+      "token_count": 3708598,
+      "byte_count": 13428396.0,
+      "loss_sum": 10234035.206002153,
+      "token_fraction": 0.0915911200871961,
+      "val_loss": 2.7595428800862627,
+      "val_bpb": 1.0995052454501915,
+      "doc_count": 674
+    },
+    {
+      "label": "8193+",
+      "token_count": 3686296,
+      "byte_count": 13033925.0,
+      "loss_sum": 9849965.072497943,
+      "token_fraction": 0.09104032834320426,
+      "val_loss": 2.6720494155916787,
+      "val_bpb": 1.0902698736583403,
+      "doc_count": 251
+    }
+  ],
+  "position_buckets": [
+    {
+      "label": "1-256",
+      "token_count": 11610183,
+      "byte_count": 43421508.0,
+      "loss_sum": 34114807.63398299,
+      "token_fraction": 0.2867362991047621,
+      "val_loss": 2.9383522752382967,
+      "val_bpb": 1.1334766124296791
+    },
+    {
+      "label": "257-512",
+      "token_count": 7523676,
+      "byte_count": 28562805.0,
+      "loss_sum": 20920910.671777125,
+      "token_fraction": 0.18581197315350848,
+      "val_loss": 2.7806767159799444,
+      "val_bpb": 1.056706233055677
+    },
+    {
+      "label": "513-1024",
+      "token_count": 8213442,
+      "byte_count": 31100745.0,
+      "loss_sum": 22705150.948015887,
+      "token_fraction": 0.20284710085892838,
+      "val_loss": 2.764389271637383,
+      "val_bpb": 1.0532419295852196
+    },
+    {
+      "label": "1025-2048",
+      "token_count": 6005566,
+      "byte_count": 22429873.0,
+      "loss_sum": 16502280.527332928,
+      "token_fraction": 0.14831926153699643,
+      "val_loss": 2.747831016649043,
+      "val_bpb": 1.0614308106043098
+    },
+    {
+      "label": "2049-4096",
+      "token_count": 3531842,
+      "byte_count": 12904184.0,
+      "loss_sum": 9670820.335822228,
+      "token_fraction": 0.08722578309943618,
+      "val_loss": 2.7381803421054025,
+      "val_bpb": 1.0812031616891753
+    },
+    {
+      "label": "4097+",
+      "token_count": 3606094,
+      "byte_count": 12661776.0,
+      "loss_sum": 9599032.035186915,
+      "token_fraction": 0.0890595822463684,
+      "val_loss": 2.661891796272342,
+      "val_bpb": 1.093723022307333
+    }
+  ],
+  "long_doc_comparisons": [
+    {
+      "label": "docs_scored_len_gt_2048_pos_le_2048",
+      "token_count": 6514688,
+      "byte_count": 24205974.0,
+      "loss_sum": 18272944.5135543,
+      "token_fraction": 0.3095228615554575,
+      "val_loss": 2.804884057924846,
+      "val_bpb": 1.0890818288139936
+    },
+    {
+      "label": "docs_scored_len_gt_2048_pos_gt_2048",
+      "token_count": 7137936,
+      "byte_count": 25565960.0,
+      "loss_sum": 19269852.371009167,
+      "token_fraction": 0.3391343340340652,
+      "val_loss": 2.6996392754164744,
+      "val_bpb": 1.0874037374038512
+    },
+    {
+      "label": "docs_scored_len_gt_4096_pos_le_4096",
+      "token_count": 3788800,
+      "byte_count": 13800545.0,
+      "loss_sum": 10484968.243313182,
+      "token_fraction": 0.18001172394768827,
+      "val_loss": 2.767358594624467,
+      "val_bpb": 1.0960879942427053
+    },
+    {
+      "label": "docs_scored_len_gt_4096_pos_gt_4096",
+      "token_count": 3606094,
+      "byte_count": 12661776.0,
+      "loss_sum": 9599032.035186915,
+      "token_fraction": 0.171331080462789,
+      "val_loss": 2.661891796272342,
+      "val_bpb": 1.093723022307333
+    }
+  ],
+  "beyond_position_thresholds": [
+    {
+      "label": ">1024",
+      "token_count": 13143502,
+      "byte_count": 47995833.0,
+      "loss_sum": 35772132.89834212,
+      "token_fraction": 0.5502243597203763,
+      "val_loss": 2.721659181726614,
+      "val_bpb": 1.0752658201485765,
+      "loss_fraction": 0.3151368761298733,
+      "contribution_to_total_bpb": 0.3415936879433622
+    },
+    {
+      "label": ">2048",
+      "token_count": 7137936,
+      "byte_count": 25565960.0,
+      "loss_sum": 19269852.371009167,
+      "token_fraction": 0.29881429358210804,
+      "val_loss": 2.6996392754164744,
+      "val_bpb": 1.0874037374038512,
+      "loss_fraction": 0.16975898800725694,
+      "contribution_to_total_bpb": 0.1840108320139399
+    },
+    {
+      "label": ">4096",
+      "token_count": 3606094,
+      "byte_count": 12661776.0,
+      "loss_sum": 9599032.035186915,
+      "token_fraction": 0.15096134669751568,
+      "val_loss": 2.661891796272342,
+      "val_bpb": 1.093723022307333,
+      "loss_fraction": 0.08456328220729552,
+      "contribution_to_total_bpb": 0.09166265715561908
+    }
+  ],
+  "deeper_followup": {
+    "source": "analysis/sp8192_deeper_doc_eval/deeper_doc_eval.json",
+    "summary": "Within matched long-doc subsets, the first 256 tokens are clearly worst, but excluding that prefix still leaves a modest late-position penalty relative to the best mid-context region.",
+    "docs_gt_2048_position_buckets": [
+      {
+        "label": "1-256",
+        "token_count": 814336,
+        "token_fraction_within_group": 0.05964684884019365,
+        "val_loss": 2.943724380217495,
+        "val_bpb": 1.1633373759132346,
+        "loss_sum": 2397180.7368887938,
+        "byte_count": 2972827.0
+      },
+      {
+        "label": "257-512",
+        "token_count": 814336,
+        "token_fraction_within_group": 0.05964684884019365,
+        "val_loss": 2.824568182663037,
+        "val_bpb": 1.0934772422393628,
+        "loss_sum": 2300147.555597087,
+        "byte_count": 3034733.0
+      },
+      {
+        "label": "513-1024",
+        "token_count": 1628672,
+        "token_fraction_within_group": 0.1192936976803873,
+        "val_loss": 2.8070878860659727,
+        "val_bpb": 1.0834339674635558,
+        "loss_sum": 4571825.44157484,
+        "byte_count": 6087819.0
+      },
+      {
+        "label": "1025-2048",
+        "token_count": 3257344,
+        "token_fraction_within_group": 0.2385873953607746,
+        "val_loss": 2.7641510320965765,
+        "val_bpb": 1.0725917518319437,
+        "loss_sum": 9003790.77949359,
+        "byte_count": 12110595.0
+      },
+      {
+        "label": "2049-4096",
+        "token_count": 3531842,
+        "token_fraction_within_group": 0.25869327390837105,
+        "val_loss": 2.7381803421053834,
+        "val_bpb": 1.081203161689168,
+        "loss_sum": 9670820.335822161,
+        "byte_count": 12904184.0
+      },
+      {
+        "label": "4097+",
+        "token_count": 3606094,
+        "token_fraction_within_group": 0.2641319353700798,
+        "val_loss": 2.661891796272354,
+        "val_bpb": 1.093723022307338,
+        "loss_sum": 9599032.035186958,
+        "byte_count": 12661776.0
+      }
+    ],
+    "docs_gt_2048_excluding_prefix256": [
+      {
+        "label": "257-512",
+        "token_count": 814336,
+        "token_fraction_within_group": 0.06343026422214551,
+        "val_loss": 2.824568182663037,
+        "val_bpb": 1.0934772422393628,
+        "loss_sum": 2300147.555597087,
+        "byte_count": 3034733.0
+      },
+      {
+        "label": "513-1024",
+        "token_count": 1628672,
+        "token_fraction_within_group": 0.12686052844429102,
+        "val_loss": 2.8070878860659727,
+        "val_bpb": 1.0834339674635558,
+        "loss_sum": 4571825.44157484,
+        "byte_count": 6087819.0
+      },
+      {
+        "label": "1025-2048",
+        "token_count": 3257344,
+        "token_fraction_within_group": 0.25372105688858204,
+        "val_loss": 2.7641510320965765,
+        "val_bpb": 1.0725917518319437,
+        "loss_sum": 9003790.77949359,
+        "byte_count": 12110595.0
+      },
+      {
+        "label": "2049-4096",
+        "token_count": 3531842,
+        "token_fraction_within_group": 0.27510225662487087,
+        "val_loss": 2.7381803421053834,
+        "val_bpb": 1.081203161689168,
+        "loss_sum": 9670820.335822161,
+        "byte_count": 12904184.0
+      },
+      {
+        "label": "4097+",
+        "token_count": 3606094,
+        "token_fraction_within_group": 0.2808858938201106,
+        "val_loss": 2.661891796272354,
+        "val_bpb": 1.093723022307338,
+        "loss_sum": 9599032.035186958,
+        "byte_count": 12661776.0
+      }
+    ],
+    "docs_gt_2048_tail_delta_vs_1025_2048_bpb": {
+      "2049-4096": 0.008611409857224307,
+      "4097+": 0.021131270475394272
+    },
+    "docs_gt_4096_position_buckets": [
+      {
+        "label": "1-256",
+        "token_count": 236800,
+        "token_fraction_within_group": 0.03202209524571955,
+        "val_loss": 2.9186658439715107,
+        "val_bpb": 1.1971290569617439,
+        "loss_sum": 691140.0718524538,
+        "byte_count": 832913.0
+      },
+      {
+        "label": "257-512",
+        "token_count": 236800,
+        "token_fraction_within_group": 0.03202209524571955,
+        "val_loss": 2.8002213998748022,
+        "val_bpb": 1.1078096453807191,
+        "loss_sum": 663092.4274903531,
+        "byte_count": 863542.0
+      },
+      {
+        "label": "513-1024",
+        "token_count": 473600,
+        "token_fraction_within_group": 0.0640441904914391,
+        "val_loss": 2.8006298926408006,
+        "val_bpb": 1.10186313050797,
+        "loss_sum": 1326378.3171546832,
+        "byte_count": 1736658.0
+      },
+      {
+        "label": "1025-2048",
+        "token_count": 947200,
+        "token_fraction_within_group": 0.1280883809828782,
+        "val_loss": 2.7563577425621997,
+        "val_bpb": 1.0821627480673115,
+        "loss_sum": 2610822.0537549155,
+        "byte_count": 3480641.0
+      },
+      {
+        "label": "2049-4096",
+        "token_count": 1894400,
+        "token_fraction_within_group": 0.2561767619657564,
+        "val_loss": 2.741519939326836,
+        "val_bpb": 1.0879795433600596,
+        "loss_sum": 5193535.373060758,
+        "byte_count": 6886791.0
+      },
+      {
+        "label": "4097-8192",
+        "token_count": 1975990,
+        "token_fraction_within_group": 0.267210050610597,
+        "val_loss": 2.714685033840178,
+        "val_bpb": 1.095003000922898,
+        "loss_sum": 5364190.480017853,
+        "byte_count": 7067461.0
+      },
+      {
+        "label": "8193+",
+        "token_count": 1630104,
+        "token_fraction_within_group": 0.22043642545789027,
+        "val_loss": 2.597896548422122,
+        "val_bpb": 1.0921059880598354,
+        "loss_sum": 4234841.555169094,
+        "byte_count": 5594315.0
+      }
+    ],
+    "docs_gt_4096_excluding_prefix256": [
+      {
+        "label": "257-512",
+        "token_count": 236800,
+        "token_fraction_within_group": 0.03308143201248824,
+        "val_loss": 2.8002213998748022,
+        "val_bpb": 1.1078096453807191,
+        "loss_sum": 663092.4274903531,
+        "byte_count": 863542.0
+      },
+      {
+        "label": "513-1024",
+        "token_count": 473600,
+        "token_fraction_within_group": 0.06616286402497648,
+        "val_loss": 2.8006298926408006,
+        "val_bpb": 1.10186313050797,
+        "loss_sum": 1326378.3171546832,
+        "byte_count": 1736658.0
+      },
+      {
+        "label": "1025-2048",
+        "token_count": 947200,
+        "token_fraction_within_group": 0.13232572804995296,
+        "val_loss": 2.7563577425621997,
+        "val_bpb": 1.0821627480673115,
+        "loss_sum": 2610822.0537549155,
+        "byte_count": 3480641.0
+      },
+      {
+        "label": "2049-4096",
+        "token_count": 1894400,
+        "token_fraction_within_group": 0.2646514560999059,
+        "val_loss": 2.741519939326836,
+        "val_bpb": 1.0879795433600596,
+        "loss_sum": 5193535.373060758,
+        "byte_count": 6886791.0
+      },
+      {
+        "label": "4097-8192",
+        "token_count": 1975990,
+        "token_fraction_within_group": 0.276049741732925,
+        "val_loss": 2.714685033840178,
+        "val_bpb": 1.095003000922898,
+        "loss_sum": 5364190.480017853,
+        "byte_count": 7067461.0
+      },
+      {
+        "label": "8193+",
+        "token_count": 1630104,
+        "token_fraction_within_group": 0.2277287780797514,
+        "val_loss": 2.597896548422122,
+        "val_bpb": 1.0921059880598354,
+        "loss_sum": 4234841.555169094,
+        "byte_count": 5594315.0
+      }
+    ],
+    "docs_gt_4096_tail_delta_vs_1025_2048_bpb": {
+      "2049-4096": 0.005816795292748129,
+      "4097-8192": 0.012840252855586602,
+      "8193+": 0.00994323999252385
+    }
+  ]
+}

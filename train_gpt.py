@@ -22,6 +22,8 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
+    train_seq_len_end = int(os.environ.get("TRAIN_SEQ_LEN_END", "0")) or train_seq_len
+    seq_len_bump_frac = float(os.environ.get("SEQ_LEN_BUMP_FRAC", 0.5))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
@@ -292,7 +294,7 @@ class DocumentPackingLoader:
         self.world_size = h.world_size
         self.device = device
         self.cu_bucket_size = cu_bucket_size
-        self.max_seq_len = h.train_seq_len
+        self.h = h
         all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
         if not all_files:
             raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
@@ -356,14 +358,15 @@ class DocumentPackingLoader:
 
     def next_batch(self, global_tokens, grad_accum_steps):
         num_tokens_local = global_tokens // (self.world_size * grad_accum_steps)
+        cur_seq_len = self.h.train_seq_len
         if self._next_batch is not None:
             inputs, targets, cu_seqlens, max_seqlen = self._next_batch.result()
         else:
             inputs, targets, cu_seqlens, max_seqlen = self._prepare_batch(
-                num_tokens_local, self.max_seq_len
+                num_tokens_local, cur_seq_len
             )
         self._next_batch = self._batch_pool.submit(
-            self._prepare_batch, num_tokens_local, self.max_seq_len
+            self._prepare_batch, num_tokens_local, cur_seq_len
         )
         return (
             inputs[None].to(self.device, non_blocking=True),
@@ -741,18 +744,24 @@ class Rotary(nn.Module):
         self._seq_len_cached = 0
         self._cos_cached = None
         self._sin_cached = None
+        self._yarn_scale_cached = 0.0
 
-    def forward(self, seq_len, device, dtype):
-        if (
-            self._cos_cached is None
-            or self._sin_cached is None
-            or self._seq_len_cached < seq_len
-            or self._cos_cached.device != device
-        ):
+    def forward(self, seq_len, device, dtype, yarn_seq_len=None):
+        if yarn_seq_len is None:
+            yarn_seq_len = seq_len
+        use_yarn = self.yarn and yarn_seq_len > self.train_seq_len
+        yarn_scale = yarn_seq_len / self.train_seq_len if use_yarn else 0.0
+        cache_ok = (
+            self._cos_cached is not None
+            and self._sin_cached is not None
+            and self._cos_cached.device == device
+            and self._seq_len_cached >= seq_len
+            and self._yarn_scale_cached == yarn_scale
+        )
+        if not cache_ok:
             rd = self.rope_dims
-            if self.yarn and seq_len > self.train_seq_len:
-                scale = seq_len / self.train_seq_len
-                new_base = self.base * scale ** (rd / (rd - 2))
+            if use_yarn:
+                new_base = self.base * yarn_scale ** (rd / (rd - 2))
                 inv_freq = 1.0 / new_base ** (
                     torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd
                 )
@@ -763,6 +772,7 @@ class Rotary(nn.Module):
             self._cos_cached = freqs.cos()[None, :, None, :]
             self._sin_cached = freqs.sin()[None, :, None, :]
             self._seq_len_cached = seq_len
+            self._yarn_scale_cached = yarn_scale
         return self._cos_cached[:, :seq_len].to(dtype=dtype), self._sin_cached[:, :seq_len].to(dtype=dtype)
 
 
@@ -815,7 +825,9 @@ class CausalSelfAttention(nn.Module):
         v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        cos, sin = self.rotary(
+            seqlen, x.device, q.dtype, yarn_seq_len=max_seqlen or seqlen
+        )
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
@@ -2610,6 +2622,12 @@ def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
     base_model.refresh_fp8_lm_head_cache()
+    train_seq_len_start = h.train_seq_len
+    if h.train_seq_len_end != train_seq_len_start:
+        log(
+            f"seq_len_curriculum:enabled start:{train_seq_len_start} "
+            f"end:{h.train_seq_len_end} bump_frac:{h.seq_len_bump_frac:.3f}"
+        )
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     compiled_forward_logits = torch.compile(
         base_model.forward_logits, dynamic=False, fullgraph=True
@@ -2681,7 +2699,9 @@ def train_model(h, device, val_data):
         model.train()
         num_tokens_local = h.train_batch_tokens // h.world_size
         for blk in base_model.blocks:
-            blk.attn.rotary(num_tokens_local, device, torch.bfloat16)
+            blk.attn.rotary(
+                num_tokens_local, device, torch.bfloat16, yarn_seq_len=h.train_seq_len
+            )
         cu_bucket_size = train_loader.cu_bucket_size
         warmup_cu_buckets = tuple(cu_bucket_size * i for i in range(1, 5))
         warmup_cu_iters = 3
@@ -2783,6 +2803,17 @@ def train_model(h, device, val_data):
             log(
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
+        target_seq_len = (
+            train_seq_len_start
+            if frac < h.seq_len_bump_frac
+            else h.train_seq_len_end
+        )
+        if target_seq_len != h.train_seq_len:
+            log(
+                f"seq_len_curriculum:bump step:{step} frac:{frac:.3f} "
+                f"seq_len:{h.train_seq_len}->{target_seq_len}"
+            )
+            h.train_seq_len = target_seq_len
         train_loss = step_fn(step, scale)
         with torch.no_grad():
             for (name, t) in base_model.state_dict().items():
@@ -2903,16 +2934,8 @@ def train_and_eval(h, device):
         for p in ttt_model.parameters():
             p.requires_grad_(False)
 
-        if h.rope_yarn:
-            _yarn_seqlen = h.train_batch_tokens // h.grad_accum_steps
-            for block in ttt_model.blocks:
-                block.attn.rotary(_yarn_seqlen, device, torch.bfloat16)
-        else:
-            for block in ttt_model.blocks:
-                block.attn.rotary._cos_cached = None
-                block.attn.rotary._sin_cached = None
-                block.attn.rotary._seq_len_cached = 0
-                block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
+        for block in ttt_model.blocks:
+            block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
 
         def _fwd_ttt_inner(input_ids, target_ids, lora):
             return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
