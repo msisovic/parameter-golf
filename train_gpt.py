@@ -448,9 +448,8 @@ class FP8LinearTensorwiseFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, weight_fp8_t, w_scale):
         x_2d = x.reshape(-1, x.size(-1))
-        # EXPERIMENT: fixed scale to measure amax overhead
-        x_scale = torch.tensor(1.0 / 448.0, dtype=torch.float32, device=x_2d.device)
-        x_fp8 = x_2d.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+        x_scale = x_2d.detach().abs().amax().float().clamp_min(1e-12) / 448.0
+        x_fp8 = (x_2d / x_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
         y = torch._scaled_mm(
             x_fp8,
             weight_fp8_t,
@@ -671,10 +670,6 @@ def linear_leaky_relu_square_kernel(
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], aux1 * aux1)
 
 
-# Default FP8 scale for MLP activations (used until first delayed-scale update)
-_MLP_FP8_DEFAULT_ACT_SCALE = 6.0 / 448.0
-
-
 def linear_leaky_relu_square(a, b, aux=None, fp8_gemm=False, w_fp8=None, scale_ab=None):
     M, K = a.shape
     N = (w_fp8 if w_fp8 is not None else b).shape[0]
@@ -688,8 +683,8 @@ def linear_leaky_relu_square(a, b, aux=None, fp8_gemm=False, w_fp8=None, scale_a
     num_stages = 4 if forward else 3
 
     if fp8_gemm and forward:
-        # FP8 forward: quantize x with fixed scale (post-RMSNorm activations)
-        act_scale = _MLP_FP8_DEFAULT_ACT_SCALE
+        # Dynamic scaling: compute amax per-forward, all tensor ops (compile-safe)
+        act_scale = a.detach().abs().amax().float().clamp_min(1e-12) / 448.0
         a_fp8 = (a / act_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
         scale_ab = act_scale * scale_ab
         a_desc = TensorDescriptor.from_tensor(a_fp8, [BLOCK_SIZE_M, BLOCK_SIZE_K])
@@ -729,12 +724,9 @@ def linear_leaky_relu_square(a, b, aux=None, fp8_gemm=False, w_fp8=None, scale_a
 
 class FusedLinearLeakyReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w1, w2, w1_fp8=None, scale_ab=None):
+    def forward(ctx, x, w1, w2):
         x_flat = x.reshape(-1, x.shape[-1])
-        fp8_gemm = w1_fp8 is not None
-        pre, post = linear_leaky_relu_square(
-            x_flat, w1, fp8_gemm=fp8_gemm, w_fp8=w1_fp8, scale_ab=scale_ab,
-        )
+        pre, post = linear_leaky_relu_square(x_flat, w1)
         out = F.linear(post, w2)
         ctx.save_for_backward(x, w1, w2, pre, post)
         return out.view(*x.shape[:-1], out.shape[-1])
@@ -742,16 +734,63 @@ class FusedLinearLeakyReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x, w1, w2, pre, post = ctx.saved_tensors
-        x_flat = x.reshape(-1, x.shape[-1])
-        grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
+        x_flat = x.reshape(-1, x.shape[-1]).contiguous()
+        grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
         dw2 = grad_output_flat.T @ post
         dpre = linear_leaky_relu_square(grad_output_flat, w2.T.contiguous(), aux=pre)
         dw1 = dpre.T @ x_flat
         dx = dpre @ w1
-        return dx.view_as(x), dw1, dw2, None, None
+        return dx.view_as(x), dw1, dw2
+
+
+_FP8_MLP_NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count if torch.cuda.is_available() else 132
+
+
+class FusedLinearLeakyReLUSquareFP8Function(torch.autograd.Function):
+    """Separate autograd fn for FP8 path — no branches, dynamo-friendly."""
+
+    @staticmethod
+    def forward(ctx, x, w1, w2, w1_fp8, w_scale, act_scale):
+        x_flat = x.reshape(-1, x.shape[-1])
+        M, K = x_flat.shape
+        N = w1_fp8.shape[0]
+        inv_scale = (1.0 / act_scale).to(x_flat.dtype)
+        x_fp8 = (x_flat * inv_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+        scale_ab = act_scale * w_scale
+        c = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+        aux = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+        num_sms = _FP8_MLP_NUM_SMS
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 256, 64
+        a_desc = TensorDescriptor.from_tensor(x_fp8, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor.from_tensor(w1_fp8, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+        aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+        grid = (min(num_sms, triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)),)
+        linear_leaky_relu_square_kernel[grid](
+            a_desc, b_desc, c_desc, aux_desc, scale_ab,
+            M, N, K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+            NUM_SMS=num_sms, FORWARD=True, FP8_GEMM=True,
+            num_stages=4, num_warps=8,
+        )
+        out = F.linear(aux, w2)  # aux = post
+        ctx.save_for_backward(x, w1, w2, c, aux)  # c = pre, aux = post
+        return out.view(*x.shape[:-1], out.shape[-1])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, w1, w2, pre, post = ctx.saved_tensors
+        x_flat = x.reshape(-1, x.shape[-1]).contiguous()
+        grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
+        dw2 = grad_output_flat.T @ post
+        dpre = linear_leaky_relu_square(grad_output_flat, w2.T.contiguous(), aux=pre)
+        dw1 = dpre.T @ x_flat
+        dx = dpre @ w1
+        return dx.view_as(x), dw1, dw2, None, None, None
 
 
 FusedLeakyReLUSquareMLP = FusedLinearLeakyReLUSquareFunction.apply
+FusedLeakyReLUSquareMLP_FP8 = FusedLinearLeakyReLUSquareFP8Function.apply
 
 
 class Rotary(nn.Module):
@@ -872,15 +911,23 @@ class MLP(nn.Module):
     def __init__(self, dim, mlp_mult):
         super().__init__()
         self.use_fused = True
-        self.up_w_fp8 = None  # set by GPT model when FP8_MLP=1
-        self.up_w_scale = None
+        self.register_buffer("up_w_fp8", None, persistent=False)
+        self.register_buffer("up_w_scale", None, persistent=False)
+        self.register_buffer("_act_scale", torch.tensor(6.0 / 448.0, dtype=torch.float32), persistent=False)
 
     def forward(self, x, up_w, down_w):
         if self.training and self.use_fused:
-            return FusedLeakyReLUSquareMLP(
-                x, up_w.to(x.dtype), down_w.to(x.dtype),
-                self.up_w_fp8, self.up_w_scale,
-            )
+            if self.up_w_fp8 is not None:
+                # Delayed scaling: use previous step's scale × 1.05 safety margin
+                act_scale = self._act_scale * 1.05
+                result = FusedLeakyReLUSquareMLP_FP8(
+                    x, up_w.to(x.dtype), down_w.to(x.dtype),
+                    self.up_w_fp8, self.up_w_scale, act_scale,
+                )
+                # Update scale for next call (after GEMM, can overlap with next layer)
+                self._act_scale.copy_(x.detach().reshape(-1, x.size(-1)).abs().amax().float().clamp_min(1e-12) / 448.0)
+                return result
+            return FusedLeakyReLUSquareMLP(x, up_w.to(x.dtype), down_w.to(x.dtype))
         hidden = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5).square()
         self._last_down_input = hidden.detach() if getattr(self, "_calib", False) else None
         return F.linear(hidden, down_w.to(x.dtype))
@@ -945,8 +992,6 @@ class GPT(nn.Module):
         self.register_buffer("fp8_lm_head_weight_t", None, persistent=False)
         self.register_buffer("fp8_lm_head_weight_scale", None, persistent=False)
         self.fp8_mlp = h.fp8_mlp
-        self._mlp_up_fp8 = None  # cached FP8 up-proj weights [num_layers, hidden, model_dim]
-        self._mlp_up_scale = None  # per-layer scale [num_layers]
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
