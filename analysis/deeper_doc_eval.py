@@ -126,7 +126,7 @@ def main() -> None:
         window_start_pos = torch.zeros(bsz, dtype=torch.int64, device=device)
         doc_scored_len = torch.zeros(bsz, dtype=torch.int64, device=device)
         for i, (token_start, wlen, s, ws, doc_idx) in enumerate(pending):
-            chunk = val_data.full_val_tokens[token_start:token_start + wlen + 1].to(
+            chunk = val_data.val_tokens[token_start:token_start + wlen + 1].to(
                 device=device, dtype=torch.int64, non_blocking=True
             )
             x_batch[i, :wlen] = chunk[:-1]
