@@ -2722,11 +2722,37 @@ def train_model(h, device, val_data):
                         wloss = model(x, y, cu_seqlens=cu, max_seqlen=h.train_seq_len)
                     (wloss / h.grad_accum_steps).backward()
             optimizers.zero_grad_all()
+        curriculum_on = h.train_seq_len_end != train_seq_len_start
+        loops_on = h.num_loops > 0
+        need_start_loop = loops_on and (
+            not curriculum_on or h.enable_looping_at < h.seq_len_bump_frac
+        )
+        need_end_noloop = curriculum_on and (
+            not loops_on or h.seq_len_bump_frac < h.enable_looping_at
+        )
+        need_end_loop = curriculum_on and loops_on
         _run_cu_bucket_warmup()
-        if h.num_loops > 0:
+        if need_start_loop:
             base_model.looping_active = True
             _run_cu_bucket_warmup()
             base_model.looping_active = False
+        if curriculum_on:
+            log(
+                f"seq_len_curriculum:warmup_end_seqlen seq_len:{h.train_seq_len_end} "
+                f"compile_end_noloop:{need_end_noloop} compile_end_loop:{need_end_loop}"
+            )
+            h.train_seq_len = h.train_seq_len_end
+            if need_end_noloop:
+                _run_cu_bucket_warmup()
+            if need_end_loop:
+                base_model.looping_active = True
+                _run_cu_bucket_warmup()
+                base_model.looping_active = False
+            h.train_seq_len = train_seq_len_start
+            for blk in base_model.blocks:
+                blk.attn.rotary(
+                    num_tokens_local, device, torch.bfloat16, yarn_seq_len=h.train_seq_len
+                )
         for warmup_step in range(h.warmup_steps):
             step_fn(warmup_step, 1.0)
             if (
