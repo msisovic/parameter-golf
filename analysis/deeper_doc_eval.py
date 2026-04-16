@@ -84,6 +84,15 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
 
     val_data = train_gpt.ValidationData(h, device)
+    if train_gpt.BOS_ID is None:
+        train_gpt.BOS_ID = 1
+    _docs = train_gpt._find_docs(val_data.val_tokens)
+    val_data.doc_start_indices = torch.tensor(
+        [s for s, _ in _docs], dtype=torch.int64
+    )
+    val_data.doc_lengths = torch.tensor(
+        [l for _, l in _docs], dtype=torch.int64
+    )
     eval_model = train_gpt.deserialize(h, device)
     if h.num_loops > 0:
         eval_model.looping_active = True
