@@ -168,9 +168,31 @@ def main() -> None:
                         accum[group_name][label]["token_count"] += float(mask.sum().item())
                         accum[group_name][label]["byte_count"] += float(tb[mask].sum().item())
         pending = []
+    import time as _time
+    _log_every = int(os.environ.get("ANALYSIS_LOG_EVERY_DOCS", "1000"))
+    _t_start = _time.perf_counter()
     with torch.inference_mode():
         total_docs = int(val_data.doc_lengths.numel())
         for doc_idx in range(total_docs):
+            if _log_every > 0 and doc_idx > 0 and doc_idx % _log_every == 0:
+                _elapsed = _time.perf_counter() - _t_start
+                _eta = _elapsed * (total_docs - doc_idx) / doc_idx
+                _total_tokens = sum(
+                    v["token_count"]
+                    for group in accum.values()
+                    for v in group.values()
+                )
+                _total_loss = sum(
+                    v["loss_sum"]
+                    for group in accum.values()
+                    for v in group.values()
+                )
+                _run_loss = _total_loss / _total_tokens if _total_tokens > 0 else 0.0
+                train_gpt.log(
+                    f"analysis_progress: doc {doc_idx}/{total_docs} "
+                    f"elapsed:{_elapsed:.0f}s eta:{_eta:.0f}s "
+                    f"running_loss(any-bucket):{_run_loss:.4f}"
+                )
             doc_len = int(val_data.doc_lengths[doc_idx].item())
             scored_len = doc_len - 1
             if scored_len <= 0:

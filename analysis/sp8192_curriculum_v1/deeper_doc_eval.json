@@ -1,0 +1,226 @@
+{
+  "docs_gt_2048_position_buckets": [
+    {
+      "label": "1-256",
+      "token_count": 814592,
+      "token_fraction_within_group": 0.06772746354000944,
+      "val_loss": 2.9521352590679713,
+      "val_bpb": 1.1666285557924214,
+      "loss_sum": 2404785.764954697,
+      "byte_count": 2973845.0
+    },
+    {
+      "label": "257-512",
+      "token_count": 814592,
+      "token_fraction_within_group": 0.06772746354000944,
+      "val_loss": 2.8300034141381873,
+      "val_bpb": 1.095605575130714,
+      "loss_sum": 2305298.1411296544,
+      "byte_count": 3035620.0
+    },
+    {
+      "label": "513-1024",
+      "token_count": 1629184,
+      "token_fraction_within_group": 0.13545492708001888,
+      "val_loss": 2.809823216526091,
+      "val_bpb": 1.0844398097531427,
+      "loss_sum": 4577719.027192843,
+      "byte_count": 6090013.0
+    },
+    {
+      "label": "1025-2048",
+      "token_count": 3258368,
+      "token_fraction_within_group": 0.27090985416003777,
+      "val_loss": 2.7605873703052333,
+      "val_bpb": 1.0712086700522057,
+      "loss_sum": 8995009.548606722,
+      "byte_count": 12114405.0
+    },
+    {
+      "label": "2049-4096",
+      "token_count": 3534099,
+      "token_fraction_within_group": 0.29383490283391417,
+      "val_loss": 2.7087405075533444,
+      "val_bpb": 1.0702619989167415,
+      "loss_sum": 9572957.119003767,
+      "byte_count": 12904184.0
+    },
+    {
+      "label": "4097+",
+      "token_count": 1976664,
+      "token_fraction_within_group": 0.1643453888460103,
+      "val_loss": 2.6586233399960264,
+      "val_bpb": 1.072755584831553,
+      "loss_sum": 5255205.045729905,
+      "byte_count": 7067461.0
+    }
+  ],
+  "docs_gt_2048_excluding_prefix256": [
+    {
+      "label": "257-512",
+      "token_count": 814592,
+      "token_fraction_within_group": 0.07264770857369994,
+      "val_loss": 2.8300034141381873,
+      "val_bpb": 1.095605575130714,
+      "loss_sum": 2305298.1411296544,
+      "byte_count": 3035620.0
+    },
+    {
+      "label": "513-1024",
+      "token_count": 1629184,
+      "token_fraction_within_group": 0.14529541714739988,
+      "val_loss": 2.809823216526091,
+      "val_bpb": 1.0844398097531427,
+      "loss_sum": 4577719.027192843,
+      "byte_count": 6090013.0
+    },
+    {
+      "label": "1025-2048",
+      "token_count": 3258368,
+      "token_fraction_within_group": 0.29059083429479976,
+      "val_loss": 2.7605873703052333,
+      "val_bpb": 1.0712086700522057,
+      "loss_sum": 8995009.548606722,
+      "byte_count": 12114405.0
+    },
+    {
+      "label": "2049-4096",
+      "token_count": 3534099,
+      "token_fraction_within_group": 0.31518133522377384,
+      "val_loss": 2.7087405075533444,
+      "val_bpb": 1.0702619989167415,
+      "loss_sum": 9572957.119003767,
+      "byte_count": 12904184.0
+    },
+    {
+      "label": "4097+",
+      "token_count": 1976664,
+      "token_fraction_within_group": 0.17628470476032665,
+      "val_loss": 2.6586233399960264,
+      "val_bpb": 1.072755584831553,
+      "loss_sum": 5255205.045729905,
+      "byte_count": 7067461.0
+    }
+  ],
+  "docs_gt_4096_position_buckets": [
+    {
+      "label": "1-256",
+      "token_count": 236800,
+      "token_fraction_within_group": 0.041072149613630406,
+      "val_loss": 2.928623894360466,
+      "val_bpb": 1.2012134818697648,
+      "loss_sum": 693498.1381845584,
+      "byte_count": 832913.0
+    },
+    {
+      "label": "257-512",
+      "token_count": 236800,
+      "token_fraction_within_group": 0.041072149613630406,
+      "val_loss": 2.8061126019852334,
+      "val_bpb": 1.1101402934220188,
+      "loss_sum": 664487.4641501033,
+      "byte_count": 863542.0
+    },
+    {
+      "label": "513-1024",
+      "token_count": 473600,
+      "token_fraction_within_group": 0.08214429922726081,
+      "val_loss": 2.803865079205169,
+      "val_bpb": 1.1031359630250261,
+      "loss_sum": 1327910.5015115682,
+      "byte_count": 1736658.0
+    },
+    {
+      "label": "1025-2048",
+      "token_count": 947200,
+      "token_fraction_within_group": 0.16428859845452162,
+      "val_loss": 2.7544506197402834,
+      "val_bpb": 1.0814140000938541,
+      "loss_sum": 2609015.6270179963,
+      "byte_count": 3480641.0
+    },
+    {
+      "label": "2049-4096",
+      "token_count": 1894400,
+      "token_fraction_within_group": 0.32857719690904325,
+      "val_loss": 2.7093014559935247,
+      "val_bpb": 1.075193551807747,
+      "loss_sum": 5132500.678234133,
+      "byte_count": 6886791.0
+    },
+    {
+      "label": "4097-8192",
+      "token_count": 1976664,
+      "token_fraction_within_group": 0.34284560618191356,
+      "val_loss": 2.6586233399960264,
+      "val_bpb": 1.072755584831553,
+      "loss_sum": 5255205.045729905,
+      "byte_count": 7067461.0
+    },
+    {
+      "label": "8193+",
+      "token_count": 0,
+      "token_fraction_within_group": 0.0,
+      "val_loss": NaN,
+      "val_bpb": NaN,
+      "loss_sum": 0.0,
+      "byte_count": 0.0
+    }
+  ],
+  "docs_gt_4096_excluding_prefix256": [
+    {
+      "label": "257-512",
+      "token_count": 236800,
+      "token_fraction_within_group": 0.042831324168008764,
+      "val_loss": 2.8061126019852334,
+      "val_bpb": 1.1101402934220188,
+      "loss_sum": 664487.4641501033,
+      "byte_count": 863542.0
+    },
+    {
+      "label": "513-1024",
+      "token_count": 473600,
+      "token_fraction_within_group": 0.08566264833601753,
+      "val_loss": 2.803865079205169,
+      "val_bpb": 1.1031359630250261,
+      "loss_sum": 1327910.5015115682,
+      "byte_count": 1736658.0
+    },
+    {
+      "label": "1025-2048",
+      "token_count": 947200,
+      "token_fraction_within_group": 0.17132529667203505,
+      "val_loss": 2.7544506197402834,
+      "val_bpb": 1.0814140000938541,
+      "loss_sum": 2609015.6270179963,
+      "byte_count": 3480641.0
+    },
+    {
+      "label": "2049-4096",
+      "token_count": 1894400,
+      "token_fraction_within_group": 0.3426505933440701,
+      "val_loss": 2.7093014559935247,
+      "val_bpb": 1.075193551807747,
+      "loss_sum": 5132500.678234133,
+      "byte_count": 6886791.0
+    },
+    {
+      "label": "4097-8192",
+      "token_count": 1976664,
+      "token_fraction_within_group": 0.35753013747986856,
+      "val_loss": 2.6586233399960264,
+      "val_bpb": 1.072755584831553,
+      "loss_sum": 5255205.045729905,
+      "byte_count": 7067461.0
+    },
+    {
+      "label": "8193+",
+      "token_count": 0,
+      "token_fraction_within_group": 0.0,
+      "val_loss": NaN,
+      "val_bpb": NaN,
+      "loss_sum": 0.0,
+      "byte_count": 0.0
+    }
+  ]
+}
