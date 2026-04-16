@@ -918,15 +918,14 @@ class MLP(nn.Module):
     def forward(self, x, up_w, down_w):
         if self.training and self.use_fused:
             if self.up_w_fp8 is not None:
-                # Delayed scaling: use previous step's scale × 1.05 safety margin
+                # Delayed scaling: read old scale, update for next call, then run GEMM
+                # Doing copy_ before autograd lets the amax overlap with previous layer's tail
                 act_scale = self._act_scale * 1.05
-                result = FusedLeakyReLUSquareMLP_FP8(
+                self._act_scale.copy_(x.detach().reshape(-1, x.size(-1)).abs().amax().float().clamp_min(1e-12) / 448.0)
+                return FusedLeakyReLUSquareMLP_FP8(
                     x, up_w.to(x.dtype), down_w.to(x.dtype),
                     self.up_w_fp8, self.up_w_scale, act_scale,
                 )
-                # Update scale for next call (after GEMM, can overlap with next layer)
-                self._act_scale.copy_(x.detach().reshape(-1, x.size(-1)).abs().amax().float().clamp_min(1e-12) / 448.0)
-                return result
             return FusedLeakyReLUSquareMLP(x, up_w.to(x.dtype), down_w.to(x.dtype))
         hidden = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5).square()
         self._last_down_input = hidden.detach() if getattr(self, "_calib", False) else None

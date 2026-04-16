@@ -1,0 +1,290 @@
+
+❯ Wait, old, non-delayed, dynamic scaling:                               
+  500/20000 train_loss: 3.2604 train_time: 0.8m tok/s: 8443850           
+  1000/20000 train_loss: 3.0134 train_time: 1.6m tok/s: 8396958          
+  1500/20000 train_loss: 3.0254 train_time: 2.3m tok/s: 8379475          
+  2000/20000 train_loss: 2.9814 train_time: 3.1m tok/s: 8372581          
+  layer_loop:enabled step:2185 frac:0.350 encoder:[0, 1, 2, 3, 4, 5, 3,  
+  4] decoder:[5, 3, 4, 5, 6, 7, 8, 9, 10]                                
+  2500/20000 train_loss: 3.0669 train_time: 4.1m tok/s: 7906155          
+  3000/20000 train_loss: 2.9058 train_time: 5.3m tok/s: 7430909          
+  3500/20000 train_loss: 2.9792 train_time: 6.4m tok/s: 7126042          
+  4000/20000 train_loss: 2.9064 train_time: 7.7m tok/s: 6827099          
+  4000/20000 val_loss: 2.8810 val_bpb: 1.1153                            
+                                                                         
+  new run:                                                               
+  500/20000 train_loss: 3.2583 train_time: 0.8m tok/s: 8493283           
+  1000/20000 train_loss: 3.0131 train_time: 1.6m tok/s: 8429575          
+  1500/20000 train_loss: 3.0220 train_time: 2.3m tok/s: 8415854          
+  2000/20000 train_loss: 2.9831 train_time: 3.1m tok/s: 8413386          
+  layer_loop:enabled step:2196 frac:0.350 encoder:[0, 1, 2, 3, 4, 5, 3,  
+  4] decoder:[5, 3, 4, 5, 6, 7, 8, 9, 10]                                
+  2500/20000 train_loss: 3.0715 train_time: 4.1m tok/s: 7957007          
+  3000/20000 train_loss: 2.9053 train_time: 5.3m tok/s: 7405625          
+  3500/20000 train_loss: 2.9740 train_time: 6.5m tok/s: 7057369          
+                                                                         
+  why are we slower once recurrence kicks in? I expected the gains to    
+  get even larger then?                                                  
+
+● Good catch. The post-loop numbers:
+
+  ┌──────┬─────────┬─────────┬───────┐
+  │ Step │ Dynamic │ Delayed │ Delta │
+  ├──────┼─────────┼─────────┼───────┤
+  │ 2500 │ 7906K   │ 7957K   │ +51K  │
+  ├──────┼─────────┼─────────┼───────┤
+  │ 3000 │ 7431K   │ 7406K   │ -25K  │
+  ├──────┼─────────┼─────────┼───────┤
+  │ 3500 │ 7126K   │ 7057K   │ -69K  │
+  └──────┴─────────┴─────────┴───────┘
+
+  The copy_() buffer mutation after each MLP call is likely the issue.
+  With 17 layers (post-loop), that's 17 copy_() ops per forward. Each
+  forces the amax kernel to complete before the copy can execute,
+  creating a serialization point that prevents torch.compile from
+  overlapping the MLP's amax with the next layer's attention.
+
+  The simplest fix: don't update the scale every layer call. Update it
+  once per step in the training loop (outside compile), using a fixed
+  "good enough" scale. But we can't access activations outside compile.
+
+  Or: just go back to dynamic scaling (amax inside the autograd
+  function). It was 8443K and didn't have the post-loop regression. The
+  delayed scaling only wins in pre-loop (+50K) but loses in post-loop
+  (-69K) — it's a wash or worse overall.
+
+● Update(train_gpt.py)
+  ⎿  Added 2 lines, removed 7 lines
+      918      def forward(self, x, up_w, down_w):
+      919          if self.training and self.use_fused:
+      920              if self.up_w_fp8 is not None:
+      921 -                # Delayed scaling: use previous step's 
+          -scale × 1.05 safety margin                             
+      922 -                act_scale = self._act_scale * 1.05     
+      923 -                result = FusedLeakyReLUSquareMLP_FP8(  
+      921 +                return FusedLeakyReLUSquareMLP_FP8(    
+      922                      x, up_w.to(x.dtype), down_w.to(x.dt
+           ype),
+      925 -                    self.up_w_fp8, self.up_w_scale, act
+          -_scale,                                                
+      923 +                    self.up_w_fp8, self.up_w_scale,    
+      924                  )
+      927 -                # Update scale for next call (after GEM
+          -M, can overlap with next layer)                        
+      928 -                self._act_scale.copy_(x.detach().reshap
+          -e(-1, x.size(-1)).abs().amax().float().clamp_min(1e-12)
+          - / 448.0)                                              
+      929 -                return result                          
+      925              return FusedLeakyReLUSquareMLP(x, up_w.to(x
+           .dtype), down_w.to(x.dtype))
+      926          hidden = F.leaky_relu(F.linear(x, up_w.to(x.dty
+           pe)), negative_slope=0.5).square()
+      927          self._last_down_input = hidden.detach() if geta
+           ttr(self, "_calib", False) else None
+
+● Now put the dynamic amax back inside the autograd function:
+
+● Update(train_gpt.py)
+  ⎿  Added 2 lines, removed 1 line
+      750      """Separate autograd fn for FP8 path — no branches,
+            dynamo-friendly."""
+      751  
+      752      @staticmethod
+      753 -    def forward(ctx, x, w1, w2, w1_fp8, w_scale, act_sc
+          -ale):                                                  
+      753 +    def forward(ctx, x, w1, w2, w1_fp8, w_scale):      
+      754          x_flat = x.reshape(-1, x.shape[-1])
+      755          M, K = x_flat.shape
+      756          N = w1_fp8.shape[0]
+      757 +        act_scale = x_flat.detach().abs().amax().float(
+          +).clamp_min(1e-12) / 448.0                             
+      758          inv_scale = (1.0 / act_scale).to(x_flat.dtype)
+      759          x_fp8 = (x_flat * inv_scale).clamp(-448.0, 448.
+           0).to(torch.float8_e4m3fn).contiguous()
+      760          scale_ab = act_scale * w_scale
+
+● Fix backward return count (back to 5 inputs):
+
+● Update(train_gpt.py)
+  ⎿  Added 1 line, removed 1 line
+      787          dpre = linear_leaky_relu_square(grad_output_fla
+           t, w2.T.contiguous(), aux=pre)
+      788          dw1 = dpre.T @ x_flat
+      789          dx = dpre @ w1
+      790 -        return dx.view_as(x), dw1, dw2, None, None, Non
+          -e                                                      
+      790 +        return dx.view_as(x), dw1, dw2, None, None     
+      791  
+      792  
+      793  FusedLeakyReLUSquareMLP = FusedLinearLeakyReLUSquareFun
+           ction.apply
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ You are jumping to it too quickly, yes, the overhead per layer rises,  
+  but also the win right? All those matmuls are faster?                  
+
+● You're right, I was too hasty. With 17 layers the GEMM savings is 17 ×
+  0.094ms = 1.6ms. The copy_() overhead should be negligible (one scalar
+  copy per layer). The gain should scale proportionally.
+
+  The degradation from +51K (step 2500) to -69K (step 3500) is suspicious
+   though — that's a 120K swing that shouldn't happen if the overhead is
+  constant per layer. Let me revert my revert and keep the delayed
+  scaling, but let this run finish to see the full picture. The step 3500
+   number might be an anomaly.
+
+● Update(train_gpt.py)
+  ⎿  Added 1 line, removed 2 lines
+      750      """Separate autograd fn for FP8 path — no branches,
+            dynamo-friendly."""
+      751  
+      752      @staticmethod
+      753 -    def forward(ctx, x, w1, w2, w1_fp8, w_scale):      
+      753 +    def forward(ctx, x, w1, w2, w1_fp8, w_scale, act_sc
+          +ale):                                                  
+      754          x_flat = x.reshape(-1, x.shape[-1])
+      755          M, K = x_flat.shape
+      756          N = w1_fp8.shape[0]
+      757 -        act_scale = x_flat.detach().abs().amax().float(
+          -).clamp_min(1e-12) / 448.0                             
+      757          inv_scale = (1.0 / act_scale).to(x_flat.dtype)
+      758          x_fp8 = (x_flat * inv_scale).clamp(-448.0, 448.
+           0).to(torch.float8_e4m3fn).contiguous()
+      759          scale_ab = act_scale * w_scale
+
+● Update(train_gpt.py)
+  ⎿  Added 1 line, removed 1 line
+      786          dpre = linear_leaky_relu_square(grad_output_fla
+           t, w2.T.contiguous(), aux=pre)
+      787          dw1 = dpre.T @ x_flat
+      788          dx = dpre @ w1
+      789 -        return dx.view_as(x), dw1, dw2, None, None     
+      789 +        return dx.view_as(x), dw1, dw2, None, None, Non
+          +e                                                      
+      790  
+      791  
+      792  FusedLeakyReLUSquareMLP = FusedLinearLeakyReLUSquareFun
+           ction.apply
+
+● Update(train_gpt.py)
+  ⎿  Added 5 lines, removed 2 lines
+      918      def forward(self, x, up_w, down_w):
+      919          if self.training and self.use_fused:
+      920              if self.up_w_fp8 is not None:
+      921 -                return FusedLeakyReLUSquareMLP_FP8(    
+      921 +                act_scale = self._act_scale * 1.05     
+      922 +                result = FusedLeakyReLUSquareMLP_FP8(  
+      923                      x, up_w.to(x.dtype), down_w.to(x.dt
+           ype),
+      923 -                    self.up_w_fp8, self.up_w_scale,    
+      924 +                    self.up_w_fp8, self.up_w_scale, act
+          +_scale,                                                
+      925                  )
+      926 +                self._act_scale.copy_(x.detach().reshap
+          +e(-1, x.size(-1)).abs().amax().float().clamp_min(1e-12)
+          + / 448.0)                                              
+      927 +                return result                          
+      928              return FusedLeakyReLUSquareMLP(x, up_w.to(x
+           .dtype), down_w.to(x.dtype))
+      929          hidden = F.leaky_relu(F.linear(x, up_w.to(x.dty
+           pe)), negative_slope=0.5).square()
+      930          self._last_down_input = hidden.detach() if geta
+           ttr(self, "_calib", False) else None
+
+● Bash(python -c "import py_compile; py_compile.compile('train_gpt.py',
+      doraise=True)" 2>&1)
+  ⎿  (No output)
+
+● OK delayed scaling is back. Let the full run finish — we need the
+  capped step count and val_loss to judge this properly. The post-loop
+  degradation at step 3500 could be noise or an actual issue, but we
+  won't know without the full run.
+
+✻ Sautéed for 1m 3s
+
+❯ No, do you not understand my point?                                    
+  dynamic scaling is faster than delayed once recurrence kicks in? and   
+  before recur kicks in, delayed is faster, as it should. I'm suspecting 
+   bad integration with the depth recurrence code, just a bug or smth    
+
+● You're right — sorry. Let me look at the recurrence code to find the
+  bug.                       
+                                                                         
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)     
+                                                                         
+● I see it. With looping active, encoder_indices = [0,1,2,3,4,5,3,4].    
+  Layer 3 and 4's MLP are called twice. Each call to self.blocks[i] goes 
+  through Block.forward → MLP.forward.                                   
+                                                                         
+  The bug: when layer 3 runs the second time, the copy_() from the first 
+  run already updated self._act_scale. So the second run uses the FIRST  
+  run's scale (not the previous step's). That's fine for accuracy. But   
+  the copy_() after each MLP call creates a data dependency: the amax    
+  kernel must complete, then copy_() must complete, before the next      
+  operation. With 17 calls instead of 11, that's 6 extra serialization
+  points.
+
+  But actually — the dynamic scaling version ALSO computes amax 17 times 
+  (inside the autograd function). The difference is that dynamic
+  scaling's amax is part of the autograd function's compiled graph, where
+   the compiler can overlap it with the FP8 cast. The delayed scaling's
+  copy_() is in MLP.forward, creating a separate sync point between
+  layers.
+
+  The fix: move the copy_() to be truly non-blocking. Or better — skip   
+  the copy_() for repeated layers since the scale barely changes within
+  one step. But we can't easily detect repeated calls inside compile.    
+                                                                  
+  Actually, the simplest fix: do the amax + copy BEFORE the autograd call
+   (not after), same as last time but actually this means the amax
+  overlaps with the PREVIOUS layer's backward prefetch:                  
+                                                                  
+● Update(train_gpt.py)             
+  ⎿  Added 4 lines, removed 3 lines                                  
+      918      def forward(self, x, up_w, down_w):
+      919          if self.training and self.use_fused:              
+      920              if self.up_w_fp8 is not None:                     
+      921 +                # Delayed scaling: read old scale, upda
+          +te for next call, then run GEMM                               
+      922 +                # Doing copy_ before autograd lets the 
+          +amax overlap with previous layer's tail                       
+      923                  act_scale = self._act_scale * 1.05     
+      922 -                result = FusedLeakyReLUSquareMLP_FP8(  
+      924 +                self._act_scale.copy_(x.detach().reshap
+          +e(-1, x.size(-1)).abs().amax().float().clamp_min(1e-12)
+          + / 448.0)                                              
+      925 +                return FusedLeakyReLUSquareMLP_FP8(    
+      926                      x, up_w.to(x.dtype), down_w.to(x.dt
+           ype),
+      927                      self.up_w_fp8, self.up_w_scale, act
+           _scale,
+      928                  )
+      926 -                self._act_scale.copy_(x.detach().reshap
+          -e(-1, x.size(-1)).abs().amax().float().clamp_min(1e-12)
+          - / 448.0)                                              
+      927 -                return result                          
+      929              return FusedLeakyReLUSquareMLP(x, up_w.to(x
+           .dtype), down_w.to(x.dtype))
+      930          hidden = F.leaky_relu(F.linear(x, up_w.to(x.dty
+           pe)), negative_slope=0.5).square()
+      931          self._last_down_input = hidden.detach() if geta
+           ttr(self, "_calib", False) else None
+
+● Bash(python -c "import py_compile; py_compile.compile('train_gpt.py',
+      doraise=True)" 2>&1)                                           
+  ⎿  (No output)          
+
+● Now the flow per MLP call is:                                          
+  1. Read old _act_scale × 1.05 → act_scale (for the FP8 cast)       
+  2. Compute amax of x → write to _act_scale (for next call)             
+  3. Run the FP8 autograd function (cast uses act_scale from step 1)
+                                                                         
+  The copy_() in step 2 happens BEFORE the GEMM. The GEMM in step 3      
+  doesn't depend on the copy_() result (it uses act_scale from step 1).  
+  So the compiler can overlap the copy_() write with the GEMM's TMA      
+  loads.                                                                 
+                                                                  
+  Try it — this should fix the post-loop regression because the copy_()  
+  no longer sits between the GEMM return and the next layer's start.
+                                                                         
+✻ Worked for 1m 0s
