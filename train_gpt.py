@@ -2956,6 +2956,16 @@ def train_and_eval(h, device):
         compiled_model,
         compiled_forward_logits,
     )
+    if h.sliding_window_enabled:
+        timed_eval(
+            "diagnostic pre-quantization post-ema sliding_window",
+            eval_val_sliding,
+            h,
+            device,
+            val_data,
+            base_model,
+            forward_logits_fn=compiled_forward_logits,
+        )
     if not _skip_training:
         serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
     else:
