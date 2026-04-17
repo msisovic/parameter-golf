@@ -2710,8 +2710,15 @@ def train_model(h, device, val_data):
             h.train_batch_tokens, h.grad_accum_steps
         )
         log(f"warmup_cu_buckets:{','.join(str(b) for b in warmup_cu_buckets)} iters_each:{warmup_cu_iters}")
-        def _run_cu_bucket_warmup():
+        def _reset_rotary_cache(yarn_seq_len):
+            for blk in base_model.blocks:
+                blk.attn.rotary(
+                    num_tokens_local, device, torch.bfloat16, yarn_seq_len=yarn_seq_len
+                )
+        def _run_cu_bucket_warmup(reset_yarn_seq_len=None):
             for bucket_len in warmup_cu_buckets:
+                if reset_yarn_seq_len is not None:
+                    _reset_rotary_cache(reset_yarn_seq_len)
                 boundaries = list(range(0, x.size(1), max(h.train_seq_len, 1)))
                 if boundaries[-1] != x.size(1):
                     boundaries.append(x.size(1))
@@ -2758,29 +2765,21 @@ def train_model(h, device, val_data):
             )
             h.train_seq_len = h.train_seq_len_end
             if need_end_noloop:
-                _run_cu_bucket_warmup()
+                _run_cu_bucket_warmup(reset_yarn_seq_len=train_seq_len_start)
             if need_end_loop:
                 base_model.looping_active = True
-                _run_cu_bucket_warmup()
+                _run_cu_bucket_warmup(reset_yarn_seq_len=train_seq_len_start)
                 base_model.looping_active = False
             eval_flips_yarn = h.eval_seq_len > h.rope_train_seq_len
             if eval_flips_yarn:
                 h.train_seq_len = train_seq_len_start
-                _run_cu_bucket_warmup()
+                _run_cu_bucket_warmup(reset_yarn_seq_len=h.train_seq_len_end)
                 if need_start_loop:
-                    for blk in base_model.blocks:
-                        blk.attn.rotary(
-                            num_tokens_local, device, torch.bfloat16,
-                            yarn_seq_len=h.train_seq_len_end,
-                        )
                     base_model.looping_active = True
-                    _run_cu_bucket_warmup()
+                    _run_cu_bucket_warmup(reset_yarn_seq_len=h.train_seq_len_end)
                     base_model.looping_active = False
             h.train_seq_len = train_seq_len_start
-            for blk in base_model.blocks:
-                blk.attn.rotary(
-                    num_tokens_local, device, torch.bfloat16, yarn_seq_len=h.train_seq_len
-                )
+            _reset_rotary_cache(h.train_seq_len)
         if h.val_loss_every > 0:
             _run_forward_logits_warmup()
             if need_start_loop:
