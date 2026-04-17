@@ -2171,12 +2171,12 @@ def eval_val(h, device, val_data, model, forward_logits_fn=None):
             x = local[:-1]
             y = local[1:]
             bos_pos = (x == BOS_ID).nonzero(as_tuple=True)[0].tolist()
-            cu_seqlens, max_seqlen = _build_cu_seqlens(
+            cu_seqlens, _ = _build_cu_seqlens(
                 bos_pos, x.numel(), x.device, h.eval_seq_len, 64
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = run_forward_logits(
-                    x[None], cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+                    x[None], cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len
                 ).detach()
             per_token_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
@@ -3072,7 +3072,7 @@ def main():
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
     torch._dynamo.config.optimize_ddp = False
-    torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.cache_size_limit = 64
     h = Hyperparameters()
     set_logging_hparams(h)
     if h.is_main_process:
