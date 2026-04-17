@@ -950,7 +950,7 @@ class GPT(nn.Module):
                     h.mlp_mult,
                     h.rope_base,
                     h.qk_gain_init,
-                    h.train_seq_len,
+                    h.rope_train_seq_len,
                     layer_idx=i,
                     ln_scale=h.ln_scale,
                     yarn=h.rope_yarn,
@@ -965,7 +965,7 @@ class GPT(nn.Module):
                 block.attn.rotary = Rotary(
                     head_dim,
                     base=h.rope_base,
-                    train_seq_len=h.train_seq_len,
+                    train_seq_len=h.rope_train_seq_len,
                     rope_dims=h.rope_dims,
                     yarn=h.rope_yarn,
                 )
