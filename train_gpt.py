@@ -2722,6 +2722,20 @@ def train_model(h, device, val_data):
                         wloss = model(x, y, cu_seqlens=cu, max_seqlen=h.train_seq_len)
                     (wloss / h.grad_accum_steps).backward()
             optimizers.zero_grad_all()
+        def _run_forward_logits_warmup():
+            for bucket_len in warmup_cu_buckets:
+                boundaries = list(range(0, x.size(1), max(h.eval_seq_len, 1)))
+                if boundaries[-1] != x.size(1):
+                    boundaries.append(x.size(1))
+                cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
+                cu[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
+                for _ in range(warmup_cu_iters):
+                    with torch.no_grad(), torch.autocast(
+                        device_type="cuda", dtype=torch.bfloat16, enabled=True
+                    ):
+                        _ = compiled_forward_logits(
+                            x, cu_seqlens=cu, max_seqlen=h.eval_seq_len
+                        )
         curriculum_on = h.train_seq_len_end != train_seq_len_start
         loops_on = h.num_loops > 0
         need_start_loop = loops_on and (
@@ -2765,6 +2779,20 @@ def train_model(h, device, val_data):
             for blk in base_model.blocks:
                 blk.attn.rotary(
                     num_tokens_local, device, torch.bfloat16, yarn_seq_len=h.train_seq_len
+                )
+        if h.val_loss_every > 0:
+            _run_forward_logits_warmup()
+            if need_start_loop:
+                for blk in base_model.blocks:
+                    blk.attn.rotary(
+                        num_tokens_local, device, torch.bfloat16, yarn_seq_len=train_seq_len_start
+                    )
+                base_model.looping_active = True
+                _run_forward_logits_warmup()
+                base_model.looping_active = False
+            for blk in base_model.blocks:
+                blk.attn.rotary(
+                    num_tokens_local, device, torch.bfloat16, yarn_seq_len=train_seq_len_start
                 )
         for warmup_step in range(h.warmup_steps):
             step_fn(warmup_step, 1.0)
