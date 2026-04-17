@@ -767,11 +767,12 @@ class Rotary(nn.Module):
                 )
             else:
                 inv_freq = self.inv_freq.float().to(device)
-            t = torch.arange(seq_len, device=device, dtype=torch.float32)
+            alloc_seq_len = max(seq_len, self._seq_len_cached)
+            t = torch.arange(alloc_seq_len, device=device, dtype=torch.float32)
             freqs = torch.outer(t, inv_freq)
             self._cos_cached = freqs.cos()[None, :, None, :]
             self._sin_cached = freqs.sin()[None, :, None, :]
-            self._seq_len_cached = seq_len
+            self._seq_len_cached = alloc_seq_len
             self._yarn_scale_cached = yarn_scale
         return self._cos_cached[:, :seq_len].to(dtype=dtype), self._sin_cached[:, :seq_len].to(dtype=dtype)
 
