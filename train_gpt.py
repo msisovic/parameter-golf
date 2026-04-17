@@ -2748,6 +2748,19 @@ def train_model(h, device, val_data):
                 base_model.looping_active = True
                 _run_cu_bucket_warmup()
                 base_model.looping_active = False
+            eval_flips_yarn = h.eval_seq_len > h.rope_train_seq_len
+            if eval_flips_yarn:
+                h.train_seq_len = train_seq_len_start
+                _run_cu_bucket_warmup()
+                if need_start_loop:
+                    for blk in base_model.blocks:
+                        blk.attn.rotary(
+                            num_tokens_local, device, torch.bfloat16,
+                            yarn_seq_len=h.train_seq_len_end,
+                        )
+                    base_model.looping_active = True
+                    _run_cu_bucket_warmup()
+                    base_model.looping_active = False
             h.train_seq_len = train_seq_len_start
             for blk in base_model.blocks:
                 blk.attn.rotary(
