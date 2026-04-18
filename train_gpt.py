@@ -2647,7 +2647,7 @@ def train_model(h, device, val_data):
                 yarn_seq_len=h.eval_seq_len,
             )
             val_loss, val_bpb = eval_val(
-                h, device, val_data, model, compiled_forward_logits
+                h, device, val_data, base_model, compiled_forward_logits
             )
             log(
                 f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}"
