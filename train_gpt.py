@@ -2420,26 +2420,6 @@ def _set_rotary_state(model, seq_len, device, dtype, yarn_seq_len=None):
         rotary.forward(seq_len, device, dtype, yarn_seq_len=yarn_seq_len)
 
 
-def _training_runtime_states(h):
-    start_seq_len = h.train_seq_len
-    end_seq_len = h.train_seq_len_end
-    states = [(start_seq_len, False)]
-    if h.num_loops <= 0:
-        if end_seq_len != start_seq_len:
-            states.append((end_seq_len, False))
-        return states
-    if end_seq_len == start_seq_len:
-        states.append((start_seq_len, True))
-        return states
-    if h.enable_looping_at < h.seq_len_bump_frac:
-        states.extend([(start_seq_len, True), (end_seq_len, True)])
-    elif h.enable_looping_at > h.seq_len_bump_frac:
-        states.extend([(end_seq_len, False), (end_seq_len, True)])
-    else:
-        states.append((end_seq_len, True))
-    return states
-
-
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
@@ -2518,6 +2498,14 @@ def train_model(h, device, val_data):
             copy.deepcopy(opt.state_dict()) for opt in optimizers
         ]
         model.train()
+        num_tokens_local = h.train_batch_tokens // h.world_size
+        _set_rotary_state(
+            base_model,
+            num_tokens_local,
+            device,
+            torch.bfloat16,
+            yarn_seq_len=train_seq_len_start,
+        )
         cu_bucket_size = train_loader.cu_bucket_size
         warmup_cu_buckets = tuple(cu_bucket_size * i for i in range(1, 5))
         warmup_cu_iters = 3
@@ -2525,14 +2513,18 @@ def train_model(h, device, val_data):
             h.train_batch_tokens, h.grad_accum_steps
         )
         log(f"warmup_cu_buckets:{','.join(str(b) for b in warmup_cu_buckets)} iters_each:{warmup_cu_iters}")
-        def _run_cu_bucket_warmup(seq_len, looping_active):
-            base_model.looping_active = looping_active
-            h.train_seq_len = seq_len
+        def _run_cu_bucket_warmup(yarn_seq_len=None):
+            if yarn_seq_len is None:
+                yarn_seq_len = h.train_seq_len
             _set_rotary_state(
-                base_model, seq_len, device, torch.bfloat16, yarn_seq_len=seq_len
+                base_model,
+                num_tokens_local,
+                device,
+                torch.bfloat16,
+                yarn_seq_len=yarn_seq_len,
             )
             for bucket_len in warmup_cu_buckets:
-                boundaries = list(range(0, x.size(1), max(seq_len, 1)))
+                boundaries = list(range(0, x.size(1), max(h.train_seq_len, 1)))
                 if boundaries[-1] != x.size(1):
                     boundaries.append(x.size(1))
                 cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
@@ -2540,45 +2532,32 @@ def train_model(h, device, val_data):
                 for _ in range(warmup_cu_iters):
                     optimizers.zero_grad_all()
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        wloss = model(x, y, cu_seqlens=cu, max_seqlen=seq_len)
+                        wloss = model(x, y, cu_seqlens=cu, max_seqlen=h.train_seq_len)
                     (wloss / h.grad_accum_steps).backward()
             optimizers.zero_grad_all()
-        def _run_forward_logits_warmup(looping_active):
-            base_model.looping_active = looping_active
-            _set_rotary_state(
-                base_model,
-                h.eval_seq_len,
-                device,
-                torch.bfloat16,
-                yarn_seq_len=h.eval_seq_len,
-            )
-            bucket_len = warmup_cu_buckets[-1]
-            boundaries = list(range(0, x.size(1), max(h.eval_seq_len, 1)))
-            if boundaries[-1] != x.size(1):
-                boundaries.append(x.size(1))
-            cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
-            cu[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
-            with torch.no_grad(), torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16, enabled=True
-            ):
-                _ = compiled_forward_logits(
-                    x, cu_seqlens=cu, max_seqlen=h.eval_seq_len
-                )
-        seen_states = set()
-        for seq_len, looping_active in _training_runtime_states(h):
-            if (seq_len, looping_active) in seen_states:
-                continue
-            _run_cu_bucket_warmup(seq_len, looping_active)
-            seen_states.add((seq_len, looping_active))
-        if h.val_loss_every > 0:
-            _run_forward_logits_warmup(False)
-            if h.num_loops > 0:
-                _run_forward_logits_warmup(True)
+        _run_cu_bucket_warmup()
+        if h.num_loops > 0:
+            base_model.looping_active = True
+            _run_cu_bucket_warmup()
+            base_model.looping_active = False
+        if train_seq_len_end != train_seq_len_start:
+            h.train_seq_len = train_seq_len_end
+            if h.num_loops <= 0:
+                _run_cu_bucket_warmup()
+            elif h.enable_looping_at >= h.seq_len_bump_frac:
+                _run_cu_bucket_warmup()
+                base_model.looping_active = True
+                _run_cu_bucket_warmup()
+                base_model.looping_active = False
+            else:
+                base_model.looping_active = True
+                _run_cu_bucket_warmup()
+                base_model.looping_active = False
         h.train_seq_len = train_seq_len_start
         base_model.looping_active = False
         _set_rotary_state(
             base_model,
-            train_seq_len_start,
+            num_tokens_local,
             device,
             torch.bfloat16,
             yarn_seq_len=train_seq_len_start,
@@ -2955,7 +2934,7 @@ def main():
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
     torch._dynamo.config.optimize_ddp = False
-    torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.cache_size_limit = 16
     h = Hyperparameters()
     set_logging_hparams(h)
     if h.is_main_process:
