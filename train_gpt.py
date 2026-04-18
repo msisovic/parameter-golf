@@ -2552,19 +2552,18 @@ def train_model(h, device, val_data):
                 torch.bfloat16,
                 yarn_seq_len=h.eval_seq_len,
             )
-            for bucket_len in warmup_cu_buckets:
-                boundaries = list(range(0, x.size(1), max(h.eval_seq_len, 1)))
-                if boundaries[-1] != x.size(1):
-                    boundaries.append(x.size(1))
-                cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
-                cu[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
-                for _ in range(warmup_cu_iters):
-                    with torch.no_grad(), torch.autocast(
-                        device_type="cuda", dtype=torch.bfloat16, enabled=True
-                    ):
-                        _ = compiled_forward_logits(
-                            x, cu_seqlens=cu, max_seqlen=h.eval_seq_len
-                        )
+            bucket_len = warmup_cu_buckets[-1]
+            boundaries = list(range(0, x.size(1), max(h.eval_seq_len, 1)))
+            if boundaries[-1] != x.size(1):
+                boundaries.append(x.size(1))
+            cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
+            cu[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
+            with torch.no_grad(), torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=True
+            ):
+                _ = compiled_forward_logits(
+                    x, cu_seqlens=cu, max_seqlen=h.eval_seq_len
+                )
         seen_states = set()
         for seq_len, looping_active in _training_runtime_states(h):
             if (seq_len, looping_active) in seen_states:
@@ -2956,7 +2955,7 @@ def main():
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
     torch._dynamo.config.optimize_ddp = False
-    torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.cache_size_limit = 64
     h = Hyperparameters()
     set_logging_hparams(h)
     if h.is_main_process:
