@@ -36,39 +36,40 @@ run_variant () {
     echo "===== [$(date +%H:%M:%S)] ttt/${name} ====="
     env TTT_ENABLED=1 ROPE_YARN=1 FP8_LM_HEAD=1 FUSED_SOFTCAP_CE=1 \
         GPTQ_RESERVE_SECONDS=30 SLIDING_WINDOW_ENABLED=0 \
-        EVAL_SEQ_LEN=4096 EVAL_STRIDE=64 \
+        EVAL_STRIDE=64 \
         TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=4096 \
-        TTT_BATCH_SIZE=16 \
+        TTT_BATCH_SIZE=32 \
         ARTIFACT_DIR="$dir" RUN_ID="ttt_${name}" \
         EVAL_ONLY_PATH="$CKPT_ABS" "$@" \
         torchrun --standalone --nproc_per_node=8 train_gpt.py \
         2>&1 | tee "logs/diag_ttt_${STAMP}_${name}.log"
 }
 
-# ----- H1 primary -----
-# TTT at 2048 context on OUR checkpoint. YaRN stays off at eval (2048 ≤ 2048).
-# If recovery% here is ~90%+, the 4096 recovery drop is purely hparam-scaling.
-run_variant ctx2048 TTT_EVAL_SEQ_LEN=2048
+# ----- H1 primary (already confirmed: 112% recovery at 2048) -----
+# Commented out to save ~8 min on reruns. Uncomment to reproduce.
+# run_variant ctx2048 EVAL_SEQ_LEN=2048 TTT_EVAL_SEQ_LEN=2048
 
-# Reference: reproduces the 40% recovery at 4096 with defaults.
-run_variant ctx4096_default TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.0001 TTT_GRAD_STEPS=1 TTT_CHUNK_SIZE=32
+# Reference: reproduces the 40% recovery at 4096 with defaults. Done: 59% recovery.
+# run_variant ctx4096_default EVAL_SEQ_LEN=4096 TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.0001 TTT_GRAD_STEPS=1 TTT_CHUNK_SIZE=32
 
 # ----- TTT hparam sweep at 4096 (only meaningful if H1 confirmed) -----
-# Weaker-gradient hypothesis: more context -> smaller per-chunk grad -> default
-# LR under-adapts. Bumping LR should recover more.
-run_variant ctx4096_lr3e-4 TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.0003 TTT_GRAD_STEPS=1 TTT_CHUNK_SIZE=32
-run_variant ctx4096_lr1e-3 TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.001  TTT_GRAD_STEPS=1 TTT_CHUNK_SIZE=32
+# Weaker-gradient hypothesis DISPROVEN: bigger LR destabilizes (gradient directions
+# are noisy at 4096, bigger step averages back toward post-quant). Skipping LR sweep.
+# run_variant ctx4096_lr3e-4 EVAL_SEQ_LEN=4096 TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.0003 TTT_GRAD_STEPS=1 TTT_CHUNK_SIZE=32
+# run_variant ctx4096_lr1e-3 EVAL_SEQ_LEN=4096 TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.001  TTT_GRAD_STEPS=1 TTT_CHUNK_SIZE=32
 
 # More grad steps per chunk -> more adaptation, same LR.
-run_variant ctx4096_gs2 TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.0001 TTT_GRAD_STEPS=2 TTT_CHUNK_SIZE=32
+# Folded into the retraining run (post-reboot) so we don't duplicate work.
+# run_variant ctx4096_gs2 EVAL_SEQ_LEN=4096 TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.0001 TTT_GRAD_STEPS=2 TTT_CHUNK_SIZE=32
 
-# Bigger chunk -> fewer but stronger gradient signals per doc.
-run_variant ctx4096_chunk128 TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.0001 TTT_GRAD_STEPS=1 TTT_CHUNK_SIZE=128
+# Bigger chunk -> fewer but stronger (less noisy) gradient signals per doc.
+# Most diagnostic for the "noisy gradient" hypothesis.
+run_variant ctx4096_chunk128 EVAL_SEQ_LEN=4096 TTT_EVAL_SEQ_LEN=4096 TTT_LORA_LR=0.0001 TTT_GRAD_STEPS=1 TTT_CHUNK_SIZE=128
 
 echo
 echo "===== summary (diag_ttt_${STAMP}) ====="
 printf "%-22s %-12s %-12s %-12s %-12s %-10s\n" variant pre_quant post_quant ttt recovered rec_pct
-for v in ctx2048 ctx4096_default ctx4096_lr3e-4 ctx4096_lr1e-3 ctx4096_gs2 ctx4096_chunk128; do
+for v in ctx4096_chunk128; do
     log="logs/diag_ttt_${STAMP}_${v}.log"
     [[ -f "$log" ]] || continue
     pre=$(grep "diagnostic pre-quantization post-ema val_loss" "$log" | head -1 | grep -oE "val_loss:[0-9.]+" | cut -d: -f2)

@@ -748,7 +748,7 @@ class Rotary(nn.Module):
 
     def forward(self, seq_len, device, dtype, yarn_seq_len=None):
         if yarn_seq_len is None:
-            yarn_seq_len = seq_len
+            yarn_seq_len = getattr(self, "_force_yarn_seq_len", None) or seq_len
         use_yarn = self.yarn and yarn_seq_len > self.train_seq_len
         yarn_scale = yarn_seq_len / self.train_seq_len if use_yarn else 0.0
         cache_ok = (
@@ -3012,6 +3012,7 @@ def train_and_eval(h, device):
             p.requires_grad_(False)
 
         for block in ttt_model.blocks:
+            block.attn.rotary._force_yarn_seq_len = h.ttt_eval_seq_len
             block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
 
         def _fwd_ttt_inner(input_ids, target_ids, lora):
