@@ -11,3 +11,4 @@ sentencepiece
 zstandard
 brotli
 pyminify
+python-minifier
