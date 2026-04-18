@@ -2432,7 +2432,7 @@ def train_model(h, device, val_data):
         )
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     compiled_forward_logits = torch.compile(
-        base_model.forward_logits, dynamic=False, fullgraph=True
+        base_model.forward_logits, dynamic=True, fullgraph=True
     )
     model = compiled_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
@@ -2739,7 +2739,7 @@ def train_and_eval(h, device):
             base_model.looping_active = True
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
         compiled_forward_logits = torch.compile(
-            base_model.forward_logits, dynamic=False, fullgraph=True
+            base_model.forward_logits, dynamic=True, fullgraph=True
         )
     else:
         log(
@@ -2774,7 +2774,7 @@ def train_and_eval(h, device):
         eval_model.looping_active = True
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
     compiled_forward_logits = torch.compile(
-        eval_model.forward_logits, dynamic=False, fullgraph=True
+        eval_model.forward_logits, dynamic=True, fullgraph=True
     )
     timed_eval(
         "diagnostic quantized",
