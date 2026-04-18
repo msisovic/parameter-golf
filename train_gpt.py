@@ -2537,7 +2537,7 @@ def train_model(h, device, val_data):
         initial_optimizer_states = [
             copy.deepcopy(opt.state_dict()) for opt in optimizers
         ]
-        model.train()
+        base_model.train()
         train_cache_seq_len = h.train_batch_tokens // h.world_size
         train_warmup_cu_buckets = (64, 128, 192)
 
