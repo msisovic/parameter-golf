@@ -1,8 +1,7 @@
-import ast, base64, collections, copy, fcntl, glob, io, json, lzma, math, os
+import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
-from pyminify import to_source
 from flash_attn_interface import (
     flash_attn_func as flash_attn_3_func,
     flash_attn_varlen_func,
@@ -22,8 +21,6 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
-    train_seq_len_end = int(os.environ.get("TRAIN_SEQ_LEN_END", "0")) or train_seq_len
-    seq_len_bump_frac = float(os.environ.get("SEQ_LEN_BUMP_FRAC", 0.5))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
@@ -41,9 +38,6 @@ class Hyperparameters:
     skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 3e1))
-    fp8_lm_head = bool(int(os.environ.get("FP8_LM_HEAD", "0")))
-    train_ce_float = bool(int(os.environ.get("TRAIN_CE_FLOAT", "1")))
-    fused_softcap_ce = bool(int(os.environ.get("FUSED_SOFTCAP_CE", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 1e4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     rope_train_seq_len = int(os.environ.get("ROPE_TRAIN_SEQ_LEN", 2048))
@@ -294,7 +288,7 @@ class DocumentPackingLoader:
         self.world_size = h.world_size
         self.device = device
         self.cu_bucket_size = cu_bucket_size
-        self.h = h
+        self.max_seq_len = h.train_seq_len
         all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
         if not all_files:
             raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
@@ -358,15 +352,14 @@ class DocumentPackingLoader:
 
     def next_batch(self, global_tokens, grad_accum_steps):
         num_tokens_local = global_tokens // (self.world_size * grad_accum_steps)
-        cur_seq_len = self.h.train_seq_len
         if self._next_batch is not None:
             inputs, targets, cu_seqlens, max_seqlen = self._next_batch.result()
         else:
             inputs, targets, cu_seqlens, max_seqlen = self._prepare_batch(
-                num_tokens_local, cur_seq_len
+                num_tokens_local, self.max_seq_len
             )
         self._next_batch = self._batch_pool.submit(
-            self._prepare_batch, num_tokens_local, cur_seq_len
+            self._prepare_batch, num_tokens_local, self.max_seq_len
         )
         return (
             inputs[None].to(self.device, non_blocking=True),
@@ -444,171 +437,6 @@ class CastedLinear(nn.Linear):
         w = self.weight.to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
-
-
-class FP8LinearTensorwiseFn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, weight_fp8_t, w_scale):
-        x_2d = x.reshape(-1, x.size(-1))
-        x_scale = x_2d.detach().abs().amax().float().clamp_min(1e-12) / 448.0
-        x_fp8 = (x_2d / x_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
-        y = torch._scaled_mm(
-            x_fp8,
-            weight_fp8_t,
-            scale_a=x_scale,
-            scale_b=w_scale,
-            out_dtype=x.dtype,
-        )
-        ctx.input_shape = x.shape
-        ctx.save_for_backward(x_2d, weight)
-        return y.view(*x.shape[:-1], weight.size(0))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x_2d, weight = ctx.saved_tensors
-        grad_2d = grad_output.reshape(-1, grad_output.size(-1))
-        grad_input = grad_2d @ weight.to(grad_2d.dtype)
-        grad_weight = grad_2d.transpose(0, 1) @ x_2d.to(grad_2d.dtype)
-        return grad_input.view(ctx.input_shape), grad_weight.to(weight.dtype), None, None
-
-
-def fp8_linear_tensorwise(x, weight, weight_fp8_t, w_scale):
-    return FP8LinearTensorwiseFn.apply(x, weight, weight_fp8_t, w_scale)
-
-
-@triton.jit
-def fused_softcap_ce_fwd_kernel(
-    logits_ptr,
-    losses_ptr,
-    lse_ptr,
-    targets_ptr,
-    stride_logits_n,
-    stride_logits_v,
-    n_rows,
-    n_cols,
-    A,
-    C,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row_idx = tl.program_id(0).to(tl.int64)
-    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
-    max_val = -float("inf")
-    sum_exp = 0.0
-    inv_C = 1.0 / C
-    for off in range(0, n_cols, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < n_cols
-        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float("inf")).to(tl.float32)
-        z = A * tl.sigmoid(val * inv_C)
-        z = tl.where(mask, z, -float("inf"))
-        curr_max = tl.max(z, axis=0)
-        new_max = tl.maximum(max_val, curr_max)
-        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
-        max_val = new_max
-    lse = max_val + tl.log(sum_exp)
-    tl.store(lse_ptr + row_idx, lse)
-    target = tl.load(targets_ptr + row_idx).to(tl.int32)
-    val_target = tl.load(logits_row_ptr + target).to(tl.float32)
-    z_target = A * tl.sigmoid(val_target * inv_C)
-    tl.store(losses_ptr + row_idx, lse - z_target)
-
-
-@triton.jit
-def fused_softcap_ce_bwd_kernel(
-    grad_input_ptr,
-    grad_output_ptr,
-    lse_ptr,
-    logits_ptr,
-    targets_ptr,
-    stride_logits_n,
-    stride_logits_v,
-    stride_grad_n,
-    stride_grad_v,
-    n_rows,
-    n_cols,
-    A,
-    C,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row_idx = tl.program_id(0).to(tl.int64)
-    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
-    grad_row_ptr = grad_input_ptr + row_idx * stride_grad_n
-    lse = tl.load(lse_ptr + row_idx)
-    grad_loss = tl.load(grad_output_ptr + row_idx)
-    target = tl.load(targets_ptr + row_idx).to(tl.int32)
-    inv_C = 1.0 / C
-    inv_C_A = inv_C * A
-    for off in range(0, n_cols, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < n_cols
-        val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        sigmoid_u = tl.sigmoid(val * inv_C)
-        z = A * sigmoid_u
-        p = tl.exp(z - lse)
-        grad_z = grad_loss * (p - tl.where(cols == target, 1.0, 0.0))
-        grad_x = grad_z * (inv_C_A * sigmoid_u * (1.0 - sigmoid_u))
-        tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
-
-
-class FusedSoftcapCrossEntropyFn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, logits, targets, softcap):
-        logits_2d = logits.reshape(-1, logits.size(-1))
-        targets_1d = targets.reshape(-1)
-        logits_2d = logits_2d.contiguous()
-        targets_1d = targets_1d.contiguous()
-        losses = torch.empty(logits_2d.size(0), dtype=torch.float32, device=logits.device)
-        lse = torch.empty_like(losses)
-        # c * tanh(x / c) is CE-equivalent to 2c * sigmoid(2x / c) up to a row-wise constant.
-        A = float(2.0 * softcap)
-        C = float(softcap / 2.0)
-        fused_softcap_ce_fwd_kernel[(logits_2d.size(0),)](
-            logits_2d,
-            losses,
-            lse,
-            targets_1d,
-            logits_2d.stride(0),
-            logits_2d.stride(1),
-            logits_2d.size(0),
-            logits_2d.size(1),
-            A,
-            C,
-            BLOCK_SIZE=2048,
-            num_warps=2,
-        )
-        ctx.input_shape = logits.shape
-        ctx.save_for_backward(logits_2d, targets_1d, lse)
-        ctx.A = A
-        ctx.C = C
-        return losses
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        logits_2d, targets_1d, lse = ctx.saved_tensors
-        grad_output = grad_output.contiguous()
-        grad_input = torch.empty_like(logits_2d, dtype=torch.bfloat16)
-        fused_softcap_ce_bwd_kernel[(logits_2d.size(0),)](
-            grad_input,
-            grad_output,
-            lse,
-            logits_2d,
-            targets_1d,
-            logits_2d.stride(0),
-            logits_2d.stride(1),
-            grad_input.stride(0),
-            grad_input.stride(1),
-            logits_2d.size(0),
-            logits_2d.size(1),
-            ctx.A,
-            ctx.C,
-            BLOCK_SIZE=1024,
-            num_warps=4,
-        )
-        return grad_input.view(ctx.input_shape), None, None
-
-
-def fused_softcap_cross_entropy(logits, targets, softcap):
-    return FusedSoftcapCrossEntropyFn.apply(logits, targets, softcap)
 
 
 @triton.jit
@@ -744,36 +572,28 @@ class Rotary(nn.Module):
         self._seq_len_cached = 0
         self._cos_cached = None
         self._sin_cached = None
-        self._yarn_scale_cached = 0.0
 
-    def forward(self, seq_len, device, dtype, yarn_seq_len=None):
-        if yarn_seq_len is None:
-            yarn_seq_len = getattr(self, "_force_yarn_seq_len", None) or seq_len
-        use_yarn = self.yarn and yarn_seq_len > self.train_seq_len
-        yarn_scale = yarn_seq_len / self.train_seq_len if use_yarn else 0.0
-        cache_ok = (
-            self._cos_cached is not None
-            and self._sin_cached is not None
-            and self._cos_cached.device == device
-            and self._seq_len_cached >= seq_len
-            and self._yarn_scale_cached == yarn_scale
-        )
-        if not cache_ok:
+    def forward(self, seq_len, device, dtype):
+        if (
+            self._cos_cached is None
+            or self._sin_cached is None
+            or self._seq_len_cached < seq_len
+            or self._cos_cached.device != device
+        ):
             rd = self.rope_dims
-            if use_yarn:
-                new_base = self.base * yarn_scale ** (rd / (rd - 2))
+            if self.yarn and seq_len > self.train_seq_len:
+                scale = seq_len / self.train_seq_len
+                new_base = self.base * scale ** (rd / (rd - 2))
                 inv_freq = 1.0 / new_base ** (
                     torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd
                 )
             else:
                 inv_freq = self.inv_freq.float().to(device)
-            alloc_seq_len = max(seq_len, self._seq_len_cached)
-            t = torch.arange(alloc_seq_len, device=device, dtype=torch.float32)
+            t = torch.arange(seq_len, device=device, dtype=torch.float32)
             freqs = torch.outer(t, inv_freq)
             self._cos_cached = freqs.cos()[None, :, None, :]
             self._sin_cached = freqs.sin()[None, :, None, :]
-            self._seq_len_cached = alloc_seq_len
-            self._yarn_scale_cached = yarn_scale
+            self._seq_len_cached = seq_len
         return self._cos_cached[:, :seq_len].to(dtype=dtype), self._sin_cached[:, :seq_len].to(dtype=dtype)
 
 
@@ -826,9 +646,7 @@ class CausalSelfAttention(nn.Module):
         v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(
-            seqlen, x.device, q.dtype, yarn_seq_len=max_seqlen or seqlen
-        )
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
@@ -914,16 +732,9 @@ class GPT(nn.Module):
         super().__init__()
         if h.logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {h.logit_softcap}")
-        if h.fp8_lm_head and not h.tie_embeddings:
-            raise ValueError("fp8_lm_head currently only supports tied embeddings")
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
-        self.fp8_lm_head = h.fp8_lm_head
-        self.train_ce_float = h.train_ce_float
-        self.fused_softcap_ce = h.fused_softcap_ce
-        self.register_buffer("fp8_lm_head_weight_t", None, persistent=False)
-        self.register_buffer("fp8_lm_head_weight_scale", None, persistent=False)
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
@@ -950,7 +761,7 @@ class GPT(nn.Module):
                     h.mlp_mult,
                     h.rope_base,
                     h.qk_gain_init,
-                    h.rope_train_seq_len,
+                    h.train_seq_len,
                     layer_idx=i,
                     ln_scale=h.ln_scale,
                     yarn=h.rope_yarn,
@@ -965,7 +776,7 @@ class GPT(nn.Module):
                 block.attn.rotary = Rotary(
                     head_dim,
                     base=h.rope_base,
-                    train_seq_len=h.rope_train_seq_len,
+                    train_seq_len=h.train_seq_len,
                     rope_dims=h.rope_dims,
                     yarn=h.rope_yarn,
                 )
@@ -1041,35 +852,6 @@ class GPT(nn.Module):
                 ):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
-    @torch.no_grad()
-    def refresh_fp8_lm_head_cache(self):
-        if not (self.tie_embeddings and self.fp8_lm_head):
-            self.fp8_lm_head_weight_t = None
-            self.fp8_lm_head_weight_scale = None
-            return
-        weight = self.tok_emb.weight.detach()
-        w_scale = weight.abs().amax().float().clamp_min(1e-12) / 448.0
-        w_fp8 = (weight / w_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
-        self.fp8_lm_head_weight_t = w_fp8.t()
-        self.fp8_lm_head_weight_scale = w_scale
-
-    def _project_logits(self, x):
-        x = self.final_norm(x)
-        if self.head_proj is not None:
-            x = self.head_proj(x)
-        if self.tie_embeddings:
-            if self.training and self.fp8_lm_head:
-                if self.fp8_lm_head_weight_t is None or self.fp8_lm_head_weight_scale is None:
-                    self.refresh_fp8_lm_head_cache()
-                return fp8_linear_tensorwise(
-                    x,
-                    self.tok_emb.weight,
-                    self.fp8_lm_head_weight_t,
-                    self.fp8_lm_head_weight_scale,
-                )
-            return F.linear(x, self.tok_emb.weight)
-        return self.lm_head(x)
-
     def _bank_weights(self, i):
         n = self.num_layers
         return (
@@ -1114,7 +896,7 @@ class GPT(nn.Module):
             return lane0
         return 0.5 * (lane0 + lane1)
 
-    def _forward_features(self, input_ids, cu_seqlens=None, max_seqlen=0):
+    def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -1173,28 +955,21 @@ class GPT(nn.Module):
                 x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
-        return x
-
-    def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
-        x = self._forward_features(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
-        )
-        logits_proj = self._project_logits(x)
+        x = self.final_norm(x)
+        if self.head_proj is not None:
+            x = self.head_proj(x)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids, target_ids, cu_seqlens=None, max_seqlen=0):
-        x = self._forward_features(
+        logits = self.forward_logits(
             input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
         )
-        logits = self._project_logits(x)
-        if self.training and self.fused_softcap_ce:
-            return fused_softcap_cross_entropy(logits, target_ids, self.logit_softcap).mean()
-        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
-        logits_flat = logits.reshape(-1, logits.size(-1))
-        if self.train_ce_float:
-            logits_flat = logits_flat.float()
         return F.cross_entropy(
-            logits_flat,
+            logits.reshape(-1, logits.size(-1)).float(),
             target_ids.reshape(-1),
             reduction="mean",
         )
@@ -2067,7 +1842,10 @@ def _rebank_state_dict(flat_sd, num_layers, model_dim, kv_dim, hidden_dim):
 
 def _compressed_code_size(code):
     code_raw = code.encode("utf-8")
-    minified = to_source(ast.parse(code), indent_with=" ").encode("utf-8")
+    minified = subprocess.run(
+        ["pyminify", "--no-rename-locals", "--no-hoist-literals", "--remove-literal-statements", "-"],
+        input=code_raw, capture_output=True, check=True,
+    ).stdout
     compressed = lzma.compress(minified)
     encoded = base64.b85encode(compressed)
     wrapper = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode("' + encoded + b'")))\n'
@@ -2172,12 +1950,12 @@ def eval_val(h, device, val_data, model, forward_logits_fn=None):
             x = local[:-1]
             y = local[1:]
             bos_pos = (x == BOS_ID).nonzero(as_tuple=True)[0].tolist()
-            cu_seqlens, _ = _build_cu_seqlens(
+            cu_seqlens, max_seqlen = _build_cu_seqlens(
                 bos_pos, x.numel(), x.device, h.eval_seq_len, 64
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = run_forward_logits(
-                    x[None], cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len
+                    x[None], cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
                 ).detach()
             per_token_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
@@ -2622,13 +2400,6 @@ def timed_eval(label, fn, *args, **kwargs):
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
-    base_model.refresh_fp8_lm_head_cache()
-    train_seq_len_start = h.train_seq_len
-    if h.train_seq_len_end != train_seq_len_start:
-        log(
-            f"seq_len_curriculum:enabled start:{train_seq_len_start} "
-            f"end:{h.train_seq_len_end} bump_frac:{h.seq_len_bump_frac:.3f}"
-        )
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     compiled_forward_logits = torch.compile(
         base_model.forward_logits, dynamic=False, fullgraph=True
@@ -2686,7 +2457,6 @@ def train_model(h, device, val_data):
         if h.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
         optimizers.step(distributed=h.distributed)
-        base_model.refresh_fp8_lm_head_cache()
         return train_loss
 
     if h.warmup_steps > 0:
@@ -2700,9 +2470,7 @@ def train_model(h, device, val_data):
         model.train()
         num_tokens_local = h.train_batch_tokens // h.world_size
         for blk in base_model.blocks:
-            blk.attn.rotary(
-                num_tokens_local, device, torch.bfloat16, yarn_seq_len=h.train_seq_len
-            )
+            blk.attn.rotary(num_tokens_local, device, torch.bfloat16)
         cu_bucket_size = train_loader.cu_bucket_size
         warmup_cu_buckets = tuple(cu_bucket_size * i for i in range(1, 5))
         warmup_cu_iters = 3
@@ -2710,15 +2478,8 @@ def train_model(h, device, val_data):
             h.train_batch_tokens, h.grad_accum_steps
         )
         log(f"warmup_cu_buckets:{','.join(str(b) for b in warmup_cu_buckets)} iters_each:{warmup_cu_iters}")
-        def _reset_rotary_cache(yarn_seq_len):
-            for blk in base_model.blocks:
-                blk.attn.rotary(
-                    num_tokens_local, device, torch.bfloat16, yarn_seq_len=yarn_seq_len
-                )
-        def _run_cu_bucket_warmup(reset_yarn_seq_len=None):
+        def _run_cu_bucket_warmup():
             for bucket_len in warmup_cu_buckets:
-                if reset_yarn_seq_len is not None:
-                    _reset_rotary_cache(reset_yarn_seq_len)
                 boundaries = list(range(0, x.size(1), max(h.train_seq_len, 1)))
                 if boundaries[-1] != x.size(1):
                     boundaries.append(x.size(1))
@@ -2730,70 +2491,11 @@ def train_model(h, device, val_data):
                         wloss = model(x, y, cu_seqlens=cu, max_seqlen=h.train_seq_len)
                     (wloss / h.grad_accum_steps).backward()
             optimizers.zero_grad_all()
-        def _run_forward_logits_warmup():
-            for bucket_len in warmup_cu_buckets:
-                boundaries = list(range(0, x.size(1), max(h.eval_seq_len, 1)))
-                if boundaries[-1] != x.size(1):
-                    boundaries.append(x.size(1))
-                cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
-                cu[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
-                for _ in range(warmup_cu_iters):
-                    with torch.no_grad(), torch.autocast(
-                        device_type="cuda", dtype=torch.bfloat16, enabled=True
-                    ):
-                        _ = compiled_forward_logits(
-                            x, cu_seqlens=cu, max_seqlen=h.eval_seq_len
-                        )
-        curriculum_on = h.train_seq_len_end != train_seq_len_start
-        loops_on = h.num_loops > 0
-        need_start_loop = loops_on and (
-            not curriculum_on or h.enable_looping_at < h.seq_len_bump_frac
-        )
-        need_end_noloop = curriculum_on and (
-            not loops_on or h.seq_len_bump_frac < h.enable_looping_at
-        )
-        need_end_loop = curriculum_on and loops_on
         _run_cu_bucket_warmup()
-        if need_start_loop:
+        if h.num_loops > 0:
             base_model.looping_active = True
             _run_cu_bucket_warmup()
             base_model.looping_active = False
-        if curriculum_on:
-            log(
-                f"seq_len_curriculum:warmup_end_seqlen seq_len:{h.train_seq_len_end} "
-                f"compile_end_noloop:{need_end_noloop} compile_end_loop:{need_end_loop}"
-            )
-            h.train_seq_len = h.train_seq_len_end
-            if need_end_noloop:
-                _run_cu_bucket_warmup(reset_yarn_seq_len=train_seq_len_start)
-            if need_end_loop:
-                base_model.looping_active = True
-                _run_cu_bucket_warmup(reset_yarn_seq_len=train_seq_len_start)
-                base_model.looping_active = False
-            eval_flips_yarn = h.eval_seq_len > h.rope_train_seq_len
-            if eval_flips_yarn:
-                h.train_seq_len = train_seq_len_start
-                _run_cu_bucket_warmup(reset_yarn_seq_len=h.train_seq_len_end)
-                if need_start_loop:
-                    base_model.looping_active = True
-                    _run_cu_bucket_warmup(reset_yarn_seq_len=h.train_seq_len_end)
-                    base_model.looping_active = False
-            h.train_seq_len = train_seq_len_start
-            _reset_rotary_cache(h.train_seq_len)
-        if h.val_loss_every > 0:
-            _run_forward_logits_warmup()
-            if need_start_loop:
-                for blk in base_model.blocks:
-                    blk.attn.rotary(
-                        num_tokens_local, device, torch.bfloat16, yarn_seq_len=train_seq_len_start
-                    )
-                base_model.looping_active = True
-                _run_forward_logits_warmup()
-                base_model.looping_active = False
-            for blk in base_model.blocks:
-                blk.attn.rotary(
-                    num_tokens_local, device, torch.bfloat16, yarn_seq_len=train_seq_len_start
-                )
         for warmup_step in range(h.warmup_steps):
             step_fn(warmup_step, 1.0)
             if (
@@ -2820,7 +2522,6 @@ def train_model(h, device, val_data):
         for (opt, state) in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         optimizers.zero_grad_all()
-        base_model.refresh_fp8_lm_head_cache()
         train_loader = DocumentPackingLoader(h, device)
     ema_state = {
         name: t.detach().float().clone()
@@ -2870,17 +2571,6 @@ def train_model(h, device, val_data):
             log(
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
-        target_seq_len = (
-            train_seq_len_start
-            if frac < h.seq_len_bump_frac
-            else h.train_seq_len_end
-        )
-        if target_seq_len != h.train_seq_len:
-            log(
-                f"seq_len_curriculum:bump step:{step} frac:{frac:.3f} "
-                f"seq_len:{h.train_seq_len}->{target_seq_len}"
-            )
-            h.train_seq_len = target_seq_len
         train_loss = step_fn(step, scale)
         with torch.no_grad():
             for (name, t) in base_model.state_dict().items():
@@ -2956,16 +2646,6 @@ def train_and_eval(h, device):
         compiled_model,
         compiled_forward_logits,
     )
-    if h.sliding_window_enabled:
-        timed_eval(
-            "diagnostic pre-quantization post-ema sliding_window",
-            eval_val_sliding,
-            h,
-            device,
-            val_data,
-            base_model,
-            forward_logits_fn=compiled_forward_logits,
-        )
     if not _skip_training:
         serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
     else:
@@ -3011,9 +2691,16 @@ def train_and_eval(h, device):
         for p in ttt_model.parameters():
             p.requires_grad_(False)
 
-        for block in ttt_model.blocks:
-            block.attn.rotary._force_yarn_seq_len = h.ttt_eval_seq_len
-            block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
+        if h.rope_yarn:
+            _yarn_seqlen = h.train_batch_tokens // h.grad_accum_steps
+            for block in ttt_model.blocks:
+                block.attn.rotary(_yarn_seqlen, device, torch.bfloat16)
+        else:
+            for block in ttt_model.blocks:
+                block.attn.rotary._cos_cached = None
+                block.attn.rotary._sin_cached = None
+                block.attn.rotary._seq_len_cached = 0
+                block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
 
         def _fwd_ttt_inner(input_ids, target_ids, lora):
             return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
@@ -3124,7 +2811,7 @@ def main():
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
     torch._dynamo.config.optimize_ddp = False
-    torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.cache_size_limit = 16
     h = Hyperparameters()
     set_logging_hparams(h)
     if h.is_main_process:
