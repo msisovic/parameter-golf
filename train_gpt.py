@@ -24,6 +24,7 @@ class Hyperparameters:
     train_seq_len_end = int(os.environ.get("TRAIN_SEQ_LEN_END", "0")) or train_seq_len
     seq_len_bump_frac = float(os.environ.get("SEQ_LEN_BUMP_FRAC", 0.5))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
+    curriculum_monitor_steps = int(os.environ.get("CURRICULUM_MONITOR_STEPS", 64))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
@@ -2417,6 +2418,7 @@ def _set_rotary_state(model, cache_seq_len, device, dtype, yarn_seq_len=None):
         rotary._seq_len_cached = 0
         if hasattr(rotary, "_yarn_scale_cached"):
             rotary._yarn_scale_cached = 0.0
+        rotary._force_yarn_seq_len = yarn_seq_len
         rotary.forward(cache_seq_len, device, dtype, yarn_seq_len=yarn_seq_len)
 
 
@@ -2529,6 +2531,40 @@ def train_model(h, device, val_data):
         optimizers.step(distributed=h.distributed)
         return train_loss
 
+    def _prime_live_train_regime(label, max_shape_samples=24, target_cu_len=None):
+        active_model = (
+            compiled_train_forward_bump_loop
+            if (
+                compiled_train_forward_bump_loop is not None
+                and base_model.looping_active
+                and h.train_seq_len == train_seq_len_end
+            )
+            else compiled_train_forward
+        )
+        seen_cu_lens = set()
+        sampled_cu_lens = []
+        for _ in range(max_shape_samples):
+            x0, y0, cu0, _ = train_loader.next_batch(
+                h.train_batch_tokens, h.grad_accum_steps
+            )
+            cu_len = int(cu0.numel())
+            if cu_len in seen_cu_lens:
+                if target_cu_len is not None and target_cu_len in seen_cu_lens:
+                    break
+                continue
+            seen_cu_lens.add(cu_len)
+            sampled_cu_lens.append(cu_len)
+            optimizers.zero_grad_all()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                warmup_loss = active_model(
+                    x0, y0, cu_seqlens=cu0, max_seqlen=h.train_seq_len
+                )
+            (warmup_loss / h.grad_accum_steps).backward()
+            if target_cu_len is not None and cu_len == target_cu_len:
+                break
+        optimizers.zero_grad_all()
+        log(f"{label}:real_cu_lens {sampled_cu_lens}")
+
     if h.warmup_steps > 0:
         initial_model_state = {
             name: tensor.detach().cpu().clone()
@@ -2539,8 +2575,7 @@ def train_model(h, device, val_data):
         ]
         base_model.train()
         train_cache_seq_len = h.train_batch_tokens // h.world_size
-        train_warmup_cu_buckets = (64, 128, 192)
-
+        train_warmup_cu_buckets = (64, 128, 192, 256)
         def _run_train_state_warmup(seq_len, looping_active, label):
             nonlocal train_loader
             h.train_seq_len = seq_len
@@ -2621,6 +2656,38 @@ def train_model(h, device, val_data):
         for (name, t) in base_model.state_dict().items()
     }
     ema_decay = h.ema_decay
+    recent_train_losses = collections.deque(maxlen=max(h.curriculum_monitor_steps, 1))
+    recent_step_ms = collections.deque(maxlen=max(h.curriculum_monitor_steps, 1))
+    active_transition_monitors = []
+
+    def _summarize_monitor_samples(losses, step_ms):
+        if not losses:
+            return "insufficient_samples"
+        avg_loss = sum(losses) / len(losses)
+        avg_step_ms = sum(step_ms) / max(len(step_ms), 1)
+        return (
+            f"samples:{len(losses)} loss_avg:{avg_loss:.4f} "
+            f"loss_min:{min(losses):.4f} loss_max:{max(losses):.4f} "
+            f"step_ms_avg:{avg_step_ms:.1f}"
+        )
+
+    def _start_transition_monitor(label, step, frac, lr_scale):
+        pre_losses = list(recent_train_losses)
+        pre_step_ms = list(recent_step_ms)
+        log(
+            f"{label}:monitor_start step:{step} frac:{frac:.3f} lr_scale:{lr_scale:.4f} "
+            f"seq_len:{h.train_seq_len} looping:{int(base_model.looping_active)} "
+            f"pre[{_summarize_monitor_samples(pre_losses, pre_step_ms)}]"
+        )
+        if h.curriculum_monitor_steps <= 0:
+            return
+        active_transition_monitors.append({
+            "label": label,
+            "start_step": step,
+            "losses": [],
+            "step_ms": [],
+        })
+
     training_time_ms = 0.0
     stop_after_step = None
     eval_cache_seq_len = h.val_batch_tokens // h.world_size
@@ -2686,6 +2753,7 @@ def train_model(h, device, val_data):
             log(
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
+            _start_transition_monitor("layer_loop", step, frac, scale)
         target_seq_len = (
             train_seq_len_start
             if frac < h.seq_len_bump_frac
@@ -2704,7 +2772,35 @@ def train_model(h, device, val_data):
                 torch.bfloat16,
                 yarn_seq_len=h.train_seq_len,
             )
+            torch.cuda.synchronize()
+            training_time_ms += 1e3 * (time.perf_counter() - t0)
+            _prime_live_train_regime(
+                "seq_len_bump_warmup",
+                target_cu_len=256 if h.train_seq_len == train_seq_len_end else None,
+            )
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _start_transition_monitor("seq_len_curriculum", step, frac, scale)
+        step_t0 = time.perf_counter()
         train_loss = step_fn(step, scale)
+        step_elapsed_ms = 1e3 * (time.perf_counter() - step_t0)
+        loss_item = train_loss.item()
+        recent_train_losses.append(loss_item)
+        recent_step_ms.append(step_elapsed_ms)
+        completed_monitors = []
+        for monitor in active_transition_monitors:
+            monitor["losses"].append(loss_item)
+            monitor["step_ms"].append(step_elapsed_ms)
+            if len(monitor["losses"]) >= h.curriculum_monitor_steps:
+                log(
+                    f"{monitor['label']}:monitor_end step:{step+1} "
+                    f"post[{_summarize_monitor_samples(monitor['losses'], monitor['step_ms'])}]"
+                )
+                completed_monitors.append(monitor)
+        if completed_monitors:
+            active_transition_monitors = [
+                m for m in active_transition_monitors if m not in completed_monitors
+            ]
         with torch.no_grad():
             for (name, t) in base_model.state_dict().items():
                 ema_state[name].mul_(ema_decay).add_(
@@ -2718,7 +2814,7 @@ def train_model(h, device, val_data):
         if should_log_train:
             tok_per_sec = step * h.train_batch_tokens / (approx_training_time_ms / 1e3)
             log(
-                f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
+                f"{step}/{h.iterations} train_loss: {loss_item:.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f} lr_scale: {scale:.4f} step_ms: {step_elapsed_ms:.1f}"
             )
         reached_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -2774,6 +2870,13 @@ def train_and_eval(h, device):
         )
     _skip_training = bool(h.eval_only_path)
     torch._dynamo.reset()
+    _set_rotary_state(
+        base_model,
+        h.val_batch_tokens // h.world_size,
+        device,
+        torch.bfloat16,
+        yarn_seq_len=h.eval_seq_len,
+    )
     timed_eval(
         "diagnostic pre-quantization post-ema",
         eval_val,
@@ -2795,6 +2898,13 @@ def train_and_eval(h, device):
     eval_model = deserialize(h, device)
     if h.num_loops > 0:
         eval_model.looping_active = True
+    _set_rotary_state(
+        eval_model,
+        h.val_batch_tokens // h.world_size,
+        device,
+        torch.bfloat16,
+        yarn_seq_len=h.eval_seq_len,
+    )
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
     compiled_forward_logits = (
         torch.compile(eval_model.forward_logits, dynamic=False, fullgraph=True)
