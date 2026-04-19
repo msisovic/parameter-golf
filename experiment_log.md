@@ -225,3 +225,79 @@ Notes:
 - This was the best autonomous search result so far and very close to the `< 2.76` target.
 - The quantized phase did not complete cleanly before manual interruption, so no trustworthy quantized metric was recorded for this run.
 - Delaying looping avoided the long early looped-2048 slowdown, but the combined loop+4096 transition still caused a visible loss/time shock.
+
+## 2026-04-19 - YARN / Seq-Len Bug Diff Against `pr-1530-lm-head-kernels`
+
+Findings from diffing the current branch against `origin/pr-1530-lm-head-kernels`:
+
+- `DocumentPackingLoader` had drifted from the working branch and was using a fixed `self.max_seq_len = h.train_seq_len` captured at construction time.
+- The working branch uses the live `self.h.train_seq_len` on each batch instead.
+- `CausalSelfAttention.forward()` had also drifted: this branch stopped passing `max_seqlen` into rotary/YARN and relied on forced rotary cache state instead.
+- The working branch still calls rotary with `yarn_seq_len=max_seqlen or seqlen`.
+
+Applied fixes on this branch:
+
+- Reverted `DocumentPackingLoader.next_batch()` to use the live current `self.h.train_seq_len`.
+- Restored the working branch rotary call pattern so attention passes `yarn_seq_len=max_seqlen or seqlen`.
+- Kept the current branch structure otherwise; this was a targeted bug fix, not a wholesale branch port.
+
+Interpretation:
+
+- The stale loader seq-len would make curriculum packing diverge from the active training regime.
+- The rotary call drift changed YARN semantics in the actual attention path, not just compile behavior.
+- These are both plausible root-cause bugs for the gap between this branch and the known-good branch.
+
+## 2026-04-19 - Verification Run After Loader + Rotary Fix
+
+Command:
+
+```bash
+SEED=0 GPTQ_RESERVE_SECONDS=13 \
+TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=4096 SEQ_LEN_BUMP_FRAC=0.7 \
+EVAL_SEQ_LEN=4096 ROPE_YARN=1 \
+CURRICULUM_MONITOR_STEPS=64 TTT_ENABLED=0 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+500-step logs:
+
+- `500`: `train_loss 3.2552`, `train_time 0.8m`, `tok/s 8203478`
+- `1000`: `train_loss 3.0043`, `train_time 1.6m`, `tok/s 8159803`
+- `1500`: `train_loss 3.0192`, `train_time 2.4m`, `tok/s 8147944`
+- `2000`: `train_loss 2.9735`, `train_time 3.2m`, `tok/s 8148639`
+- `2500`: `train_loss 3.0558`, `train_time 4.3m`, `tok/s 7629644`
+- `3000`: `train_loss 2.9010`, `train_time 5.5m`, `tok/s 7191450`
+- `3500`: `train_loss 2.9655`, `train_time 6.6m`, `tok/s 6908994`
+- `4000`: `train_loss 2.8659`, `train_time 7.9m`, `tok/s 6653963`
+- `4500`: `train_loss 2.8114`, `train_time 9.1m`, `tok/s 6459437`
+
+Transition monitors:
+
+- Loop monitor:
+  - pre: `loss_avg 3.0744`, `step_ms_avg 36.6`
+  - post: `loss_avg 3.1228`, `step_ms_avg 70.1`
+- Seq-len bump monitor:
+  - pre: `loss_avg 2.9347`, `step_ms_avg 70.6`
+  - post: `loss_avg 2.9189`, `step_ms_avg 68.0`
+
+Validation / diagnostics:
+
+- `4000` val at `4096`: `2.8526`
+- End-of-training val at `4096`: `2.7563` bpb `1.0670`
+- Diagnostic pre-quantization post-EMA val at `4096`: `2.75512949` bpb `1.06655748`
+
+Quantized follow-up:
+
+```bash
+EVAL_ONLY_PATH=final_model.pt EVAL_SEQ_LEN=4096 ROPE_YARN=1 TTT_ENABLED=0 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+- Diagnostic pre-quantization post-EMA val at `4096`: `2.75512953` bpb `1.06655750`
+- Diagnostic quantized val at `4096`: `2.78594677` bpb `1.07848737`
+
+Current read:
+
+- This fix closed the gap to the known-good branch behavior.
+- The target was reached: pre-quantized `4096` val is now `2.7551`, below `< 2.76`.
+- The improvement showed up mainly after the curriculum bump, which matches the bug hypothesis.

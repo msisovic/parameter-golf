@@ -288,11 +288,11 @@ class DocumentPackingLoader:
     _shard_pool = ThreadPoolExecutor(1)
 
     def __init__(self, h, device, cu_bucket_size=64):
+        self.h = h
         self.rank = h.rank
         self.world_size = h.world_size
         self.device = device
         self.cu_bucket_size = cu_bucket_size
-        self.max_seq_len = h.train_seq_len
         all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
         if not all_files:
             raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
@@ -356,14 +356,15 @@ class DocumentPackingLoader:
 
     def next_batch(self, global_tokens, grad_accum_steps):
         num_tokens_local = global_tokens // (self.world_size * grad_accum_steps)
+        cur_seq_len = self.h.train_seq_len
         if self._next_batch is not None:
             inputs, targets, cu_seqlens, max_seqlen = self._next_batch.result()
         else:
             inputs, targets, cu_seqlens, max_seqlen = self._prepare_batch(
-                num_tokens_local, self.max_seq_len
+                num_tokens_local, cur_seq_len
             )
         self._next_batch = self._batch_pool.submit(
-            self._prepare_batch, num_tokens_local, self.max_seq_len
+            self._prepare_batch, num_tokens_local, cur_seq_len
         )
         return (
             inputs[None].to(self.device, non_blocking=True),
@@ -580,9 +581,7 @@ class Rotary(nn.Module):
 
     def forward(self, seq_len, device, dtype, yarn_seq_len=None):
         if yarn_seq_len is None:
-            yarn_seq_len = getattr(self, "_force_yarn_seq_len", None)
-            if yarn_seq_len is None:
-                yarn_seq_len = seq_len
+            yarn_seq_len = getattr(self, "_force_yarn_seq_len", None) or seq_len
         use_yarn = self.yarn and yarn_seq_len > self.train_seq_len
         yarn_scale = yarn_seq_len / self.train_seq_len if use_yarn else 0.0
         cache_ok = (
@@ -660,7 +659,9 @@ class CausalSelfAttention(nn.Module):
         v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        cos, sin = self.rotary(
+            seqlen, x.device, q.dtype, yarn_seq_len=max_seqlen or seqlen
+        )
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
