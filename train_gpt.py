@@ -579,11 +579,24 @@ class Rotary(nn.Module):
         self._sin_cached = None
         self._yarn_scale_cached = 0.0
 
+    def get_yarn_scale(self, seq_len, yarn_seq_len=None):
+        if yarn_seq_len is None:
+            yarn_seq_len = getattr(self, "_force_yarn_seq_len", None) or seq_len
+        if not (self.yarn and yarn_seq_len > self.train_seq_len):
+            return 1.0
+        return yarn_seq_len / self.train_seq_len
+
+    def get_attn_scale_multiplier(self, seq_len, yarn_seq_len=None):
+        yarn_scale = self.get_yarn_scale(seq_len, yarn_seq_len=yarn_seq_len)
+        if yarn_scale <= 1.0:
+            return 1.0
+        return 1.0 + 0.1 * math.log(yarn_scale)
+
     def forward(self, seq_len, device, dtype, yarn_seq_len=None):
         if yarn_seq_len is None:
             yarn_seq_len = getattr(self, "_force_yarn_seq_len", None) or seq_len
         use_yarn = self.yarn and yarn_seq_len > self.train_seq_len
-        yarn_scale = yarn_seq_len / self.train_seq_len if use_yarn else 0.0
+        yarn_scale = self.get_yarn_scale(seq_len, yarn_seq_len=yarn_seq_len) if use_yarn else 0.0
         cache_ok = (
             self._cos_cached is not None
             and self._sin_cached is not None
@@ -652,6 +665,11 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
+    def _softmax_scale(self, seqlen, yarn_seq_len=None):
+        return (self.head_dim ** -0.5) * self.rotary.get_attn_scale_multiplier(
+            seqlen, yarn_seq_len=yarn_seq_len
+        )
+
     def forward(self, x, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0):
         bsz, seqlen, dim = x.shape
         q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
@@ -665,6 +683,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        softmax_scale = self._softmax_scale(seqlen, yarn_seq_len=max_seqlen or seqlen)
         if cu_seqlens is not None:
             y = flash_attn_varlen_func(
                 q[0],
@@ -675,10 +694,11 @@ class CausalSelfAttention(nn.Module):
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
                 causal=True,
+                softmax_scale=softmax_scale,
                 window_size=(-1, -1),
             )[None]
         else:
-            y = flash_attn_3_func(q, k, v, causal=True)
+            y = flash_attn_3_func(q, k, v, causal=True, softmax_scale=softmax_scale)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
@@ -1089,7 +1109,8 @@ class GPT(nn.Module):
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        softmax_scale = attn._softmax_scale(seqlen)
+        y = flash_attn_3_func(q, k, v, causal=True, softmax_scale=softmax_scale)
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
@@ -1130,7 +1151,8 @@ class GPT(nn.Module):
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        softmax_scale = attn._softmax_scale(seqlen)
+        y = flash_attn_3_func(q, k, v, causal=True, softmax_scale=softmax_scale)
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
