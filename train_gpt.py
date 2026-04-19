@@ -1869,6 +1869,9 @@ def _compressed_code_size(code):
 
 def serialize(h, base_model, code):
     code_bytes_uncompressed, code_bytes = _compressed_code_size(code)
+    if h.distributed and not h.is_main_process:
+        log("GPTQ:waiting for main process serialize")
+        return None, None
     if h.is_main_process:
         torch.save(base_model.state_dict(), h.model_path)
         model_bytes = os.path.getsize(h.model_path)
@@ -1895,11 +1898,10 @@ def serialize(h, base_model, code):
     quant_blob = _compress(quant_raw, h.compressor)
     quant_file_bytes = len(quant_blob)
     bytes_total = quant_file_bytes + code_bytes
-    if h.is_main_process:
-        with open(h.quantized_model_path, "wb") as f:
-            f.write(quant_blob)
-        log(f"Serialized model quantized+{h.compressor}: {quant_file_bytes} bytes")
-        log(f"Total submission size quantized+{h.compressor}: {bytes_total} bytes")
+    with open(h.quantized_model_path, "wb") as f:
+        f.write(quant_blob)
+    log(f"Serialized model quantized+{h.compressor}: {quant_file_bytes} bytes")
+    log(f"Total submission size quantized+{h.compressor}: {bytes_total} bytes")
     return bytes_total, quant_file_bytes
 
 

@@ -301,3 +301,91 @@ Current read:
 - This fix closed the gap to the known-good branch behavior.
 - The target was reached: pre-quantized `4096` val is now `2.7551`, below `< 2.76`.
 - The improvement showed up mainly after the curriculum bump, which matches the bug hypothesis.
+
+## 2026-04-19 - MIN_LR 0.05 On Top Of Fixed YARN/Curriculum Path
+
+Command:
+
+```bash
+SEED=0 GPTQ_RESERVE_SECONDS=13 \
+TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=4096 SEQ_LEN_BUMP_FRAC=0.7 \
+EVAL_SEQ_LEN=4096 ROPE_YARN=1 MIN_LR=0.05 \
+CURRICULUM_MONITOR_STEPS=64 TTT_ENABLED=0 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+500-step logs:
+
+- `500`: `train_loss 3.2447`, `train_time 0.8m`, `tok/s 8203515`
+- `1000`: `train_loss 3.0070`, `train_time 1.6m`, `tok/s 8163595`
+- `1500`: `train_loss 3.0144`, `train_time 2.4m`, `tok/s 8145194`
+- `2000`: `train_loss 2.9728`, `train_time 3.2m`, `tok/s 8146272`
+- `2500`: `train_loss 3.0602`, `train_time 4.3m`, `tok/s 7627433`
+- `3000`: `train_loss 2.8969`, `train_time 5.5m`, `tok/s 7188901`
+- `3500`: `train_loss 2.9669`, `train_time 6.6m`, `tok/s 6907008`
+- `4000`: `train_loss 2.8662`, `train_time 7.9m`, `tok/s 6652386`
+- `4500`: `train_loss 2.8061`, `train_time 9.1m`, `tok/s 6458378`
+
+Transition monitors:
+
+- Loop monitor:
+  - pre: `loss_avg 3.0732`, `step_ms_avg 37.3`
+  - post: `loss_avg 3.1232`, `step_ms_avg 70.1`
+- Seq-len bump monitor:
+  - pre: `loss_avg 2.9361`, `step_ms_avg 70.2`
+  - post: `loss_avg 2.9216`, `step_ms_avg 67.9`
+
+Validation / diagnostics:
+
+- `4000` val at `4096`: `2.8511`
+- End-of-training val at `4096`: `2.7591` bpb `1.0681`
+- Diagnostic pre-quantization post-EMA val at `4096`: `2.75383580` bpb `1.06605667`
+
+Eval-only quantized follow-up from saved checkpoint:
+
+```bash
+EVAL_ONLY_PATH=final_model.pt EVAL_SEQ_LEN=4096 ROPE_YARN=1 TTT_ENABLED=0 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+- Diagnostic pre-quantization post-EMA val at `4096`: `2.75384741` bpb `1.06606117`
+- Diagnostic quantized val at `4096`: `2.78306027` bpb `1.07736996`
+
+Current read:
+
+- `MIN_LR=0.05` improved both metrics over the fixed baseline.
+- Previous fixed baseline pre-quantized / quantized at `4096`: `2.75512953` / `2.78594677`
+- New `MIN_LR=0.05` run: `2.75384741` / `2.78306027`
+
+## 2026-04-19 - Post-GPTQ Hang Fix
+
+Symptom:
+
+- Full training runs were often getting stuck after GPTQ packaging, before the final `diagnostic quantized` line.
+- The same saved checkpoint would quantize/evaluate fine in a later `eval_only` pass, so the quantized eval path itself was not the problem.
+
+Root-cause hypothesis and fix:
+
+- `serialize()` was redundantly running GPTQ on all 8 ranks and then synchronizing before quantized eval.
+- That work is not rank-dependent; only one rank needs to write the quantized artifact.
+- Changed `serialize()` so GPTQ/serialization runs only on the main process, while the other ranks wait for the artifact.
+
+Verification command:
+
+```bash
+ARTIFACT_DIR=/tmp/pg_evalonly_serialize_check \
+EVAL_ONLY_PATH=final_model.pt EVAL_SEQ_LEN=4096 ROPE_YARN=1 TTT_ENABLED=0 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+Verification result:
+
+- Fresh serialize completed without hanging.
+- Fresh quantized diagnostic also completed in the same run:
+  - `diagnostic quantized val_loss:2.78269538`
+  - `val_bpb:1.07722871`
+
+Current read:
+
+- The post-GPTQ hang was in the full-rank serialize path, not in quantized evaluation itself.
+- The rank-0-only serialize fix removes that stall and slightly simplifies post-training evaluation.
