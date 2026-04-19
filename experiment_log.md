@@ -175,3 +175,53 @@ Validation / quantization / TTT:
   - corrected YARN run quantized: `2.81182195`
 - The loop transition at `2048` still looks like the main source of degradation before the `4096` phase.
 - GPTQ calibration remains a likely source of measurement mismatch because calibration currently uses dense fixed-length `h.train_seq_len` sequences while evaluation is still being reported at `2048`.
+
+## 2026-04-19 - Autonomous Search Run 1: Delay Loop To Bump, Eval At 4096
+
+Command:
+
+```bash
+SEED=0 GPTQ_RESERVE_SECONDS=13 \
+TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=4096 SEQ_LEN_BUMP_FRAC=0.7 \
+EVAL_SEQ_LEN=4096 ENABLE_LOOPING_AT=0.7 \
+CURRICULUM_MONITOR_STEPS=64 TTT_ENABLED=0 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+Purpose:
+
+- Keep the healthy no-YARN baseline
+- Remove the long early looped-2048 regime
+- Judge the run directly on long-context eval (`4096`)
+- Skip TTT during search
+
+500-step logs:
+
+- `500`: `train_loss 3.2505`, `train_time 0.8m`, `tok/s 8204386`
+- `1000`: `train_loss 3.0061`, `train_time 1.6m`, `tok/s 8164274`
+- `1500`: `train_loss 3.0146`, `train_time 2.4m`, `tok/s 8154352`
+- `2000`: `train_loss 2.9743`, `train_time 3.2m`, `tok/s 8154449`
+- `2500`: `train_loss 3.0914`, `train_time 4.0m`, `tok/s 8152546`
+- `3000`: `train_loss 2.9452`, `train_time 4.8m`, `tok/s 8151092`
+- `3500`: `train_loss 3.0280`, `train_time 5.6m`, `tok/s 8148671`
+- `4000`: `train_loss 2.9795`, `train_time 6.4m`, `tok/s 8149499`
+- `4500`: `train_loss 2.9552`, `train_time 7.4m`, `tok/s 7942955`
+- `5000`: `train_loss 2.8357`, `train_time 8.6m`, `tok/s 7609230`
+
+Transition monitors:
+
+- Loop and seq-len bump were aligned at step `4258`
+- Shared pre-window: `loss_avg 2.9647`, `step_ms_avg 37.7`
+- Shared post-window: `loss_avg 3.0230`, `step_ms_avg 70.5`
+
+Validation / diagnostics:
+
+- `4000` val at `4096`: `2.9529`
+- End-of-training val at `4096`: `2.7718` bpb `1.0730`
+- Diagnostic pre-quantization post-EMA val at `4096`: `2.76971049` bpb `1.07220203`
+
+Notes:
+
+- This was the best autonomous search result so far and very close to the `< 2.76` target.
+- The quantized phase did not complete cleanly before manual interruption, so no trustworthy quantized metric was recorded for this run.
+- Delaying looping avoided the long early looped-2048 slowdown, but the combined loop+4096 transition still caused a visible loss/time shock.

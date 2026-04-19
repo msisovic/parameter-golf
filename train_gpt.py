@@ -93,6 +93,7 @@ class Hyperparameters:
     ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "adam")
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     ttt_output_dir = os.environ.get("TTT_OUTPUT_DIR", "")
+    skip_gptq = bool(int(os.environ.get("SKIP_GPTQ", "0")))
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
@@ -2886,6 +2887,9 @@ def train_and_eval(h, device):
         compiled_model,
         compiled_forward_logits,
     )
+    if h.skip_gptq:
+        log("skip_gptq: enabled - stopping after pre-quantization diagnostic")
+        return
     if not _skip_training:
         serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
     else:
