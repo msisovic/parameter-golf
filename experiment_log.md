@@ -99,3 +99,79 @@ Current conclusion:
 - The limiting issue is no longer the live seq-len bump recompile.
 - The next priority should be improving the training baseline / quantized baseline under seq-len curriculum rather than continuing to chase TTT gains first.
 - For now, it is reasonable to treat long-context TTT as a smaller win in this regime and focus on beating the non-curriculum training baseline.
+
+## 2026-04-19 - YARN Investigation And Eval-State Fix
+
+### What Was Wrong
+
+- With `ROPE_YARN=1`, a real runtime recompile bug was found: training forwards were allowing runtime YARN scale to vary because the forced YARN length was not being pinned on the rotary modules.
+- Fix: `_set_rotary_state(...)` now sets `rotary._force_yarn_seq_len = yarn_seq_len`.
+- A second issue was found in post-training diagnostics:
+  - `diagnostic pre-quantization post-ema` was evaluating the in-memory model without explicitly resetting rotary/YARN state to `eval_seq_len`
+  - `diagnostic quantized` used a fresh deserialized model
+  - this could make the two diagnostics measure different rotary/YARN regimes
+- Fix: both pre-quantized and quantized diagnostics now explicitly call `_set_rotary_state(..., yarn_seq_len=h.eval_seq_len)` before eval.
+
+### YARN Run Without LR Floor, Before Eval-State Fix
+
+Command:
+
+```bash
+SEED=0 GPTQ_RESERVE_SECONDS=13 \
+TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=4096 SEQ_LEN_BUMP_FRAC=0.7 \
+ROPE_YARN=1 \
+CURRICULUM_MONITOR_STEPS=64 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+Observed metrics before the eval-state fix:
+
+- End-of-training val: `2.7846`
+- Diagnostic pre-quantization post-EMA val: `2.77005797`
+- Diagnostic quantized val: `3.02985493`
+
+This quantized result was suspiciously bad and is no longer considered trustworthy due to the diagnostic rotary/YARN state mismatch.
+
+### YARN Run Without LR Floor, After Eval-State Fix
+
+Same command as above, but with the diagnostic eval-state fix applied.
+
+500-step logs:
+
+- `500`: `train_loss 3.2552`, `train_time 0.8m`, `tok/s 8199726`
+- `1000`: `train_loss 3.0093`, `train_time 1.6m`, `tok/s 8161478`
+- `1500`: `train_loss 3.0135`, `train_time 2.4m`, `tok/s 8152870`
+- `2000`: `train_loss 2.9736`, `train_time 3.2m`, `tok/s 8153124`
+- `2500`: `train_loss 3.0585`, `train_time 4.3m`, `tok/s 7634081`
+- `3000`: `train_loss 2.9005`, `train_time 5.5m`, `tok/s 7195419`
+- `3500`: `train_loss 2.9648`, `train_time 6.6m`, `tok/s 6912457`
+- `4000`: `train_loss 2.8778`, `train_time 7.8m`, `tok/s 6701395`
+- `4500`: `train_loss 2.8606`, `train_time 9.0m`, `tok/s 6545224`
+
+Transition monitors:
+
+- Loop monitor:
+  - pre: `loss_avg 3.0726`, `step_ms_avg 36.3`
+  - post: `loss_avg 3.1308`, `step_ms_avg 70.2`
+- Seq-len bump monitor:
+  - pre: `loss_avg 2.9331`, `step_ms_avg 70.4`
+  - post: `loss_avg 2.9326`, `step_ms_avg 66.1`
+
+Validation / quantization / TTT:
+
+- `4000` val: `2.8826`
+- End-of-training val: `2.7847` bpb `1.0780`
+- Diagnostic pre-quantization post-EMA val: `2.78223137` bpb `1.07705376`
+- Diagnostic quantized val: `2.81182195` bpb `1.08850882`
+- Quantized TTT LoRA val: `2.78466097` bpb `1.07802904`
+
+### Current Read
+
+- The catastrophic YARN quantized regression was partly an eval-state bug.
+- After fixing eval-state handling, YARN is no longer obviously broken, but this exact YARN config is still worse than the earlier no-YARN curriculum baseline:
+  - no-YARN curriculum pre-quantized: `2.77139888`
+  - no-YARN curriculum quantized: `2.80068618`
+  - corrected YARN run pre-quantized: `2.78223137`
+  - corrected YARN run quantized: `2.81182195`
+- The loop transition at `2048` still looks like the main source of degradation before the `4096` phase.
+- GPTQ calibration remains a likely source of measurement mismatch because calibration currently uses dense fixed-length `h.train_seq_len` sequences while evaluation is still being reported at `2048`.
