@@ -27,7 +27,7 @@ class Hyperparameters:
     seq_len_bump_fracs = os.environ.get("SEQ_LEN_BUMP_FRACS", "")
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     curriculum_monitor_steps = int(os.environ.get("CURRICULUM_MONITOR_STEPS", 64))
-    train_cu_bucket_size = int(os.environ.get("TRAIN_CU_BUCKET_SIZE", 256))
+    train_cu_bucket_size = int(os.environ.get("TRAIN_CU_BUCKET_SIZE", 192))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
@@ -579,10 +579,45 @@ class Rotary(nn.Module):
             torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("_inv_freq_active", inv_freq.clone(), persistent=False)
         self._seq_len_cached = 0
         self._cos_cached = None
         self._sin_cached = None
-        self._yarn_scale_cached = 0.0
+        self._yarn_seq_len_applied = train_seq_len
+        self._yarn_seq_len_cached = train_seq_len
+
+    def _reset_yarn_frequencies(self):
+        self._inv_freq_active = self.inv_freq.clone()
+        self._yarn_seq_len_applied = self.train_seq_len
+
+    def apply_yarn(self, old_seq_len, new_seq_len, alpha=1.0, beta=32.0):
+        if not self.yarn or new_seq_len <= self.train_seq_len:
+            self._reset_yarn_frequencies()
+            return
+        if old_seq_len <= 0:
+            old_seq_len = self.train_seq_len
+        angular_freq = self._inv_freq_active.float()
+        scaling_factor = old_seq_len / new_seq_len
+        rotations = old_seq_len * angular_freq / (2 * math.pi)
+        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0.0, 1.0)
+        self._inv_freq_active = angular_freq * (
+            scaling_factor + interpolation_weight * (1.0 - scaling_factor)
+        )
+        self._yarn_seq_len_applied = new_seq_len
+
+    def set_yarn_seq_len(self, yarn_seq_len):
+        target_seq_len = int(yarn_seq_len or self.train_seq_len)
+        if not self.yarn or target_seq_len <= self.train_seq_len:
+            if self._yarn_seq_len_applied != self.train_seq_len:
+                self._reset_yarn_frequencies()
+            return
+        current_seq_len = self._yarn_seq_len_applied
+        if target_seq_len == current_seq_len:
+            return
+        if target_seq_len < current_seq_len:
+            self._reset_yarn_frequencies()
+            current_seq_len = self.train_seq_len
+        self.apply_yarn(current_seq_len, target_seq_len)
 
     def get_yarn_scale(self, seq_len, yarn_seq_len=None):
         if yarn_seq_len is None:
@@ -600,31 +635,23 @@ class Rotary(nn.Module):
     def forward(self, seq_len, device, dtype, yarn_seq_len=None):
         if yarn_seq_len is None:
             yarn_seq_len = getattr(self, "_force_yarn_seq_len", None) or seq_len
-        use_yarn = self.yarn and yarn_seq_len > self.train_seq_len
-        yarn_scale = self.get_yarn_scale(seq_len, yarn_seq_len=yarn_seq_len) if use_yarn else 0.0
+        self.set_yarn_seq_len(yarn_seq_len)
         cache_ok = (
             self._cos_cached is not None
             and self._sin_cached is not None
             and self._seq_len_cached >= seq_len
             and self._cos_cached.device == device
-            and self._yarn_scale_cached == yarn_scale
+            and self._yarn_seq_len_cached == self._yarn_seq_len_applied
         )
         if not cache_ok:
-            rd = self.rope_dims
-            if use_yarn:
-                new_base = self.base * yarn_scale ** (rd / (rd - 2))
-                inv_freq = 1.0 / new_base ** (
-                    torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd
-                )
-            else:
-                inv_freq = self.inv_freq.float().to(device)
+            inv_freq = self._inv_freq_active.float().to(device)
             alloc_seq_len = max(seq_len, self._seq_len_cached)
             t = torch.arange(alloc_seq_len, device=device, dtype=torch.float32)
             freqs = torch.outer(t, inv_freq)
             self._cos_cached = freqs.cos()[None, :, None, :]
             self._sin_cached = freqs.sin()[None, :, None, :]
             self._seq_len_cached = alloc_seq_len
-            self._yarn_scale_cached = yarn_scale
+            self._yarn_seq_len_cached = self._yarn_seq_len_applied
         return self._cos_cached[:, :seq_len].to(dtype=dtype), self._sin_cached[:, :seq_len].to(dtype=dtype)
 
 
@@ -2447,9 +2474,10 @@ def _set_rotary_state(model, cache_seq_len, device, dtype, yarn_seq_len=None):
         rotary._cos_cached = None
         rotary._sin_cached = None
         rotary._seq_len_cached = 0
-        if hasattr(rotary, "_yarn_scale_cached"):
-            rotary._yarn_scale_cached = 0.0
         rotary._force_yarn_seq_len = yarn_seq_len
+        if hasattr(rotary, "_yarn_seq_len_cached"):
+            rotary._yarn_seq_len_cached = rotary.train_seq_len
+        rotary.set_yarn_seq_len(yarn_seq_len)
         rotary.forward(cache_seq_len, device, dtype, yarn_seq_len=yarn_seq_len)
 
 
@@ -2461,6 +2489,10 @@ def _should_compile_eval_logits(h):
         and h.train_seq_len_end == h.train_seq_len
         and not h.sliding_window_enabled
     )
+
+
+def _should_compile_eval_model(h):
+    return _should_compile_eval_logits(h)
 
 
 def _parse_csv_ints(raw):
@@ -2670,7 +2702,11 @@ def train_model(h, device, val_data):
                     seq_len,
                     looping_active,
                     f"startup_seq_len_prime:seq_len{seq_len}:loop{int(looping_active)}",
-                    target_cu_len=256 if stage_idx == len(seq_len_schedule) - 1 else None,
+                    target_cu_len=(
+                        h.train_cu_bucket_size
+                        if stage_idx == len(seq_len_schedule) - 1
+                        else None
+                    ),
                 )
         h.train_seq_len = train_seq_len_start
         base_model.looping_active = False
@@ -3004,12 +3040,18 @@ def train_and_eval(h, device):
         base_model.load_state_dict(torch.load(h.eval_only_path, map_location=device))
         if h.num_loops > 0:
             base_model.looping_active = True
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+        compiled_model = (
+            torch.compile(base_model, dynamic=False, fullgraph=True)
+            if _should_compile_eval_model(h)
+            else base_model
+        )
         compiled_forward_logits = (
             torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
             if _should_compile_eval_logits(h)
             else base_model.forward_logits
         )
+        if compiled_model is base_model:
+            log("eval_model:using eager model for long-context eval")
         if compiled_forward_logits is base_model.forward_logits:
             log("eval_logits:using eager forward_logits for long-context eval")
     else:
@@ -3060,12 +3102,18 @@ def train_and_eval(h, device):
         torch.bfloat16,
         yarn_seq_len=h.eval_seq_len,
     )
-    compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    compiled_model = (
+        torch.compile(eval_model, dynamic=False, fullgraph=True)
+        if _should_compile_eval_model(h)
+        else eval_model
+    )
     compiled_forward_logits = (
         torch.compile(eval_model.forward_logits, dynamic=False, fullgraph=True)
         if _should_compile_eval_logits(h)
         else eval_model.forward_logits
     )
+    if compiled_model is eval_model:
+        log("eval_model:using eager model for long-context eval")
     if compiled_forward_logits is eval_model.forward_logits:
         log("eval_logits:using eager forward_logits for long-context eval")
     timed_eval(
