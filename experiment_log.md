@@ -486,3 +486,60 @@ Current read:
 - Loss perturbance from staged bumps is mild; no stage shows a severe optimization shock.
 - The main cost of staging is runtime (`+3ms` to `+5ms` per step after each bump), not model instability.
 - Conclusion from the `4096` study: we likely do not need finer-grained bumps than one intermediate step.
+
+## 2026-04-20 - 2048 -> 4096 -> 8192 Curriculum And 8192 TTT
+
+Training run:
+
+```bash
+RUN_ID=seq8192_two_stage_seed0 \
+SEED=0 GPTQ_RESERVE_SECONDS=13 \
+TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=8192 \
+TRAIN_SEQ_LEN_STAGES=2048,4096,8192 \
+SEQ_LEN_BUMP_FRACS=0.80,0.92 \
+EVAL_SEQ_LEN=8192 TTT_EVAL_SEQ_LEN=8192 \
+MIN_LR=0.05 CURRICULUM_MONITOR_STEPS=64 \
+ROPE_YARN=1 ROPE_TRAIN_SEQ_LEN=2048 \
+TTT_BATCH_SIZE=8 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+Observed training results:
+
+- reached `4684` steps inside the wallclock cap
+- bump `2048 -> 4096` at `step 3957`
+  - pre: `loss_avg 2.8873`, `step_ms_avg 69.7`
+  - post: `loss_avg 2.8432`, `step_ms_avg 68.4`
+- bump `4096 -> 8192` at `step 4415`
+  - pre: `loss_avg 2.8195`, `step_ms_avg 68.1`
+  - post: `loss_avg 2.8282`, `step_ms_avg 74.1`
+- end-of-training val at `8192`: `2.7574`
+- post-EMA pre-quantization val at `8192`: `2.75103623`
+- quantized eval at `8192` from eval-only isolation:
+  - `diagnostic quantized val_loss:2.78048974`
+  - `val_bpb:1.07636971`
+
+TTT at `8192`:
+
+- The post-training slowdown was isolated to the TTT path, not GPTQ itself.
+- `eval_only` at `8192` showed:
+  - pre-quantization eval finishes quickly
+  - quantized eval finishes quickly
+  - then `ttt_lora:compile warmup` takes about `139.7s`
+  - the long tail is the actual full TTT eval over the validation set
+
+Important full TTT result:
+
+```text
+quantized_ttt_lora val_loss:2.76844785 val_bpb:1.07174506 eval_time:1002022ms
+total_eval_time:1002.0s
+```
+
+Current read:
+
+- This finally beats the prior non-TTT quantized baseline at `8192` in loss terms.
+- The improvement is real, but the full TTT eval is too slow for the current total allowed eval-time budget.
+- Likely next direction:
+  - improve TTT throughput / reduce compile warmup cost
+  - revisit `TTT_BATCH_SIZE` and related settings
+  - keep TTT as a separate evaluation pass while iterating on speed
