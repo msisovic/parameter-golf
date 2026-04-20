@@ -25,6 +25,7 @@ class Hyperparameters:
     train_seq_len_stages = os.environ.get("TRAIN_SEQ_LEN_STAGES", "")
     seq_len_bump_frac = float(os.environ.get("SEQ_LEN_BUMP_FRAC", 0.5))
     seq_len_bump_fracs = os.environ.get("SEQ_LEN_BUMP_FRACS", "")
+    train_doc_len_curriculum = bool(int(os.environ.get("TRAIN_DOC_LEN_CURRICULUM", "0")))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     curriculum_monitor_steps = int(os.environ.get("CURRICULUM_MONITOR_STEPS", 64))
     train_cu_bucket_size = int(os.environ.get("TRAIN_CU_BUCKET_SIZE", 192))
@@ -295,6 +296,7 @@ class DocumentPackingLoader:
         self.rank = h.rank
         self.world_size = h.world_size
         self.device = device
+        self.doc_len_curriculum = h.train_doc_len_curriculum
         self.cu_bucket_size = (
             h.train_cu_bucket_size if cu_bucket_size is None else cu_bucket_size
         )
@@ -319,6 +321,12 @@ class DocumentPackingLoader:
         )
         if self.bos_idx.size == 0:
             self.bos_idx = np.array([0], dtype=np.int64)
+        self.doc_starts = self.bos_idx
+        self.doc_ends = np.concatenate(
+            [self.bos_idx[1:], np.array([self.shard_size], dtype=np.int64)]
+        )
+        self.doc_lens = self.doc_ends - self.doc_starts
+        self.doc_cursor = 0
         self.cursor = int(self.bos_idx[0])
 
     def _submit_next_shard(self):
@@ -342,7 +350,12 @@ class DocumentPackingLoader:
         hi = np.searchsorted(self.bos_idx, local_start + total_len, side="left")
         return (self.bos_idx[lo:hi] - local_start).tolist()
 
-    def _prepare_batch(self, num_tokens_local, max_seq_len):
+    def _doc_len_limit(self, max_seq_len):
+        if not self.doc_len_curriculum or max_seq_len >= self.h.train_seq_len_end:
+            return 0
+        return max_seq_len
+
+    def _prepare_contiguous_batch(self, num_tokens_local, max_seq_len):
         per_rank_span = num_tokens_local + 1
         global_span = per_rank_span * self.world_size
         while self.cursor + global_span > self.shard_size:
@@ -358,6 +371,58 @@ class DocumentPackingLoader:
         cu_seqlens = cu_seqlens.pin_memory()
         self.cursor += global_span
         return inputs, targets, cu_seqlens, max_seqlen
+
+    def _next_allowed_doc(self, doc_len_limit):
+        while True:
+            if self.doc_cursor >= len(self.doc_starts):
+                self._advance_shard()
+                continue
+            doc_start = int(self.doc_starts[self.doc_cursor])
+            doc_end = int(self.doc_ends[self.doc_cursor])
+            doc_len = doc_end - doc_start
+            self.doc_cursor += 1
+            self.cursor = doc_end
+            if doc_len_limit > 0 and doc_len > doc_len_limit:
+                continue
+            return self.tokens[doc_start:doc_end]
+
+    def _prepare_doc_curriculum_batch(self, num_tokens_local, max_seq_len):
+        per_rank_span = num_tokens_local + 1
+        global_span = per_rank_span * self.world_size
+        doc_len_limit = self._doc_len_limit(max_seq_len)
+        chunks = []
+        doc_starts = []
+        total = 0
+        while total < global_span:
+            doc = self._next_allowed_doc(doc_len_limit)
+            if doc.numel() <= 0:
+                continue
+            take = min(doc.numel(), global_span - total)
+            if take <= 1 and total > 0:
+                continue
+            doc_starts.append(total)
+            chunks.append(doc[:take])
+            total += take
+        packed = torch.cat(chunks, dim=0)
+        local_start = self.rank * per_rank_span
+        buf = packed[local_start : local_start + per_rank_span]
+        inputs = buf[:-1].to(dtype=torch.int64).pin_memory()
+        targets = buf[1:].to(dtype=torch.int64).pin_memory()
+        starts = [
+            start - local_start
+            for start in doc_starts
+            if local_start <= start < local_start + inputs.numel()
+        ]
+        cu_seqlens, max_seqlen = _build_cu_seqlens(
+            starts, inputs.numel(), inputs.device, max_seq_len, self.cu_bucket_size
+        )
+        cu_seqlens = cu_seqlens.pin_memory()
+        return inputs, targets, cu_seqlens, max_seqlen
+
+    def _prepare_batch(self, num_tokens_local, max_seq_len):
+        if self._doc_len_limit(max_seq_len) > 0:
+            return self._prepare_doc_curriculum_batch(num_tokens_local, max_seq_len)
+        return self._prepare_contiguous_batch(num_tokens_local, max_seq_len)
 
     def next_batch(self, global_tokens, grad_accum_steps):
         num_tokens_local = global_tokens // (self.world_size * grad_accum_steps)
