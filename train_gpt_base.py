@@ -21,8 +21,6 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
-    train_seq_len_end = int(os.environ.get("TRAIN_SEQ_LEN_END", "0")) or train_seq_len
-    seq_len_bump_frac = float(os.environ.get("SEQ_LEN_BUMP_FRAC", 0.5))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
@@ -1914,7 +1912,7 @@ def _loss_bpb(loss_sum, token_count, byte_count):
     return val_loss, val_bpb
 
 
-def eval_val(h, device, val_data, model, forward_logits_fn=None, fixed_max_seqlen=None):
+def eval_val(h, device, val_data, model, forward_logits_fn=None):
     seq_len = h.eval_seq_len
     local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
     if local_batch_tokens < seq_len:
@@ -1955,10 +1953,9 @@ def eval_val(h, device, val_data, model, forward_logits_fn=None, fixed_max_seqle
             cu_seqlens, max_seqlen = _build_cu_seqlens(
                 bos_pos, x.numel(), x.device, h.eval_seq_len, 64
             )
-            eval_max_seqlen = max_seqlen if fixed_max_seqlen is None else fixed_max_seqlen
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = run_forward_logits(
-                    x[None], cu_seqlens=cu_seqlens, max_seqlen=eval_max_seqlen
+                    x[None], cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
                 ).detach()
             per_token_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
@@ -2400,35 +2397,13 @@ def timed_eval(label, fn, *args, **kwargs):
     return val_loss, val_bpb
 
 
-def _reset_rotary_caches(model):
-    for block in model.blocks:
-        rotary = block.attn.rotary
-        rotary._cos_cached = None
-        rotary._sin_cached = None
-        rotary._seq_len_cached = 0
-
-
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    def _forward_logits_short(input_ids, cu_seqlens=None, max_seqlen=0):
-        return base_model.forward_logits(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.train_seq_len
-        )
-
-    def _forward_logits_long(input_ids, cu_seqlens=None, max_seqlen=0):
-        return base_model.forward_logits(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len
-        )
-
-    compiled_forward_logits_short = torch.compile(
-        _forward_logits_short, dynamic=False, fullgraph=True
+    compiled_forward_logits = torch.compile(
+        base_model.forward_logits, dynamic=False, fullgraph=True
     )
-    compiled_forward_logits_long = torch.compile(
-        _forward_logits_long, dynamic=False, fullgraph=True
-    )
-    compiled_forward_logits = compiled_forward_logits_short
     model = compiled_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
     optimizers = Optimizers(h, base_model)
@@ -2548,33 +2523,6 @@ def train_model(h, device, val_data):
             opt.load_state_dict(state)
         optimizers.zero_grad_all()
         train_loader = DocumentPackingLoader(h, device)
-
-    def _warm_eval_logits(forward_logits_fn, fixed_max_seqlen):
-        local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
-        local_batch_seqs = max(local_batch_tokens // h.eval_seq_len, 1)
-        raw_end = local_batch_seqs * h.eval_seq_len + 1
-        local = val_data.val_tokens[:raw_end].to(
-            device=device, dtype=torch.int64, non_blocking=True
-        )
-        x = local[:-1]
-        bos_pos = (x == BOS_ID).nonzero(as_tuple=True)[0].tolist()
-        for bucket_len in (64, 128, 192, 256):
-            cu_seqlens, _ = _build_cu_seqlens(
-                bos_pos, x.numel(), x.device, h.eval_seq_len, 64
-            )
-            if cu_seqlens.numel() > bucket_len:
-                continue
-            cu = torch.full((bucket_len,), x.numel(), dtype=torch.int32, device=device)
-            cu[: cu_seqlens.numel()] = cu_seqlens
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                forward_logits_fn(
-                    x[None], cu_seqlens=cu, max_seqlen=fixed_max_seqlen
-                ).detach()
-        torch.cuda.synchronize()
-
-    _warm_eval_logits(compiled_forward_logits_short, h.train_seq_len)
-    if h.eval_seq_len != h.train_seq_len:
-        _warm_eval_logits(compiled_forward_logits_long, h.eval_seq_len)
     ema_state = {
         name: t.detach().float().clone()
         for (name, t) in base_model.state_dict().items()
@@ -2582,7 +2530,6 @@ def train_model(h, device, val_data):
     ema_decay = h.ema_decay
     training_time_ms = 0.0
     stop_after_step = None
-    bumped = h.train_seq_len_end == h.train_seq_len
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -2598,17 +2545,8 @@ def train_model(h, device, val_data):
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1e3 * (time.perf_counter() - t0)
-            active_eval_forward = (
-                compiled_forward_logits_long if bumped else compiled_forward_logits_short
-            )
-            active_eval_max_seqlen = h.eval_seq_len if bumped else h.train_seq_len
             val_loss, val_bpb = eval_val(
-                h,
-                device,
-                val_data,
-                model,
-                active_eval_forward,
-                fixed_max_seqlen=active_eval_max_seqlen,
+                h, device, val_data, model, compiled_forward_logits
             )
             log(
                 f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}"
@@ -2632,16 +2570,6 @@ def train_model(h, device, val_data):
             base_model.looping_active = True
             log(
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
-            )
-        if not bumped and frac >= h.seq_len_bump_frac:
-            bumped = True
-            old_seq_len = h.train_seq_len
-            h.train_seq_len = h.train_seq_len_end
-            train_loader.max_seq_len = h.train_seq_len
-            _reset_rotary_caches(base_model)
-            log(
-                f"seq_len_curriculum:bump step:{step} frac:{frac:.3f} "
-                f"seq_len:{old_seq_len}->{h.train_seq_len}"
             )
         train_loss = step_fn(step, scale)
         with torch.no_grad():
@@ -2677,7 +2605,7 @@ def train_model(h, device, val_data):
         name: t.to(dtype=current_state[name].dtype) for (name, t) in ema_state.items()
     }
     base_model.load_state_dict(avg_state, strict=True)
-    return base_model, compiled_model, compiled_forward_logits_long
+    return base_model, compiled_model, compiled_forward_logits
 
 
 def train_and_eval(h, device):
@@ -2696,13 +2624,8 @@ def train_and_eval(h, device):
         if h.num_loops > 0:
             base_model.looping_active = True
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-        def _forward_logits_eval(input_ids, cu_seqlens=None, max_seqlen=0):
-            return base_model.forward_logits(
-                input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len
-            )
-
         compiled_forward_logits = torch.compile(
-            _forward_logits_eval, dynamic=False, fullgraph=True
+            base_model.forward_logits, dynamic=False, fullgraph=True
         )
     else:
         log(
@@ -2736,13 +2659,8 @@ def train_and_eval(h, device):
     if h.num_loops > 0:
         eval_model.looping_active = True
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
-    def _forward_logits_eval_quant(input_ids, cu_seqlens=None, max_seqlen=0):
-        return eval_model.forward_logits(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len
-        )
-
     compiled_forward_logits = torch.compile(
-        _forward_logits_eval_quant, dynamic=False, fullgraph=True
+        eval_model.forward_logits, dynamic=False, fullgraph=True
     )
     timed_eval(
         "diagnostic quantized",
