@@ -2549,6 +2549,72 @@ def train_model(h, device, val_data):
         optimizers.zero_grad_all()
         train_loader = DocumentPackingLoader(h, device)
 
+        if h.train_seq_len_end != h.train_seq_len:
+            bump_model_state = {
+                name: tensor.detach().cpu().clone()
+                for (name, tensor) in base_model.state_dict().items()
+            }
+            bump_optimizer_states = [
+                copy.deepcopy(opt.state_dict()) for opt in optimizers
+            ]
+            old_seq_len = h.train_seq_len
+            old_looping = base_model.looping_active
+            h.train_seq_len = h.train_seq_len_end
+            train_loader.max_seq_len = h.train_seq_len
+            _reset_rotary_caches(base_model)
+            x, y, cu_seqlens, _ = train_loader.next_batch(
+                h.train_batch_tokens, h.grad_accum_steps
+            )
+            log(
+                f"bump_prewarm:seq_len:{old_seq_len}->{h.train_seq_len} "
+                f"looping:{int(h.num_loops > 0 and h.enable_looping_at <= h.seq_len_bump_frac)}"
+            )
+
+            def _run_bump_cu_bucket_warmup():
+                for bucket_len in warmup_cu_buckets:
+                    boundaries = list(range(0, x.size(1), max(h.train_seq_len, 1)))
+                    if boundaries[-1] != x.size(1):
+                        boundaries.append(x.size(1))
+                    cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
+                    cu[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
+                    for _ in range(warmup_cu_iters):
+                        optimizers.zero_grad_all()
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                            wloss = model(x, y, cu_seqlens=cu, max_seqlen=h.train_seq_len)
+                        (wloss / h.grad_accum_steps).backward()
+                optimizers.zero_grad_all()
+
+            _run_bump_cu_bucket_warmup()
+            if h.num_loops > 0 and h.enable_looping_at <= h.seq_len_bump_frac:
+                base_model.looping_active = True
+                _run_bump_cu_bucket_warmup()
+                for warmup_step in range(h.warmup_steps):
+                    step_fn(warmup_step, 1.0)
+                    if (
+                        warmup_step <= 5
+                        or (warmup_step + 1) % 10 == 0
+                        or warmup_step + 1 == h.warmup_steps
+                    ):
+                        log(f"bump_loop_warmup_step: {warmup_step+1}/{h.warmup_steps}")
+            else:
+                for warmup_step in range(h.warmup_steps):
+                    step_fn(warmup_step, 1.0)
+                    if (
+                        warmup_step <= 5
+                        or (warmup_step + 1) % 10 == 0
+                        or warmup_step + 1 == h.warmup_steps
+                    ):
+                        log(f"bump_warmup_step: {warmup_step+1}/{h.warmup_steps}")
+
+            base_model.load_state_dict(bump_model_state, strict=True)
+            for (opt, state) in zip(optimizers, bump_optimizer_states, strict=True):
+                opt.load_state_dict(state)
+            optimizers.zero_grad_all()
+            h.train_seq_len = old_seq_len
+            base_model.looping_active = old_looping
+            train_loader = DocumentPackingLoader(h, device)
+            _reset_rotary_caches(base_model)
+
     def _warm_eval_logits(forward_logits_fn, fixed_max_seqlen):
         local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
         local_batch_seqs = max(local_batch_tokens // h.eval_seq_len, 1)
@@ -2893,7 +2959,7 @@ def main():
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
     torch._dynamo.config.optimize_ddp = False
-    torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.cache_size_limit = 512
     h = Hyperparameters()
     set_logging_hparams(h)
     if h.is_main_process:
