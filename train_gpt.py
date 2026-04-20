@@ -305,10 +305,21 @@ class DocumentPackingLoader:
             raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
         self.files = all_files
         self.file_iter = iter(self.files)
-        self._init_shard(load_data_shard(next(self.file_iter)))
+        self.stage_thresholds = self._stage_thresholds()
+        self.deferred_spans = {stage: collections.deque() for stage in self.stage_thresholds}
+        self.current_file = next(self.file_iter)
+        self._init_shard(load_data_shard(self.current_file))
         self._next_shard = self._submit_next_shard()
         self._batch_pool = ThreadPoolExecutor(1)
         self._next_batch = None
+
+    def _stage_thresholds(self):
+        stages = _parse_csv_ints(self.h.train_seq_len_stages)
+        if not stages:
+            stages = [self.h.train_seq_len]
+            if self.h.train_seq_len_end != self.h.train_seq_len:
+                stages.append(self.h.train_seq_len_end)
+        return sorted(set(stages))
 
     def _init_shard(self, tokens):
         global BOS_ID
@@ -326,22 +337,32 @@ class DocumentPackingLoader:
             [self.bos_idx[1:], np.array([self.shard_size], dtype=np.int64)]
         )
         self.doc_lens = self.doc_ends - self.doc_starts
-        self.doc_cursor = 0
+        self.spans = None
+        self.span_idx = 0
+        self.span_cursor = 0
+        self._prepared_seq_len = None
+        self._prepared_cursor = None
         self.cursor = int(self.bos_idx[0])
 
     def _submit_next_shard(self):
         try:
             path = next(self.file_iter)
+            self._next_file = path
             return self._shard_pool.submit(load_data_shard, path)
         except StopIteration:
+            self._next_file = None
             return None
 
     def _advance_shard(self):
         if self._next_shard is None:
             self.file_iter = iter(self.files)
+            self.current_file = next(self.file_iter)
+            self._next_file = self.current_file
             self._next_shard = self._shard_pool.submit(
-                load_data_shard, next(self.file_iter)
+                load_data_shard, self.current_file
             )
+        else:
+            self.current_file = self._next_file
         self._init_shard(self._next_shard.result())
         self._next_shard = self._submit_next_shard()
 
@@ -350,10 +371,87 @@ class DocumentPackingLoader:
         hi = np.searchsorted(self.bos_idx, local_start + total_len, side="left")
         return (self.bos_idx[lo:hi] - local_start).tolist()
 
+    def _defer_target_stage(self, doc_len):
+        if doc_len <= self.h.train_seq_len_end:
+            idx = np.searchsorted(np.asarray(self.stage_thresholds, dtype=np.int64), doc_len, side="left")
+            if idx < len(self.stage_thresholds):
+                return int(self.stage_thresholds[idx])
+        return None
+
+    def _coalesce_spans(self, starts, ends):
+        if len(starts) == 0:
+            return []
+        spans = []
+        span_start = int(starts[0])
+        span_end = int(ends[0])
+        for start, end in zip(starts[1:], ends[1:], strict=False):
+            start_i = int(start)
+            end_i = int(end)
+            if start_i == span_end:
+                span_end = end_i
+            else:
+                spans.append((span_start, span_end))
+                span_start, span_end = start_i, end_i
+        spans.append((span_start, span_end))
+        return spans
+
+    def _prepare_stage_spans_for_current_shard(self, seq_len):
+        start_cursor = self.cursor
+        if self._prepared_seq_len == seq_len and self._prepared_cursor == start_cursor:
+            return
+        self._prepared_seq_len = seq_len
+        self._prepared_cursor = start_cursor
+        if not self.doc_len_curriculum or seq_len >= self.h.train_seq_len_end:
+            self.spans = [(start_cursor, self.shard_size)]
+            self.span_idx = 0
+            self.span_cursor = start_cursor
+            return
+        remaining_mask = self.doc_ends > start_cursor
+        if not np.any(remaining_mask):
+            self.spans = []
+            self.span_idx = 0
+            self.span_cursor = self.shard_size
+            return
+        remaining_starts = np.maximum(self.doc_starts[remaining_mask], start_cursor)
+        remaining_ends = self.doc_ends[remaining_mask]
+        remaining_lens = self.doc_lens[remaining_mask]
+        eligible_mask = remaining_lens <= seq_len
+        self.spans = self._coalesce_spans(
+            remaining_starts[eligible_mask], remaining_ends[eligible_mask]
+        )
+        self.span_idx = 0
+        self.span_cursor = self.spans[0][0] if self.spans else self.shard_size
+        deferred_mask = ~eligible_mask
+        if not np.any(deferred_mask):
+            return
+        deferred_starts = remaining_starts[deferred_mask]
+        deferred_ends = remaining_ends[deferred_mask]
+        deferred_lens = remaining_lens[deferred_mask]
+        stage_to_spans = {stage: [] for stage in self.stage_thresholds}
+        for start, end, doc_len in zip(deferred_starts, deferred_ends, deferred_lens, strict=False):
+            target_stage = self._defer_target_stage(int(doc_len))
+            if target_stage is None or target_stage <= seq_len:
+                continue
+            stage_to_spans[target_stage].append((str(self.current_file), int(start), int(end)))
+        for stage, spans in stage_to_spans.items():
+            if not spans:
+                continue
+            queue = self.deferred_spans[stage]
+            for ref in spans:
+                if queue and queue[-1][0] == ref[0] and queue[-1][2] == ref[1]:
+                    last = queue.pop()
+                    queue.append((last[0], last[1], ref[2]))
+                else:
+                    queue.append(ref)
+
     def _doc_len_limit(self, max_seq_len):
-        if not self.doc_len_curriculum or max_seq_len >= self.h.train_seq_len_end:
+        if not self.doc_len_curriculum:
             return 0
-        return max_seq_len
+        if max_seq_len < self.h.train_seq_len_end:
+            return max_seq_len
+        if self.deferred_spans.get(max_seq_len):
+            return max_seq_len
+        return 0
 
     def _prepare_contiguous_batch(self, num_tokens_local, max_seq_len):
         per_rank_span = num_tokens_local + 1
@@ -372,36 +470,90 @@ class DocumentPackingLoader:
         self.cursor += global_span
         return inputs, targets, cu_seqlens, max_seqlen
 
-    def _next_allowed_doc(self, doc_len_limit):
-        while True:
-            if self.doc_cursor >= len(self.doc_starts):
-                self._advance_shard()
-                continue
-            doc_start = int(self.doc_starts[self.doc_cursor])
-            doc_end = int(self.doc_ends[self.doc_cursor])
-            doc_len = doc_end - doc_start
-            self.doc_cursor += 1
-            self.cursor = doc_end
-            if doc_len_limit > 0 and doc_len > doc_len_limit:
-                continue
-            return self.tokens[doc_start:doc_end]
+    def _read_ref_chunk(self, file_path, start, end):
+        if str(self.current_file) == file_path:
+            return self.tokens[start:end]
+        mm = _get_shard_memmap(Path(file_path))
+        return torch.from_numpy(np.array(mm[start:end], dtype=np.uint16, copy=False))
 
-    def _prepare_doc_curriculum_batch(self, num_tokens_local, max_seq_len):
+    def _doc_starts_in_chunk(self, chunk_start, chunk_len, packed_offset):
+        starts = [packed_offset]
+        lo = np.searchsorted(self.bos_idx, chunk_start + 1, side="left")
+        hi = np.searchsorted(self.bos_idx, chunk_start + chunk_len, side="left")
+        starts.extend((self.bos_idx[lo:hi] - chunk_start + packed_offset).tolist())
+        return starts
+
+    def _queue_doc_starts_in_chunk(self, file_path, chunk_start, chunk_len, packed_offset):
+        mm = _get_shard_memmap(Path(file_path))
+        local = np.flatnonzero(mm[chunk_start + 1 : chunk_start + chunk_len] == BOS_ID)
+        starts = [packed_offset]
+        starts.extend((local + 1 + packed_offset).tolist())
+        return starts
+
+    def _queue_for_seq_len(self, seq_len):
+        if not self.doc_len_curriculum:
+            return None
+        return self.deferred_spans.get(seq_len)
+
+    def _next_queue_chunk(self, seq_len, remaining):
+        queue = self._queue_for_seq_len(seq_len)
+        if not queue:
+            return None
+        while queue:
+            file_path, start, end = queue[0]
+            if start >= end:
+                queue.popleft()
+                continue
+            take = min(remaining, end - start)
+            queue[0] = (file_path, start + take, end)
+            if queue[0][1] >= queue[0][2]:
+                queue.popleft()
+            return file_path, start, take
+        return None
+
+    def _next_span_chunk(self, remaining):
+        while True:
+            if self.spans is None:
+                self._prepare_stage_spans_for_current_shard(self.h.train_seq_len)
+            if self.span_idx >= len(self.spans):
+                self._advance_shard()
+                self._prepare_stage_spans_for_current_shard(self.h.train_seq_len)
+                continue
+            span_start, span_end = self.spans[self.span_idx]
+            if self.span_cursor < span_start:
+                self.span_cursor = span_start
+            if self.span_cursor >= span_end:
+                self.span_idx += 1
+                continue
+            take = min(remaining, span_end - self.span_cursor)
+            chunk_start = self.span_cursor
+            self.span_cursor += take
+            self.cursor = self.span_cursor
+            return chunk_start, take
+
+    def _prepare_deferred_queue_batch(self, num_tokens_local, max_seq_len):
         per_rank_span = num_tokens_local + 1
         global_span = per_rank_span * self.world_size
-        doc_len_limit = self._doc_len_limit(max_seq_len)
         chunks = []
-        doc_starts = []
+        global_doc_starts = []
         total = 0
         while total < global_span:
-            doc = self._next_allowed_doc(doc_len_limit)
-            if doc.numel() <= 0:
+            queued = self._next_queue_chunk(max_seq_len, global_span - total)
+            if queued is not None:
+                file_path, chunk_start, take = queued
+                chunks.append(self._read_ref_chunk(file_path, chunk_start, chunk_start + take))
+                global_doc_starts.extend(
+                    self._queue_doc_starts_in_chunk(file_path, chunk_start, take, total)
+                )
+                total += take
                 continue
-            take = min(doc.numel(), global_span - total)
-            if take <= 1 and total > 0:
+            chunk_start, take = self._next_span_chunk(global_span - total)
+            if take <= 0:
                 continue
-            doc_starts.append(total)
-            chunks.append(doc[:take])
+            chunks.append(self.tokens[chunk_start : chunk_start + take])
+            global_doc_starts.extend(
+                self._doc_starts_in_chunk(chunk_start, take, total)
+            )
             total += take
         packed = torch.cat(chunks, dim=0)
         local_start = self.rank * per_rank_span
@@ -410,7 +562,7 @@ class DocumentPackingLoader:
         targets = buf[1:].to(dtype=torch.int64).pin_memory()
         starts = [
             start - local_start
-            for start in doc_starts
+            for start in global_doc_starts
             if local_start <= start < local_start + inputs.numel()
         ]
         cu_seqlens, max_seqlen = _build_cu_seqlens(
@@ -421,7 +573,7 @@ class DocumentPackingLoader:
 
     def _prepare_batch(self, num_tokens_local, max_seq_len):
         if self._doc_len_limit(max_seq_len) > 0:
-            return self._prepare_doc_curriculum_batch(num_tokens_local, max_seq_len)
+            return self._prepare_deferred_queue_batch(num_tokens_local, max_seq_len)
         return self._prepare_contiguous_batch(num_tokens_local, max_seq_len)
 
     def next_batch(self, global_tokens, grad_accum_steps):
