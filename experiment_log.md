@@ -389,3 +389,100 @@ Current read:
 
 - The post-GPTQ hang was in the full-rank serialize path, not in quantized evaluation itself.
 - The rank-0-only serialize fix removes that stall and slightly simplifies post-training evaluation.
+
+## 2026-04-20 - Seq-Len Curriculum Perturbance Instrumentation And Staged Follow-Up
+
+Changes made:
+
+- Added step-level transition logging for curriculum events:
+  - `transition_monitor:` JSON lines now record every monitored pre/post step with `loss`, `step_ms`, `seq_len`, `looping`, `frac`, and deltas vs the pre-window average.
+- Added staged seq-len support:
+  - `TRAIN_SEQ_LEN_STAGES`
+  - `SEQ_LEN_BUMP_FRACS`
+- Added [analysis/plot_transition_monitor.py](analysis/plot_transition_monitor.py) to turn `transition_monitor:` log lines into CSV + SVG plots.
+
+Initial direct-jump perturbance baseline:
+
+```bash
+SEED=0 GPTQ_RESERVE_SECONDS=13 \
+TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=4096 SEQ_LEN_BUMP_FRAC=0.7 \
+EVAL_SEQ_LEN=4096 TTT_EVAL_SEQ_LEN=4096 \
+MIN_LR=0.05 CURRICULUM_MONITOR_STEPS=64 \
+ROPE_YARN=1 ROPE_TRAIN_SEQ_LEN=2048 \
+TTT_BATCH_SIZE=16 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+Observed direct-jump monitor:
+
+- bump at `step 3591`, `frac 0.700`, `2048 -> 4096`
+- pre: `loss_avg 2.9324`, `step_ms_avg 70.1`
+- post: `loss_avg 2.9169`, `step_ms_avg 67.9`
+- end step: `4764`
+- post-EMA `4096` diagnostic: `2.75405689`
+
+Staged curriculum experiments:
+
+- First staged attempt with evenly spaced post-`0.7` bumps produced overlapping transitions and poor observability.
+- Added startup regime priming for all staged seq-lens.
+- Removed live bump-time priming to match the `modded-nanogpt` pattern more closely: compile/warmup up front, cheap runtime bump path.
+
+Compile/recompile debugging:
+
+- Enabled `TORCH_LOGS=recompiles` and found the main live recompile sources were:
+  - variable `cu_seqlens` tensor length (`128` vs `192`)
+  - switching `looping_active` through the same compiled train graph
+- Fixes:
+  - added `TRAIN_CU_BUCKET_SIZE` and set the train path to use a fixed padded `cu_seqlens` length (`256`)
+  - compiled separate train entry points for loop-off and loop-on
+- After the fix, the bad live train recompiles disappeared.
+- Remaining compile log noise was:
+  - expected untimed startup specialization across different `max_seqlen`
+  - optimizer-side recompiles in `zeropower_via_newtonschulz5(...)`
+
+Final clean staged perturbance run:
+
+```bash
+RUN_ID=seq4096_gradual_seed0_recomp2 \
+TTT_ENABLED=0 SKIP_GPTQ=1 TORCH_LOGS=recompiles \
+SEED=0 GPTQ_RESERVE_SECONDS=13 \
+TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=4096 \
+TRAIN_SEQ_LEN_STAGES=2048,2560,3072,3584,4096 \
+SEQ_LEN_BUMP_FRACS=0.75,0.82,0.89,0.95 \
+EVAL_SEQ_LEN=4096 TTT_EVAL_SEQ_LEN=4096 \
+MIN_LR=0.05 CURRICULUM_MONITOR_STEPS=64 \
+ROPE_YARN=1 ROPE_TRAIN_SEQ_LEN=2048 \
+TTT_BATCH_SIZE=16 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+Key outcomes:
+
+- reached `4733` steps inside the wallclock cap (`587124ms`)
+- in-run val at `4733`: `2.7597`
+- post-EMA diagnostic at `4096`: `2.75427937`
+- all four staged bumps had clean 64-step isolated post windows
+
+Per-bump perturbance summary:
+
+- `2048 -> 2560` at `3751`
+  - loss: `2.9203 -> 2.8842` (`-0.0361`)
+  - step_ms: `65.60 -> 70.25` (`+4.65`)
+- `2560 -> 3072` at `4034`
+  - loss: `2.8528 -> 2.8596` (`+0.0069`)
+  - step_ms: `66.53 -> 71.62` (`+5.09`)
+- `3072 -> 3584` at `4311`
+  - loss: `2.8138 -> 2.8229` (`+0.0091`)
+  - step_ms: `67.39 -> 70.42` (`+3.03`)
+- `3584 -> 4096` at `4543`
+  - loss: `2.8035 -> 2.7814` (`-0.0221`)
+  - step_ms: `67.47 -> 72.75` (`+5.29`)
+
+Current read:
+
+- The staged run is effectively on par with the direct `2048 -> 4096` jump in end quality:
+  - direct-jump post-EMA: `2.75405689`
+  - staged post-EMA: `2.75427937`
+- Loss perturbance from staged bumps is mild; no stage shows a severe optimization shock.
+- The main cost of staging is runtime (`+3ms` to `+5ms` per step after each bump), not model instability.
+- Conclusion from the `4096` study: we likely do not need finer-grained bumps than one intermediate step.

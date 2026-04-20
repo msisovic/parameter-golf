@@ -22,9 +22,12 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     train_seq_len_end = int(os.environ.get("TRAIN_SEQ_LEN_END", "0")) or train_seq_len
+    train_seq_len_stages = os.environ.get("TRAIN_SEQ_LEN_STAGES", "")
     seq_len_bump_frac = float(os.environ.get("SEQ_LEN_BUMP_FRAC", 0.5))
+    seq_len_bump_fracs = os.environ.get("SEQ_LEN_BUMP_FRACS", "")
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     curriculum_monitor_steps = int(os.environ.get("CURRICULUM_MONITOR_STEPS", 64))
+    train_cu_bucket_size = int(os.environ.get("TRAIN_CU_BUCKET_SIZE", 256))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
@@ -287,12 +290,14 @@ def _build_cu_seqlens(bos_pos, total_len, device, max_doc_len=0, bucket_size=64)
 class DocumentPackingLoader:
     _shard_pool = ThreadPoolExecutor(1)
 
-    def __init__(self, h, device, cu_bucket_size=64):
+    def __init__(self, h, device, cu_bucket_size=None):
         self.h = h
         self.rank = h.rank
         self.world_size = h.world_size
         self.device = device
-        self.cu_bucket_size = cu_bucket_size
+        self.cu_bucket_size = (
+            h.train_cu_bucket_size if cu_bucket_size is None else cu_bucket_size
+        )
         all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
         if not all_files:
             raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
@@ -2458,32 +2463,82 @@ def _should_compile_eval_logits(h):
     )
 
 
+def _parse_csv_ints(raw):
+    if not raw:
+        return []
+    return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+def _parse_csv_floats(raw):
+    if not raw:
+        return []
+    return [float(part.strip()) for part in raw.split(",") if part.strip()]
+
+
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
     train_seq_len_start = h.train_seq_len
-    train_seq_len_end = h.train_seq_len_end
+    seq_len_schedule = _parse_csv_ints(h.train_seq_len_stages)
+    if not seq_len_schedule:
+        seq_len_schedule = [train_seq_len_start]
+        if h.train_seq_len_end != train_seq_len_start:
+            seq_len_schedule.append(h.train_seq_len_end)
+    if seq_len_schedule[0] != train_seq_len_start:
+        seq_len_schedule = [train_seq_len_start] + seq_len_schedule
+    deduped_seq_len_schedule = []
+    for seq_len in seq_len_schedule:
+        if not deduped_seq_len_schedule or deduped_seq_len_schedule[-1] != seq_len:
+            deduped_seq_len_schedule.append(seq_len)
+    seq_len_schedule = deduped_seq_len_schedule
+    train_seq_len_end = seq_len_schedule[-1]
+    h.train_seq_len_end = train_seq_len_end
+    seq_len_bump_thresholds = []
+    if len(seq_len_schedule) > 1:
+        seq_len_bump_thresholds = _parse_csv_floats(h.seq_len_bump_fracs)
+        if seq_len_bump_thresholds:
+            expected_thresholds = len(seq_len_schedule) - 1
+            if len(seq_len_bump_thresholds) != expected_thresholds:
+                raise ValueError(
+                    "SEQ_LEN_BUMP_FRACS must provide exactly one fraction per seq-len bump; "
+                    f"got {len(seq_len_bump_thresholds)} for {expected_thresholds} bumps"
+                )
+        else:
+            num_bumps = len(seq_len_schedule) - 1
+            seq_len_bump_thresholds = [
+                h.seq_len_bump_frac + (1.0 - h.seq_len_bump_frac) * (i / num_bumps)
+                for i in range(num_bumps)
+            ]
+        if any(
+            later <= earlier
+            for (earlier, later) in zip(
+                seq_len_bump_thresholds, seq_len_bump_thresholds[1:], strict=False
+            )
+        ):
+            raise ValueError(
+                f"SEQ_LEN_BUMP_FRACS must be strictly increasing, got {seq_len_bump_thresholds}"
+            )
+    final_seq_len_bump_frac = (
+        seq_len_bump_thresholds[-1] if seq_len_bump_thresholds else h.seq_len_bump_frac
+    )
     if train_seq_len_end != train_seq_len_start:
         log(
-            f"seq_len_curriculum:enabled start:{train_seq_len_start} "
-            f"end:{train_seq_len_end} bump_frac:{h.seq_len_bump_frac:.3f}"
+            f"seq_len_curriculum:enabled stages:{seq_len_schedule} "
+            f"bump_fracs:{[round(frac, 4) for frac in seq_len_bump_thresholds]}"
         )
     def _train_forward_base(x, y, cu_seqlens, max_seqlen):
         return base_model(x, y, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
-    def _train_forward_bump_loop(x, y, cu_seqlens, max_seqlen):
+    def _train_forward_loop(x, y, cu_seqlens, max_seqlen):
         return base_model(x, y, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
     compiled_train_forward = torch.compile(
         _train_forward_base, dynamic=False, fullgraph=True
     )
-    compiled_train_forward_bump_loop = None
-    has_bump_loop_regime = (
-        train_seq_len_end != train_seq_len_start and h.num_loops > 0
-    )
-    if has_bump_loop_regime:
-        compiled_train_forward_bump_loop = torch.compile(
-            _train_forward_bump_loop, dynamic=False, fullgraph=True
+    compiled_train_forward_loop = None
+    if h.num_loops > 0:
+        compiled_train_forward_loop = torch.compile(
+            _train_forward_loop, dynamic=False, fullgraph=True
         )
     compiled_forward_logits = (
         torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
@@ -2495,6 +2550,7 @@ def train_model(h, device, val_data):
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
     optimizers = Optimizers(h, base_model)
     train_loader = DocumentPackingLoader(h, device)
+    train_cache_seq_len = h.train_batch_tokens // h.world_size
     max_wallclock_ms = (
         1e3 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
     )
@@ -2518,12 +2574,8 @@ def train_model(h, device, val_data):
 
     def step_fn(step, lr_scale):
         active_model = (
-            compiled_train_forward_bump_loop
-            if (
-                compiled_train_forward_bump_loop is not None
-                and base_model.looping_active
-                and h.train_seq_len == train_seq_len_end
-            )
+            compiled_train_forward_loop
+            if compiled_train_forward_loop is not None and base_model.looping_active
             else compiled_train_forward
         )
         optimizers.zero_grad_all()
@@ -2559,12 +2611,8 @@ def train_model(h, device, val_data):
 
     def _prime_live_train_regime(label, max_shape_samples=24, target_cu_len=None):
         active_model = (
-            compiled_train_forward_bump_loop
-            if (
-                compiled_train_forward_bump_loop is not None
-                and base_model.looping_active
-                and h.train_seq_len == train_seq_len_end
-            )
+            compiled_train_forward_loop
+            if compiled_train_forward_loop is not None and base_model.looping_active
             else compiled_train_forward
         )
         seen_cu_lens = set()
@@ -2591,6 +2639,51 @@ def train_model(h, device, val_data):
         optimizers.zero_grad_all()
         log(f"{label}:real_cu_lens {sampled_cu_lens}")
 
+    def _prime_startup_train_regime(seq_len, looping_active, label, target_cu_len=None):
+        nonlocal train_loader
+        h.train_seq_len = seq_len
+        base_model.looping_active = looping_active
+        _set_rotary_state(
+            base_model,
+            train_cache_seq_len,
+            device,
+            torch.bfloat16,
+            yarn_seq_len=seq_len,
+        )
+        train_loader = DocumentPackingLoader(h, device)
+        _prime_live_train_regime(
+            label,
+            target_cu_len=target_cu_len,
+        )
+
+    if len(seq_len_schedule) > 1:
+        primed_regimes = set()
+        for stage_idx, seq_len in enumerate(seq_len_schedule):
+            for looping_active in (False, True):
+                if looping_active and h.num_loops <= 0:
+                    continue
+                regime_key = (seq_len, looping_active)
+                if regime_key in primed_regimes:
+                    continue
+                primed_regimes.add(regime_key)
+                _prime_startup_train_regime(
+                    seq_len,
+                    looping_active,
+                    f"startup_seq_len_prime:seq_len{seq_len}:loop{int(looping_active)}",
+                    target_cu_len=256 if stage_idx == len(seq_len_schedule) - 1 else None,
+                )
+        h.train_seq_len = train_seq_len_start
+        base_model.looping_active = False
+        _set_rotary_state(
+            base_model,
+            train_cache_seq_len,
+            device,
+            torch.bfloat16,
+            yarn_seq_len=train_seq_len_start,
+        )
+        train_loader = DocumentPackingLoader(h, device)
+        log("seq_len_curriculum:startup_priming_complete")
+
     if h.warmup_steps > 0:
         initial_model_state = {
             name: tensor.detach().cpu().clone()
@@ -2600,19 +2693,14 @@ def train_model(h, device, val_data):
             copy.deepcopy(opt.state_dict()) for opt in optimizers
         ]
         base_model.train()
-        train_cache_seq_len = h.train_batch_tokens // h.world_size
-        train_warmup_cu_buckets = (64, 128, 192, 256)
+        train_warmup_cu_buckets = (h.train_cu_bucket_size,)
         def _run_train_state_warmup(seq_len, looping_active, label):
             nonlocal train_loader
             h.train_seq_len = seq_len
             base_model.looping_active = looping_active
             warmup_model = (
-                compiled_train_forward_bump_loop
-                if (
-                    compiled_train_forward_bump_loop is not None
-                    and looping_active
-                    and seq_len == train_seq_len_end
-                )
+                compiled_train_forward_loop
+                if compiled_train_forward_loop is not None and looping_active
                 else compiled_train_forward
             )
             _set_rotary_state(
@@ -2657,7 +2745,7 @@ def train_model(h, device, val_data):
         if train_seq_len_end != train_seq_len_start:
             if h.num_loops <= 0:
                 _run_train_state_warmup(train_seq_len_end, False, "bump_warmup_step")
-            elif h.enable_looping_at > h.seq_len_bump_frac:
+            elif h.enable_looping_at > final_seq_len_bump_frac:
                 _run_train_state_warmup(train_seq_len_end, False, "bump_warmup_step")
                 _run_train_state_warmup(train_seq_len_end, True, "bump_loop_warmup_step")
             else:
@@ -2682,13 +2770,14 @@ def train_model(h, device, val_data):
         for (name, t) in base_model.state_dict().items()
     }
     ema_decay = h.ema_decay
-    recent_train_losses = collections.deque(maxlen=max(h.curriculum_monitor_steps, 1))
-    recent_step_ms = collections.deque(maxlen=max(h.curriculum_monitor_steps, 1))
+    recent_train_samples = collections.deque(maxlen=max(h.curriculum_monitor_steps, 1))
     active_transition_monitors = []
 
-    def _summarize_monitor_samples(losses, step_ms):
-        if not losses:
+    def _summarize_monitor_samples(samples):
+        if not samples:
             return "insufficient_samples"
+        losses = [sample["loss"] for sample in samples]
+        step_ms = [sample["step_ms"] for sample in samples]
         avg_loss = sum(losses) / len(losses)
         avg_step_ms = sum(step_ms) / max(len(step_ms), 1)
         return (
@@ -2697,22 +2786,54 @@ def train_model(h, device, val_data):
             f"step_ms_avg:{avg_step_ms:.1f}"
         )
 
+    def _log_transition_monitor_sample(monitor, phase, offset, sample):
+        payload = {
+            "event": "transition_monitor_step",
+            "label": monitor["label"],
+            "event_step": monitor["start_step"],
+            "phase": phase,
+            "offset": offset,
+            "step": sample["step"],
+            "frac": round(sample["frac"], 6),
+            "lr_scale": round(sample["lr_scale"], 6),
+            "seq_len": sample["seq_len"],
+            "looping": sample["looping"],
+            "loss": round(sample["loss"], 8),
+            "step_ms": round(sample["step_ms"], 4),
+            "pre_loss_avg": round(monitor["pre_loss_avg"], 8),
+            "pre_step_ms_avg": round(monitor["pre_step_ms_avg"], 4),
+            "loss_delta_vs_pre_avg": round(
+                sample["loss"] - monitor["pre_loss_avg"], 8
+            ),
+            "step_ms_delta_vs_pre_avg": round(
+                sample["step_ms"] - monitor["pre_step_ms_avg"], 4
+            ),
+        }
+        log(f"transition_monitor:{json.dumps(payload, sort_keys=True)}", console=False)
+
     def _start_transition_monitor(label, step, frac, lr_scale):
-        pre_losses = list(recent_train_losses)
-        pre_step_ms = list(recent_step_ms)
+        pre_samples = list(recent_train_samples)
+        pre_losses = [sample["loss"] for sample in pre_samples]
+        pre_step_ms = [sample["step_ms"] for sample in pre_samples]
+        pre_loss_avg = sum(pre_losses) / len(pre_losses) if pre_losses else 0.0
+        pre_step_ms_avg = sum(pre_step_ms) / len(pre_step_ms) if pre_step_ms else 0.0
         log(
             f"{label}:monitor_start step:{step} frac:{frac:.3f} lr_scale:{lr_scale:.4f} "
             f"seq_len:{h.train_seq_len} looping:{int(base_model.looping_active)} "
-            f"pre[{_summarize_monitor_samples(pre_losses, pre_step_ms)}]"
+            f"pre[{_summarize_monitor_samples(pre_samples)}]"
         )
         if h.curriculum_monitor_steps <= 0:
             return
-        active_transition_monitors.append({
+        monitor = {
             "label": label,
             "start_step": step,
-            "losses": [],
-            "step_ms": [],
-        })
+            "samples": [],
+            "pre_loss_avg": pre_loss_avg,
+            "pre_step_ms_avg": pre_step_ms_avg,
+        }
+        for (pre_idx, sample) in enumerate(pre_samples, start=1):
+            _log_transition_monitor_sample(monitor, "pre", pre_idx - len(pre_samples) - 1, sample)
+        active_transition_monitors.append(monitor)
 
     training_time_ms = 0.0
     stop_after_step = None
@@ -2780,11 +2901,14 @@ def train_model(h, device, val_data):
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
             _start_transition_monitor("layer_loop", step, frac, scale)
-        target_seq_len = (
-            train_seq_len_start
-            if frac < h.seq_len_bump_frac
-            else train_seq_len_end
-        )
+        target_seq_len = seq_len_schedule[0]
+        for (threshold, scheduled_seq_len) in zip(
+            seq_len_bump_thresholds, seq_len_schedule[1:], strict=False
+        ):
+            if frac >= threshold:
+                target_seq_len = scheduled_seq_len
+            else:
+                break
         if target_seq_len != h.train_seq_len:
             log(
                 f"seq_len_curriculum:bump step:{step} frac:{frac:.3f} "
@@ -2798,29 +2922,31 @@ def train_model(h, device, val_data):
                 torch.bfloat16,
                 yarn_seq_len=h.train_seq_len,
             )
-            torch.cuda.synchronize()
-            training_time_ms += 1e3 * (time.perf_counter() - t0)
-            _prime_live_train_regime(
-                "seq_len_bump_warmup",
-                target_cu_len=256 if h.train_seq_len == train_seq_len_end else None,
-            )
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
             _start_transition_monitor("seq_len_curriculum", step, frac, scale)
         step_t0 = time.perf_counter()
         train_loss = step_fn(step, scale)
         step_elapsed_ms = 1e3 * (time.perf_counter() - step_t0)
         loss_item = train_loss.item()
-        recent_train_losses.append(loss_item)
-        recent_step_ms.append(step_elapsed_ms)
+        sample = {
+            "step": step + 1,
+            "frac": frac,
+            "lr_scale": scale,
+            "seq_len": h.train_seq_len,
+            "looping": int(base_model.looping_active),
+            "loss": loss_item,
+            "step_ms": step_elapsed_ms,
+        }
+        recent_train_samples.append(sample)
         completed_monitors = []
         for monitor in active_transition_monitors:
-            monitor["losses"].append(loss_item)
-            monitor["step_ms"].append(step_elapsed_ms)
-            if len(monitor["losses"]) >= h.curriculum_monitor_steps:
+            monitor["samples"].append(sample)
+            _log_transition_monitor_sample(
+                monitor, "post", len(monitor["samples"]), sample
+            )
+            if len(monitor["samples"]) >= h.curriculum_monitor_steps:
                 log(
                     f"{monitor['label']}:monitor_end step:{step+1} "
-                    f"post[{_summarize_monitor_samples(monitor['losses'], monitor['step_ms'])}]"
+                    f"post[{_summarize_monitor_samples(monitor['samples'])}]"
                 )
                 completed_monitors.append(monitor)
         if completed_monitors:
