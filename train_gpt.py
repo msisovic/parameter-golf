@@ -372,9 +372,9 @@ class DocumentPackingLoader:
 
 
 class ShuffledSequenceLoader:
-    def __init__(self, h, device):
+    def __init__(self, h, device, seq_len=None):
         self.world_size = h.world_size
-        self.seq_len = h.train_seq_len
+        self.seq_len = h.train_seq_len if seq_len is None else seq_len
         self.device = device
         all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
         if not all_files:
@@ -1866,7 +1866,7 @@ def serialize(h, base_model, code):
     device = torch.device("cuda", h.local_rank)
     log("GPTQ:collecting Hessians from calibration data...")
     t0 = time.perf_counter()
-    calib_loader = ShuffledSequenceLoader(h, device)
+    calib_loader = ShuffledSequenceLoader(h, device, seq_len=h.eval_seq_len)
     hessians = collect_hessians(
         base_model,
         calib_loader,
