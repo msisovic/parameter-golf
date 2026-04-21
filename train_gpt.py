@@ -2411,10 +2411,36 @@ def _reset_rotary_caches(model):
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    short_train_seq_len = h.train_seq_len
+    long_train_seq_len = h.train_seq_len_end
+
+    def _train_forward_short(input_ids, target_ids, cu_seqlens=None):
+        return base_model(
+            input_ids,
+            target_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=short_train_seq_len,
+        )
+
+    def _train_forward_long(input_ids, target_ids, cu_seqlens=None):
+        return base_model(
+            input_ids,
+            target_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=long_train_seq_len,
+        )
+
+    compiled_train_short = torch.compile(
+        _train_forward_short, dynamic=False, fullgraph=True
+    )
+    compiled_train_long = (
+        compiled_train_short
+        if long_train_seq_len == short_train_seq_len
+        else torch.compile(_train_forward_long, dynamic=False, fullgraph=True)
+    )
     def _forward_logits_short(input_ids, cu_seqlens=None, max_seqlen=0):
         return base_model.forward_logits(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.train_seq_len
+            input_ids, cu_seqlens=cu_seqlens, max_seqlen=short_train_seq_len
         )
 
     def _forward_logits_long(input_ids, cu_seqlens=None, max_seqlen=0):
@@ -2429,7 +2455,7 @@ def train_model(h, device, val_data):
         _forward_logits_long, dynamic=False, fullgraph=True
     )
     compiled_forward_logits = compiled_forward_logits_short
-    model = compiled_model
+    model = base_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
     optimizers = Optimizers(h, base_model)
     train_loader = DocumentPackingLoader(h, device)
@@ -2454,7 +2480,15 @@ def train_model(h, device, val_data):
             return max((1.0 - frac) / h.warmdown_frac, h.min_lr)
         return 1.0
 
-    def step_fn(step, lr_scale):
+    microbatch_tokens_local = h.train_batch_tokens // (
+        h.world_size * h.grad_accum_steps
+    )
+
+    def _prime_rotary_caches(seq_tokens):
+        for blk in base_model.blocks:
+            blk.attn.rotary(seq_tokens, device, torch.bfloat16)
+
+    def step_fn(step, lr_scale, train_forward):
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(h.grad_accum_steps):
@@ -2462,7 +2496,7 @@ def train_model(h, device, val_data):
                 h.train_batch_tokens, h.grad_accum_steps
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, cu_seqlens=cu_seqlens, max_seqlen=h.train_seq_len)
+                loss = train_forward(x, y, cu_seqlens=cu_seqlens)
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
@@ -2493,19 +2527,16 @@ def train_model(h, device, val_data):
             copy.deepcopy(opt.state_dict()) for opt in optimizers
         ]
         model.train()
-        num_tokens_local = h.train_batch_tokens // h.world_size
-        for blk in base_model.blocks:
-            blk.attn.rotary(num_tokens_local, device, torch.bfloat16)
         cu_bucket_size = train_loader.cu_bucket_size
         warmup_cu_buckets = tuple(cu_bucket_size * i for i in range(1, 5))
         warmup_cu_iters = 3
-        x, y, cu_seqlens, _ = train_loader.next_batch(
-            h.train_batch_tokens, h.grad_accum_steps
-        )
         log(f"warmup_cu_buckets:{','.join(str(b) for b in warmup_cu_buckets)} iters_each:{warmup_cu_iters}")
-        def _run_cu_bucket_warmup():
+        def _run_cu_bucket_warmup(train_forward, seq_len):
+            x, y, cu_seqlens, _ = train_loader.next_batch(
+                h.train_batch_tokens, h.grad_accum_steps
+            )
             for bucket_len in warmup_cu_buckets:
-                boundaries = list(range(0, x.size(1), max(h.train_seq_len, 1)))
+                boundaries = list(range(0, x.size(1), max(seq_len, 1)))
                 if boundaries[-1] != x.size(1):
                     boundaries.append(x.size(1))
                 cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
@@ -2513,16 +2544,17 @@ def train_model(h, device, val_data):
                 for _ in range(warmup_cu_iters):
                     optimizers.zero_grad_all()
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        wloss = model(x, y, cu_seqlens=cu, max_seqlen=h.train_seq_len)
+                        wloss = train_forward(x, y, cu_seqlens=cu)
                     (wloss / h.grad_accum_steps).backward()
             optimizers.zero_grad_all()
-        _run_cu_bucket_warmup()
+        _prime_rotary_caches(microbatch_tokens_local)
+        _run_cu_bucket_warmup(compiled_train_short, short_train_seq_len)
         if h.num_loops > 0:
             base_model.looping_active = True
-            _run_cu_bucket_warmup()
+            _run_cu_bucket_warmup(compiled_train_short, short_train_seq_len)
             base_model.looping_active = False
         for warmup_step in range(h.warmup_steps):
-            step_fn(warmup_step, 1.0)
+            step_fn(warmup_step, 1.0, compiled_train_short)
             if (
                 warmup_step <= 5
                 or (warmup_step + 1) % 10 == 0
@@ -2535,7 +2567,7 @@ def train_model(h, device, val_data):
                 f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
             for warmup_step in range(h.warmup_steps):
-                step_fn(warmup_step, 1.0)
+                step_fn(warmup_step, 1.0, compiled_train_short)
                 if (
                     warmup_step <= 5
                     or (warmup_step + 1) % 10 == 0
@@ -2559,37 +2591,19 @@ def train_model(h, device, val_data):
             ]
             old_seq_len = h.train_seq_len
             old_looping = base_model.looping_active
-            h.train_seq_len = h.train_seq_len_end
+            h.train_seq_len = long_train_seq_len
             train_loader.max_seq_len = h.train_seq_len
-            _reset_rotary_caches(base_model)
-            x, y, cu_seqlens, _ = train_loader.next_batch(
-                h.train_batch_tokens, h.grad_accum_steps
-            )
             log(
                 f"bump_prewarm:seq_len:{old_seq_len}->{h.train_seq_len} "
                 f"looping:{int(h.num_loops > 0 and h.enable_looping_at <= h.seq_len_bump_frac)}"
             )
-
-            def _run_bump_cu_bucket_warmup():
-                for bucket_len in warmup_cu_buckets:
-                    boundaries = list(range(0, x.size(1), max(h.train_seq_len, 1)))
-                    if boundaries[-1] != x.size(1):
-                        boundaries.append(x.size(1))
-                    cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
-                    cu[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
-                    for _ in range(warmup_cu_iters):
-                        optimizers.zero_grad_all()
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                            wloss = model(x, y, cu_seqlens=cu, max_seqlen=h.train_seq_len)
-                        (wloss / h.grad_accum_steps).backward()
-                optimizers.zero_grad_all()
-
-            _run_bump_cu_bucket_warmup()
+            _prime_rotary_caches(microbatch_tokens_local)
+            _run_cu_bucket_warmup(compiled_train_long, long_train_seq_len)
             if h.num_loops > 0 and h.enable_looping_at <= h.seq_len_bump_frac:
                 base_model.looping_active = True
-                _run_bump_cu_bucket_warmup()
+                _run_cu_bucket_warmup(compiled_train_long, long_train_seq_len)
                 for warmup_step in range(h.warmup_steps):
-                    step_fn(warmup_step, 1.0)
+                    step_fn(warmup_step, 1.0, compiled_train_long)
                     if (
                         warmup_step <= 5
                         or (warmup_step + 1) % 10 == 0
@@ -2598,7 +2612,7 @@ def train_model(h, device, val_data):
                         log(f"bump_loop_warmup_step: {warmup_step+1}/{h.warmup_steps}")
             else:
                 for warmup_step in range(h.warmup_steps):
-                    step_fn(warmup_step, 1.0)
+                    step_fn(warmup_step, 1.0, compiled_train_long)
                     if (
                         warmup_step <= 5
                         or (warmup_step + 1) % 10 == 0
@@ -2613,7 +2627,7 @@ def train_model(h, device, val_data):
             h.train_seq_len = old_seq_len
             base_model.looping_active = old_looping
             train_loader = DocumentPackingLoader(h, device)
-            _reset_rotary_caches(base_model)
+            _prime_rotary_caches(microbatch_tokens_local)
 
     def _warm_eval_logits(forward_logits_fn, fixed_max_seqlen):
         local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
@@ -2702,14 +2716,14 @@ def train_model(h, device, val_data):
         if not bumped and frac >= h.seq_len_bump_frac:
             bumped = True
             old_seq_len = h.train_seq_len
-            h.train_seq_len = h.train_seq_len_end
+            h.train_seq_len = long_train_seq_len
             train_loader.max_seq_len = h.train_seq_len
-            _reset_rotary_caches(base_model)
             log(
                 f"seq_len_curriculum:bump step:{step} frac:{frac:.3f} "
                 f"seq_len:{old_seq_len}->{h.train_seq_len}"
             )
-        train_loss = step_fn(step, scale)
+        active_train_forward = compiled_train_long if bumped else compiled_train_short
+        train_loss = step_fn(step, scale, active_train_forward)
         with torch.no_grad():
             for (name, t) in base_model.state_dict().items():
                 ema_state[name].mul_(ema_decay).add_(
@@ -2743,7 +2757,7 @@ def train_model(h, device, val_data):
         name: t.to(dtype=current_state[name].dtype) for (name, t) in ema_state.items()
     }
     base_model.load_state_dict(avg_state, strict=True)
-    return base_model, compiled_model, compiled_forward_logits_long
+    return base_model, base_model, compiled_forward_logits_long
 
 
 def train_and_eval(h, device):
