@@ -571,16 +571,20 @@ class Rotary(nn.Module):
             torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached = 0
-        self._cos_cached = None
-        self._sin_cached = None
-        self._yarn_seq_len_cached = 0
         self._fixed_short_seq_len = 0
         self._fixed_short_cos = None
         self._fixed_short_sin = None
+        self._fixed_short_attn_scale_multiplier = 1.0
         self._fixed_long_seq_len = 0
         self._fixed_long_cos = None
         self._fixed_long_sin = None
+        self._fixed_long_attn_scale_multiplier = 1.0
+
+    def _get_attn_scale_multiplier(self, yarn_seq_len):
+        if not (self.yarn and yarn_seq_len > self.train_seq_len):
+            return 1.0
+        yarn_scale = yarn_seq_len / self.train_seq_len
+        return 1.0 + 0.1 * math.log(yarn_scale)
 
     def _build_cache(self, seq_len, device, yarn_seq_len=None):
         yarn_seq_len = seq_len if yarn_seq_len is None else yarn_seq_len
@@ -598,17 +602,31 @@ class Rotary(nn.Module):
         return freqs.cos()[None, :, None, :], freqs.sin()[None, :, None, :]
 
     def prime_fixed_slot(self, slot, seq_len, device, dtype, yarn_seq_len=None):
+        yarn_seq_len = seq_len if yarn_seq_len is None else yarn_seq_len
         cos, sin = self._build_cache(seq_len, device, yarn_seq_len=yarn_seq_len)
         if slot == 0:
             self._fixed_short_cos = cos.to(dtype=dtype)
             self._fixed_short_sin = sin.to(dtype=dtype)
             self._fixed_short_seq_len = seq_len
+            self._fixed_short_attn_scale_multiplier = self._get_attn_scale_multiplier(
+                yarn_seq_len
+            )
         elif slot == 1:
             self._fixed_long_cos = cos.to(dtype=dtype)
             self._fixed_long_sin = sin.to(dtype=dtype)
             self._fixed_long_seq_len = seq_len
+            self._fixed_long_attn_scale_multiplier = self._get_attn_scale_multiplier(
+                yarn_seq_len
+            )
         else:
             raise ValueError(f"unsupported rotary slot {slot}")
+
+    def get_attn_scale_multiplier(self, cache_slot):
+        if cache_slot == 0:
+            return self._fixed_short_attn_scale_multiplier
+        if cache_slot == 1:
+            return self._fixed_long_attn_scale_multiplier
+        raise ValueError(f"unsupported rotary slot {cache_slot}")
 
     def forward(self, seq_len, device, dtype, yarn_seq_len=None, cache_slot=None):
         if cache_slot == 0:
@@ -629,21 +647,7 @@ class Rotary(nn.Module):
                 self._fixed_long_cos[:, :seq_len].to(dtype=dtype),
                 self._fixed_long_sin[:, :seq_len].to(dtype=dtype),
             )
-
-        yarn_seq_len = seq_len if yarn_seq_len is None else yarn_seq_len
-        if (
-            self._cos_cached is None
-            or self._sin_cached is None
-            or self._seq_len_cached < seq_len
-            or self._cos_cached.device != device
-            or self._yarn_seq_len_cached != yarn_seq_len
-        ):
-            self._cos_cached, self._sin_cached = self._build_cache(
-                seq_len, device, yarn_seq_len=yarn_seq_len
-            )
-            self._seq_len_cached = seq_len
-            self._yarn_seq_len_cached = yarn_seq_len
-        return self._cos_cached[:, :seq_len].to(dtype=dtype), self._sin_cached[:, :seq_len].to(dtype=dtype)
+        raise ValueError("rotary forward requires an explicit fixed cache_slot")
 
 
 def apply_rotary_emb(x, cos, sin, rope_dims=0):
@@ -688,6 +692,9 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
+    def _softmax_scale(self, rotary_slot):
+        return (self.head_dim ** -0.5) * self.rotary.get_attn_scale_multiplier(rotary_slot)
+
     def forward(self, x, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0, rotary_slot=None):
         bsz, seqlen, dim = x.shape
         q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
@@ -701,6 +708,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        softmax_scale = self._softmax_scale(rotary_slot)
         if cu_seqlens is not None:
             y = flash_attn_varlen_func(
                 q[0],
@@ -711,10 +719,11 @@ class CausalSelfAttention(nn.Module):
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
                 causal=True,
+                softmax_scale=softmax_scale,
                 window_size=(-1, -1),
             )[None]
         else:
-            y = flash_attn_3_func(q, k, v, causal=True)
+            y = flash_attn_3_func(q, k, v, causal=True, softmax_scale=softmax_scale)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
@@ -1036,7 +1045,7 @@ class GPT(nn.Module):
             reduction="mean",
         )
 
-    def forward_ttt(self, input_ids, target_ids, lora):
+    def forward_ttt(self, input_ids, target_ids, lora, max_seqlen=0, rotary_slot=None):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -1061,7 +1070,21 @@ class GPT(nn.Module):
         slot = 0
         for i in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+            x = self._block_with_lora(
+                self.blocks[i],
+                x,
+                x0,
+                lora,
+                slot,
+                q_w,
+                k_w,
+                v_w,
+                out_w,
+                up_w,
+                down_w,
+                max_seqlen=max_seqlen,
+                rotary_slot=rotary_slot,
+            )
             slot += 1
             skips.append(x)
         psl = self.parallel_start_layer
@@ -1084,6 +1107,8 @@ class GPT(nn.Module):
                 lane0, lane1 = self._parallel_block_with_lora(
                     i, lane0, lane1, x0, lora, slot,
                     q_w, k_w, v_w, out_w, up_w, down_w,
+                    max_seqlen=max_seqlen,
+                    rotary_slot=rotary_slot,
                 )
             else:
                 if skip_idx < self.num_skip_weights and skips:
@@ -1096,7 +1121,21 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+                x = self._block_with_lora(
+                    self.blocks[i],
+                    x,
+                    x0,
+                    lora,
+                    slot,
+                    q_w,
+                    k_w,
+                    v_w,
+                    out_w,
+                    up_w,
+                    down_w,
+                    max_seqlen=max_seqlen,
+                    rotary_slot=rotary_slot,
+                )
             slot += 1
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
@@ -1114,7 +1153,22 @@ class GPT(nn.Module):
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
         ).reshape(bsz, sl)
 
-    def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
+    def _block_with_lora(
+        self,
+        block,
+        x,
+        x0,
+        lora,
+        slot,
+        q_w,
+        k_w,
+        v_w,
+        out_w,
+        up_w,
+        down_w,
+        max_seqlen=0,
+        rotary_slot=None,
+    ):
         mix = block.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
@@ -1132,11 +1186,19 @@ class GPT(nn.Module):
         )
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = attn.rotary(seqlen, n.device, q.dtype)
+        cos, sin = attn.rotary(
+            seqlen,
+            n.device,
+            q.dtype,
+            yarn_seq_len=max_seqlen or seqlen,
+            cache_slot=rotary_slot,
+        )
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        y = flash_attn_3_func(
+            q, k, v, causal=True, softmax_scale=attn._softmax_scale(rotary_slot)
+        )
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
@@ -1154,6 +1216,8 @@ class GPT(nn.Module):
     def _parallel_block_with_lora(
         self, block_idx, lane0, lane1, x0, lora, slot,
         q_w, k_w, v_w, out_w, up_w, down_w,
+        max_seqlen=0,
+        rotary_slot=None,
     ):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
@@ -1173,11 +1237,19 @@ class GPT(nn.Module):
         )
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = attn.rotary(seqlen, n.device, q.dtype)
+        cos, sin = attn.rotary(
+            seqlen,
+            n.device,
+            q.dtype,
+            yarn_seq_len=max_seqlen or seqlen,
+            cache_slot=rotary_slot,
+        )
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        y = flash_attn_3_func(
+            q, k, v, causal=True, softmax_scale=attn._softmax_scale(rotary_slot)
+        )
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
@@ -1688,7 +1760,7 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
     with torch.no_grad():
         for _ in range(n_calibration_batches):
             x, _ = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
-            model.forward_logits(x)
+            model.forward_logits(x, max_seqlen=h.eval_seq_len, rotary_slot=1)
     for hook in hooks:
         hook.remove()
     for i, block in enumerate(model.blocks):
@@ -2241,10 +2313,12 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
         ds, dl = test_doc
         log(f"DEBUG: test doc start={ds} len={dl}")
         toks = all_tokens_idx[ds : ds + dl].to(device=device, dtype=torch.int64)
-        x_d = toks[:-1].unsqueeze(0)
-        y_d = toks[1:].unsqueeze(0)
+        x_d = toks[:-1].unsqueeze(0)[:, : h.ttt_eval_seq_len]
+        y_d = toks[1:].unsqueeze(0)[:, : h.ttt_eval_seq_len]
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits_d = base_model.forward_logits(x_d)
+            logits_d = base_model.forward_logits(
+                x_d, max_seqlen=h.ttt_eval_seq_len, rotary_slot=1
+            )
         ptl_d = F.cross_entropy(
             logits_d.float().reshape(-1, logits_d.size(-1)),
             y_d.reshape(-1), reduction="none",
@@ -2463,16 +2537,14 @@ def timed_eval(label, fn, *args, **kwargs):
 def _reset_rotary_caches(model):
     for block in model.blocks:
         rotary = block.attn.rotary
-        rotary._cos_cached = None
-        rotary._sin_cached = None
-        rotary._seq_len_cached = 0
-        rotary._yarn_seq_len_cached = 0
         rotary._fixed_short_seq_len = 0
         rotary._fixed_short_cos = None
         rotary._fixed_short_sin = None
+        rotary._fixed_short_attn_scale_multiplier = 1.0
         rotary._fixed_long_seq_len = 0
         rotary._fixed_long_cos = None
         rotary._fixed_long_sin = None
+        rotary._fixed_long_attn_scale_multiplier = 1.0
 
 
 def _prime_rotary_fixed_slots(model, slot_specs, device, dtype=torch.bfloat16):
@@ -2484,23 +2556,29 @@ def _prime_rotary_fixed_slots(model, slot_specs, device, dtype=torch.bfloat16):
             )
 
 
+def _validate_fixed_rotary_config(h):
+    if h.train_seq_len_end != h.eval_seq_len:
+        raise ValueError(
+            "fixed rotary short/long regimes require TRAIN_SEQ_LEN_END == EVAL_SEQ_LEN"
+        )
+    if h.ttt_enabled and h.ttt_eval_seq_len != h.eval_seq_len:
+        raise ValueError(
+            "fixed rotary short/long regimes require TTT_EVAL_SEQ_LEN == EVAL_SEQ_LEN"
+        )
+
+
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
     short_train_seq_len = h.train_seq_len
     long_train_seq_len = h.train_seq_len_end
-    if long_train_seq_len != h.eval_seq_len:
-        raise ValueError(
-            "fixed rotary short/long slots require TRAIN_SEQ_LEN_END == EVAL_SEQ_LEN"
-        )
     microbatch_tokens_local = h.train_batch_tokens // (
         h.world_size * h.grad_accum_steps
     )
     eval_batch_tokens_local = h.val_batch_tokens // (
         h.world_size * h.grad_accum_steps
     )
-    eval_batch_seqs = max(eval_batch_tokens_local // h.eval_seq_len, 1)
-    rotary_slot_tokens = max(microbatch_tokens_local, eval_batch_seqs * h.eval_seq_len)
+    rotary_slot_tokens = max(microbatch_tokens_local, eval_batch_tokens_local)
     _prime_rotary_fixed_slots(
         base_model,
         (
@@ -2536,23 +2614,15 @@ def train_model(h, device, val_data):
         if long_train_seq_len == short_train_seq_len
         else torch.compile(_train_forward_long, dynamic=False, fullgraph=True)
     )
-    def _forward_logits_short(input_ids, cu_seqlens=None, max_seqlen=0):
-        return base_model.forward_logits(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=short_train_seq_len, rotary_slot=0
-        )
-
     def _forward_logits_long(input_ids, cu_seqlens=None, max_seqlen=0):
         return base_model.forward_logits(
             input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len, rotary_slot=1
         )
 
-    compiled_forward_logits_short = torch.compile(
-        _forward_logits_short, dynamic=False, fullgraph=True
-    )
     compiled_forward_logits_long = torch.compile(
         _forward_logits_long, dynamic=False, fullgraph=True
     )
-    compiled_forward_logits = compiled_forward_logits_short
+    compiled_forward_logits = compiled_forward_logits_long
     model = base_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
     optimizers = Optimizers(h, base_model)
@@ -2715,7 +2785,7 @@ def train_model(h, device, val_data):
             h.train_seq_len = old_seq_len
             base_model.looping_active = old_looping
             train_loader = DocumentPackingLoader(h, device)
-    def _warm_eval_logits(forward_logits_fn, fixed_max_seqlen):
+    def _warm_eval_logits(forward_logits_fn):
         local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
         local_batch_seqs = max(local_batch_tokens // h.eval_seq_len, 1)
         raw_end = local_batch_seqs * h.eval_seq_len + 1
@@ -2733,14 +2803,10 @@ def train_model(h, device, val_data):
             cu = torch.full((bucket_len,), x.numel(), dtype=torch.int32, device=device)
             cu[: cu_seqlens.numel()] = cu_seqlens
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                forward_logits_fn(
-                    x[None], cu_seqlens=cu, max_seqlen=fixed_max_seqlen
-                ).detach()
+                forward_logits_fn(x[None], cu_seqlens=cu, max_seqlen=h.eval_seq_len).detach()
         torch.cuda.synchronize()
 
-    _warm_eval_logits(compiled_forward_logits_short, h.train_seq_len)
-    if h.eval_seq_len != h.train_seq_len:
-        _warm_eval_logits(compiled_forward_logits_long, h.eval_seq_len)
+    _warm_eval_logits(compiled_forward_logits_long)
     ema_state = {
         name: t.detach().float().clone()
         for (name, t) in base_model.state_dict().items()
@@ -2764,17 +2830,13 @@ def train_model(h, device, val_data):
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1e3 * (time.perf_counter() - t0)
-            active_eval_forward = (
-                compiled_forward_logits_long if bumped else compiled_forward_logits_short
-            )
-            active_eval_max_seqlen = h.eval_seq_len if bumped else h.train_seq_len
             val_loss, val_bpb = eval_val(
                 h,
                 device,
                 val_data,
                 model,
-                active_eval_forward,
-                fixed_max_seqlen=active_eval_max_seqlen,
+                compiled_forward_logits_long,
+                fixed_max_seqlen=h.eval_seq_len,
             )
             log(
                 f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}"
@@ -2847,6 +2909,7 @@ def train_model(h, device, val_data):
 
 
 def train_and_eval(h, device):
+    _validate_fixed_rotary_config(h)
     random.seed(h.seed)
     np.random.seed(h.seed)
     torch.manual_seed(h.seed)
@@ -2862,10 +2925,9 @@ def train_and_eval(h, device):
         eval_batch_tokens_local = h.val_batch_tokens // (
             h.world_size * h.grad_accum_steps
         )
-        eval_batch_seqs = max(eval_batch_tokens_local // h.eval_seq_len, 1)
         _prime_rotary_fixed_slots(
             base_model,
-            ((0, eval_batch_seqs * h.eval_seq_len, h.eval_seq_len),),
+            ((1, eval_batch_tokens_local, h.eval_seq_len),),
             device,
         )
         if h.num_loops > 0:
@@ -2873,7 +2935,7 @@ def train_and_eval(h, device):
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
         def _forward_logits_eval(input_ids, cu_seqlens=None, max_seqlen=0):
             return base_model.forward_logits(
-                input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len, rotary_slot=0
+                input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len, rotary_slot=1
             )
 
         compiled_forward_logits = torch.compile(
@@ -2911,10 +2973,9 @@ def train_and_eval(h, device):
     eval_batch_tokens_local = h.val_batch_tokens // (
         h.world_size * h.grad_accum_steps
     )
-    eval_batch_seqs = max(eval_batch_tokens_local // h.eval_seq_len, 1)
     _prime_rotary_fixed_slots(
         eval_model,
-        ((0, eval_batch_seqs * h.eval_seq_len, h.eval_seq_len),),
+        ((1, eval_batch_tokens_local, h.eval_seq_len),),
         device,
     )
     if h.num_loops > 0:
@@ -2922,7 +2983,7 @@ def train_and_eval(h, device):
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
     def _forward_logits_eval_quant(input_ids, cu_seqlens=None, max_seqlen=0):
         return eval_model.forward_logits(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len, rotary_slot=0
+            input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len, rotary_slot=1
         )
 
     compiled_forward_logits = torch.compile(
@@ -2956,20 +3017,26 @@ def train_and_eval(h, device):
             ttt_model.looping_active = True
         for p in ttt_model.parameters():
             p.requires_grad_(False)
-
-        if h.rope_yarn:
-            _yarn_seqlen = h.train_batch_tokens // h.grad_accum_steps
-            for block in ttt_model.blocks:
-                block.attn.rotary(_yarn_seqlen, device, torch.bfloat16)
-        else:
-            for block in ttt_model.blocks:
-                block.attn.rotary._cos_cached = None
-                block.attn.rotary._sin_cached = None
-                block.attn.rotary._seq_len_cached = 0
-                block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
+        _prime_rotary_fixed_slots(
+            ttt_model,
+            (
+                (
+                    1,
+                    max(eval_batch_tokens_local, h.ttt_chunk_size, h.ttt_eval_seq_len),
+                    h.ttt_eval_seq_len,
+                ),
+            ),
+            device,
+        )
 
         def _fwd_ttt_inner(input_ids, target_ids, lora):
-            return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
+            return ttt_model.forward_ttt(
+                input_ids,
+                target_ids,
+                lora=lora,
+                max_seqlen=h.ttt_eval_seq_len,
+                rotary_slot=1,
+            )
 
         _fwd_ttt_compiled_inner = None
 
@@ -2982,7 +3049,9 @@ def train_and_eval(h, device):
         _ttt_debug_bypass = bool(os.environ.get("TTT_DEBUG_BYPASS"))
         if _ttt_debug_bypass:
             def _fwd_ttt_bypass(input_ids, target_ids, lora):
-                logits = ttt_model.forward_logits(input_ids)
+                logits = ttt_model.forward_logits(
+                    input_ids, max_seqlen=h.ttt_eval_seq_len, rotary_slot=1
+                )
                 dummy = lora.q_loras[0].B.sum() * 0
                 logits = logits + dummy
                 bsz, sl, V = logits.shape
