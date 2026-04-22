@@ -167,3 +167,18 @@ quantized_ttt_lora val_loss:2.76373377 val_bpb:1.06992011 eval_time:2591769ms
   - But the raw quantized penalty is still too large relative to the baseline and still needs another pass.
 
 - The new eval-only flow is now good enough for fast iteration on that remaining GPTQ / post-quant gap without retraining every time.
+
+### Follow-Up Root Cause
+
+- We found a specific reason full train+eval and eval-only were disagreeing on GPTQ quality even for the same checkpoint.
+- During the runtime seq-len curriculum bump, the training path mutated `h.train_seq_len` in place from `2048` to `8192`.
+- That mutation leaked past training and affected later post-training code.
+- In particular, `deserialize(h, device)` builds a fresh `GPT(h)` before loading dequantized weights.
+- So:
+  - full-train post-GPTQ eval was deserializing into a model configured with `train_seq_len=8192`
+  - eval-only post-GPTQ eval was deserializing into a fresh model configured with the correct env value `train_seq_len=2048`
+- With YaRN enabled, that difference changes the rotary behavior enough to materially change quantized eval quality.
+- Fix:
+  - stop mutating `h.train_seq_len` during the live curriculum bump
+  - only update `train_loader.max_seq_len` at runtime
+- This should make full-train post-GPTQ behavior match eval-only for the same `final_model.pt`.

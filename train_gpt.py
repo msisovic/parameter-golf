@@ -2872,12 +2872,11 @@ def train_model(h, device, val_data):
             )
         if not bumped and frac >= h.seq_len_bump_frac:
             bumped = True
-            old_seq_len = h.train_seq_len
-            h.train_seq_len = long_train_seq_len
-            train_loader.max_seq_len = h.train_seq_len
+            old_seq_len = train_loader.max_seq_len
+            train_loader.max_seq_len = long_train_seq_len
             log(
                 f"seq_len_curriculum:bump step:{step} frac:{frac:.3f} "
-                f"seq_len:{old_seq_len}->{h.train_seq_len}"
+                f"seq_len:{old_seq_len}->{train_loader.max_seq_len}"
             )
         active_train_forward = compiled_train_long if bumped else compiled_train_short
         train_loss = step_fn(step, scale, active_train_forward)
