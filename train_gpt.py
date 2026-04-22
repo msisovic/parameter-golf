@@ -1,4 +1,4 @@
-import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
+import base64, collections, copy, fcntl, gc, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
@@ -113,7 +113,15 @@ class Hyperparameters:
         data_dir, "tokenizers", f"fineweb_{vocab_size}_bpe.model"
     )
     artifact_dir = os.environ.get("ARTIFACT_DIR", "")
-    eval_only_path = os.environ.get("EVAL_ONLY_PATH", "")
+    _eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
+    eval_only_path = os.environ.get("EVAL_ONLY_PATH") or (
+        os.path.join(artifact_dir, "final_model.pt")
+        if _eval_only and artifact_dir
+        else "final_model.pt" if _eval_only else ""
+    )
+    force_serialize_in_eval_only = bool(
+        int(os.environ.get("FORCE_SERIALIZE_IN_EVAL_ONLY", "0"))
+    )
     logfile = (
         os.path.join(artifact_dir, f"{run_id}.txt")
         if artifact_dir
@@ -1756,6 +1764,7 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
         hooks.append(
             hook_module.register_forward_hook(make_output_hook("tok_emb.weight"))
         )
+
     model.eval()
     with torch.no_grad():
         for _ in range(n_calibration_batches):
@@ -2963,10 +2972,14 @@ def train_and_eval(h, device):
     if not _skip_training:
         serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
     else:
-        log("eval_only: skipping serialize (already have quantized model)")
-        if not os.path.exists(h.quantized_model_path):
+        if h.force_serialize_in_eval_only:
+            log("eval_only: FORCE_SERIALIZE_IN_EVAL_ONLY=1, rebuilding quantized model")
+            serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
+        elif not os.path.exists(h.quantized_model_path):
             log("eval_only: no quantized model found, running serialize anyway")
             serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
+        else:
+            log("eval_only: skipping serialize (already have quantized model)")
     if h.distributed:
         dist.barrier()
     eval_model = deserialize(h, device)
@@ -3009,8 +3022,9 @@ def train_and_eval(h, device):
             forward_logits_fn=compiled_forward_logits,
         )
     if h.ttt_enabled:
-        del eval_model, compiled_model
+        del compiled_forward_logits, eval_model, compiled_model
         torch._dynamo.reset()
+        gc.collect()
         torch.cuda.empty_cache()
         ttt_model = deserialize(h, device)
         if h.num_loops > 0:
