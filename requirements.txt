@@ -12,3 +12,4 @@ zstandard
 brotli
 pyminify
 python-minifier
+triton
