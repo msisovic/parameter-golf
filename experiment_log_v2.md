@@ -104,6 +104,19 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 
 ### Important Bugs Hit Along The Way
 
+- Phased TTT global-SGD could deadlock on 8 GPUs with the long-context eval setup.
+  - Cause:
+    - `GLOBAL_TTT_CHUNK_TOKENS=32768` with `EVAL_SEQ_LEN=8192` yields 4 eval-length sequences per global-TTT chunk.
+    - The old distributed global-TTT sharding assumed each rank would get local work.
+    - On 8 GPUs, some ranks got zero sequences for a chunk and skipped the grad `all_reduce`, while others still entered it.
+    - That produced an NCCL timeout during the post-quant phased-TTT stage even though the same config could complete on 4 GPUs.
+  - Fix:
+    - changed global-TTT SGD so every rank executes the same sync cadence each step
+    - ranks with no local slice now contribute zero grads instead of skipping collectives
+  - Practical note:
+    - `GLOBAL_TTT_CHUNK_TOKENS=65536` is a better fit for 8 GPUs because it usually gives 8 eval-length sequences per chunk, so all ranks do useful work
+    - this improves utilization, but the code fix is what makes the run correct
+
 - GPTQ calibration briefly crashed after reverting to baseline-like isolated rows.
   - Cause:
     - the new fixed rotary cache path requires explicit `rotary_slot`

@@ -2485,47 +2485,55 @@ def train_val_ttt_global_sgd_distributed(h, device, val_data, base_model, val_to
             )
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
-        my_seq_s = chunk_seqs * h.rank // h.world_size
-        my_seq_e = chunk_seqs * (h.rank + 1) // h.world_size
-        my_chunk_seqs = my_seq_e - my_seq_s
+        # Keep optimizer/all-reduce cadence identical across ranks even when a
+        # chunk contains fewer eval-length sequences than GPUs. The old static
+        # shard could give some ranks zero local work for a chunk, causing them
+        # to skip the gradient all-reduces entirely and deadlock the others.
+        global_step_span = max(1, batch_seqs * h.world_size)
+        num_sync_steps = (chunk_seqs + global_step_span - 1) // global_step_span
         for _ in range(h.global_ttt_epochs):
-            for bs in range(0, my_chunk_seqs, batch_seqs):
-                be = min(bs + batch_seqs, my_chunk_seqs)
-                actual_bs = my_seq_s + bs
-                start_tok = chunk_start + actual_bs * seq_len
-                end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                if end_tok > val_tokens.numel():
-                    continue
-                local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
-                x_flat = local[:-1]
-                y_flat = local[1:]
+            for sync_step in range(num_sync_steps):
+                seq_base = sync_step * global_step_span + h.rank * batch_seqs
+                local_seq_s = min(seq_base, chunk_seqs)
+                local_seq_e = min(seq_base + batch_seqs, chunk_seqs)
+                local_chunk_seqs = local_seq_e - local_seq_s
                 optimizer.zero_grad(set_to_none=True)
-                with torch.enable_grad():
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        if h.global_ttt_respect_doc_boundaries:
-                            bos_pos = (x_flat == BOS_ID).nonzero(as_tuple=True)[0].tolist()
-                            cu_seqlens, max_seqlen = _build_cu_seqlens(
-                                bos_pos, x_flat.numel(), x_flat.device, h.eval_seq_len, 64
-                            )
-                            loss = base_model(
-                                x_flat[None],
-                                y_flat[None],
-                                cu_seqlens=cu_seqlens,
-                                max_seqlen=h.ttt_eval_seq_len,
-                                rotary_slot=1,
-                            )
-                        else:
-                            x = x_flat.reshape(-1, seq_len)
-                            y = y_flat.reshape(-1, seq_len)
-                            loss = base_model(
-                                x, y, max_seqlen=h.ttt_eval_seq_len, rotary_slot=1
-                            )
-                loss.backward()
+                if local_chunk_seqs > 0:
+                    start_tok = chunk_start + local_seq_s * seq_len
+                    end_tok = chunk_start + local_seq_e * seq_len + 1
+                    if end_tok <= val_tokens.numel():
+                        local = val_tokens[start_tok:end_tok].to(
+                            device=device, dtype=torch.int64
+                        )
+                        x_flat = local[:-1]
+                        y_flat = local[1:]
+                        with torch.enable_grad():
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                if h.global_ttt_respect_doc_boundaries:
+                                    bos_pos = (x_flat == BOS_ID).nonzero(as_tuple=True)[0].tolist()
+                                    cu_seqlens, max_seqlen = _build_cu_seqlens(
+                                        bos_pos, x_flat.numel(), x_flat.device, h.eval_seq_len, 64
+                                    )
+                                    loss = base_model(
+                                        x_flat[None],
+                                        y_flat[None],
+                                        cu_seqlens=cu_seqlens,
+                                        max_seqlen=h.ttt_eval_seq_len,
+                                        rotary_slot=1,
+                                    )
+                                else:
+                                    x = x_flat.reshape(-1, seq_len)
+                                    y = y_flat.reshape(-1, seq_len)
+                                    loss = base_model(
+                                        x, y, max_seqlen=h.ttt_eval_seq_len, rotary_slot=1
+                                    )
+                        loss.backward()
                 if dist.is_available() and dist.is_initialized():
                     for p in ttt_params:
-                        if p.grad is not None:
-                            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                            p.grad.mul_(1.0 / h.world_size)
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad.mul_(1.0 / h.world_size)
                 if h.global_ttt_grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(ttt_params, h.global_ttt_grad_clip)
                 optimizer.step()
