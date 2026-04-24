@@ -210,3 +210,49 @@ quantized_ttt_lora val_loss:2.76373377 val_bpb:1.06992011 eval_time:2591769ms
   - original timed TTT: `958.5s`, `val_bpb=1.06346814`
   - patched timed TTT: `765.7s`, `val_bpb=1.06346775`
 - Score stayed effectively identical while removing about 193s of timed TTT overhead.
+
+### TTT Chunk-64 LR Sweep
+
+- After the recompile fix, `TTT_CHUNK_SIZE=48` preserved the known score but remained too slow.
+- `TTT_CHUNK_SIZE=64`, `TTT_BATCH_SIZE=16` was tested as the next speed/quality tradeoff.
+- The timed TTT speed was near the 600s boundary and largely invariant to `TTT_LORA_LR`.
+- LR sweep results from eval-only runs on the same seed-1337 checkpoint:
+
+| TTT chunk | TTT batch | TTT LR | val_loss | val_bpb | timed TTT |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 16 | `0.0001000` | `2.32793152` | `1.06376711` | `606.4s` |
+| 64 | 16 | `0.0001333333` | `2.32860927` | `1.06407682` | `605.1s` |
+| 64 | 16 | `0.0000750` | `2.32784477` | `1.06372748` | `600.6s` |
+
+- Takeaways:
+  - Linear LR scaling from chunk 48 to 64 (`1e-4 * 64/48 = 1.333e-4`) was worse.
+  - Slightly lower LR (`7.5e-5`) was the best chunk-64 point tried, but only marginally better than `1e-4`.
+  - Chunk 64 is close to the 600s target but does not recover chunk-48 quality.
+  - The quality loss appears to be mostly from coarser online adaptation rather than a simple LR-scale mismatch.
+
+### Current Full-Run Command
+
+```bash
+SEED=1337 \
+TORCH_LOGS="recompiles" \
+TORCHDYNAMO_VERBOSE=1 \
+NCCL_NET=Socket \
+DATA_DIR=. \
+DATA_PATH=./datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved \
+TOKENIZER_PATH=./tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model \
+CASEOPS_ENABLED=1 \
+PHASED_TTT_PREFIX_DOCS=2000 PHASED_TTT_NUM_PHASES=3 \
+GLOBAL_TTT_CHUNK_TOKENS=65536 \
+MATRIX_CLIP_SIGMAS=12.85 ATTN_CLIP_SIGMAS=13.0 \
+EMBED_BITS=7 EMBED_CLIP_SIGMAS=15.0 \
+MATRIX_LR=0.026 \
+GPTQ_RESERVE_SECONDS=4 GPTQ_CALIBRATION_BATCHES=16 \
+GATED_ATTN_ENABLED=1 GATED_ATTN_INIT_STD=0.005 GATED_ATTN_QUANT_GATE=1 \
+TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=8192 SEQ_LEN_BUMP_FRAC=0.85 \
+EVAL_SEQ_LEN=8192 TTT_EVAL_SEQ_LEN=8192 \
+TTT_BATCH_SIZE=16 TTT_CHUNK_SIZE=64 TTT_LORA_LR=0.000075 \
+ROPE_YARN=1 ROPE_TRAIN_SEQ_LEN=2048 \
+TORCH_NCCL_TRACE_BUFFER_SIZE=1048576 \
+torchrun --standalone --nproc_per_node=8 \
+train_gpt_v2.py 2>&1 | tee train_1024_seed${SEED}_seq8192_ttt_chunk64_bsz16_lr7p5e-5.log
+```
