@@ -195,3 +195,18 @@ quantized_ttt_lora val_loss:2.76373377 val_bpb:1.06992011 eval_time:2591769ms
   - stop mutating `h.train_seq_len` during the live curriculum bump
   - only update `train_loader.max_seq_len` at runtime
 - This should make full-train post-GPTQ behavior match eval-only for the same `final_model.pt`.
+
+### TTT Recompile Follow-Up
+
+- The 8192-token TTT path was paying avoidable timed recompiles after warmup.
+- Cause:
+  - warmup compiled `_fwd_ttt_inner` while the TTT model was still in train mode
+  - real TTT switches the frozen base model to eval mode
+  - the final partial doc batch can also introduce a smaller batch shape
+- Fix:
+  - call `ttt_model.eval()` before TTT compile warmup
+  - warm both the normal `TTT_BATCH_SIZE` shape and the tail batch shape
+- Result from eval-only rerun with `TTT_CHUNK_SIZE=48`, `TTT_BATCH_SIZE=16`:
+  - original timed TTT: `958.5s`, `val_bpb=1.06346814`
+  - patched timed TTT: `765.7s`, `val_bpb=1.06346775`
+- Score stayed effectively identical while removing about 193s of timed TTT overhead.

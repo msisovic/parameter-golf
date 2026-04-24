@@ -3383,7 +3383,15 @@ def train_and_eval(h, device):
         if BOS_ID is None:
             BOS_ID = 1
         t_warmup = time.perf_counter()
+        # The TTT loop runs the LoRA path with the frozen base model in eval
+        # mode. Warm that exact guard state, plus the possible final partial
+        # doc batch, so the timed TTT pass does not pay for avoidable compiles.
+        ttt_model.eval()
         warmup_bszes = [h.ttt_batch_size]
+        warmup_docs = len(_select_ttt_doc_entries(_find_docs(val_data.val_tokens), h))
+        tail_bsz = warmup_docs % h.ttt_batch_size
+        if tail_bsz:
+            warmup_bszes.append(tail_bsz)
         for bsz in warmup_bszes:
             wl = BatchedTTTLoRA(
                 bsz, ttt_model, h.ttt_lora_rank,
