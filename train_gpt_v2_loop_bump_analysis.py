@@ -1,4 +1,4 @@
-import base64, collections, copy, fcntl, gc, glob, io, lzma, math, os
+import base64, collections, copy, fcntl, gc, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
@@ -59,6 +59,13 @@ class Hyperparameters:
     enable_looping_step = int(os.environ.get("ENABLE_LOOPING_STEP", 2200))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     loop_ramp_steps = int(os.environ.get("LOOP_RAMP_STEPS", 0))
+    loop_untie_extra_scalars = bool(int(os.environ.get("LOOP_UNTIE_EXTRA_SCALARS", "1")))
+    loop_scalar_log_enabled = bool(int(os.environ.get("LOOP_SCALAR_LOG_ENABLED", "1")))
+    loop_scalar_log_start_step = int(os.environ.get("LOOP_SCALAR_LOG_START_STEP", -1))
+    loop_scalar_log_end_step = int(os.environ.get("LOOP_SCALAR_LOG_END_STEP", -1))
+    loop_scalar_log_pre_steps = int(os.environ.get("LOOP_SCALAR_LOG_PRE_STEPS", 100))
+    loop_scalar_log_post_steps = int(os.environ.get("LOOP_SCALAR_LOG_POST_STEPS", 400))
+    loop_scalar_log_every = int(os.environ.get("LOOP_SCALAR_LOG_EVERY", 1))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 8))
     parallel_final_lane = os.environ.get("PARALLEL_FINAL_LANE", "mean")
     min_lr = float(os.environ.get("MIN_LR", 0.0))
@@ -940,9 +947,12 @@ class Block(nn.Module):
 
     def forward(
         self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None,
-        max_seqlen=0, rotary_slot=None,
+        max_seqlen=0, rotary_slot=None, resid_mix=None, attn_scale=None, mlp_scale=None,
     ):
-        mix = self.resid_mix.to(dtype=x.dtype)
+        mix_src = self.resid_mix if resid_mix is None else resid_mix
+        attn_scale_src = self.attn_scale if attn_scale is None else attn_scale
+        mlp_scale_src = self.mlp_scale if mlp_scale is None else mlp_scale
+        mix = mix_src.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(
             self.attn_norm(x_in) * self.ln_scale_factor,
@@ -951,8 +961,8 @@ class Block(nn.Module):
             max_seqlen=max_seqlen,
             rotary_slot=rotary_slot,
         )
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
+        x_out = x_in + attn_scale_src.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_out + mlp_scale_src.to(dtype=x_out.dtype)[
             None, None, :
         ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         return x_out
@@ -1021,18 +1031,56 @@ class GPT(nn.Module):
             for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
                 self.blocks[i].attn.use_xsa = True
         self.looping_active = False
+        self.loop_untie_extra_scalars = bool(h.loop_untie_extra_scalars and h.num_loops > 0)
+        self.loop_width = max(h.loop_end - h.loop_start + 1, 0) if h.num_loops > 0 else 0
+        self.base_encoder_loop_entries = [
+            (i, -1, -1) for i in range(self.num_encoder_layers)
+        ]
+        self.base_decoder_loop_entries = [
+            (i, -1, -1) for i in range(self.num_encoder_layers, h.num_layers)
+        ]
         if h.num_loops > 0:
+            if self.loop_untie_extra_scalars and h.parallel_start_layer > 0:
+                if h.loop_end >= h.parallel_start_layer:
+                    raise ValueError(
+                        "LOOP_UNTIE_EXTRA_SCALARS assumes recurrent layers are pre-parallel: "
+                        f"loop_end={h.loop_end} parallel_start_layer={h.parallel_start_layer}"
+                    )
             loop_seg = list(range(h.loop_start, h.loop_end + 1))
-            all_indices = list(range(h.loop_start))
-            for _ in range(h.num_loops + 1):
-                all_indices.extend(loop_seg)
-            all_indices.extend(range(h.loop_end + 1, h.num_layers))
-            num_enc = len(all_indices) // 2
-            self.encoder_indices = all_indices[:num_enc]
-            self.decoder_indices = all_indices[num_enc:]
+            all_entries = [(i, -1, -1) for i in range(h.loop_start)]
+            for pass_idx in range(h.num_loops + 1):
+                extra_pass = pass_idx - 1
+                all_entries.extend(
+                    (i, extra_pass, local_idx)
+                    for local_idx, i in enumerate(loop_seg)
+                )
+            all_entries.extend((i, -1, -1) for i in range(h.loop_end + 1, h.num_layers))
+            num_enc = len(all_entries) // 2
+            self.encoder_loop_entries = all_entries[:num_enc]
+            self.decoder_loop_entries = all_entries[num_enc:]
+            self.encoder_indices = [i for i, _, _ in self.encoder_loop_entries]
+            self.decoder_indices = [i for i, _, _ in self.decoder_loop_entries]
         else:
+            self.encoder_loop_entries = self.base_encoder_loop_entries
+            self.decoder_loop_entries = self.base_decoder_loop_entries
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
+        if self.loop_untie_extra_scalars:
+            self.loop_extra_attn_scale = nn.Parameter(
+                torch.zeros(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
+            )
+            self.loop_extra_mlp_scale = nn.Parameter(
+                torch.zeros(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
+            )
+            extra_resid_mix = torch.zeros(
+                h.num_loops, self.loop_width, 2, h.model_dim, dtype=torch.float32
+            )
+            extra_resid_mix[:, :, 0, :] = 1.0
+            self.loop_extra_resid_mix = nn.Parameter(extra_resid_mix)
+        else:
+            self.loop_extra_attn_scale = None
+            self.loop_extra_mlp_scale = None
+            self.loop_extra_resid_mix = None
         self.num_skip_weights = min(
             len(self.encoder_indices), len(self.decoder_indices)
         )
@@ -1103,6 +1151,19 @@ class GPT(nn.Module):
             self.mlp_down_bank[i],
         )
 
+    def _block_scalar_overrides(self, extra_pass, loop_local_idx):
+        if (
+            self.loop_extra_attn_scale is not None
+            and extra_pass >= 0
+            and loop_local_idx >= 0
+        ):
+            return (
+                self.loop_extra_resid_mix[extra_pass, loop_local_idx],
+                self.loop_extra_attn_scale[extra_pass, loop_local_idx],
+                self.loop_extra_mlp_scale[extra_pass, loop_local_idx],
+            )
+        return None, None, None
+
     def _parallel_block(
         self, block_idx, lane0, lane1, x0,
         q_w, k_w, v_w, out_w, up_w, down_w,
@@ -1151,29 +1212,30 @@ class GPT(nn.Module):
         x0 = x
         skips = []
         enc_iter = (
-            self.encoder_indices
+            self.encoder_loop_entries
             if self.looping_active
-            else range(self.num_encoder_layers)
+            else self.base_encoder_loop_entries
         )
         dec_iter = (
-            self.decoder_indices
+            self.decoder_loop_entries
             if self.looping_active
-            else range(
-                self.num_encoder_layers,
-                self.num_encoder_layers + self.num_decoder_layers,
-            )
+            else self.base_decoder_loop_entries
         )
-        for i in enc_iter:
+        for i, extra_pass, loop_local_idx in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
+            resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
+                extra_pass, loop_local_idx
+            )
             x = self.blocks[i](
                 x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
                 cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                resid_mix=resid_mix, attn_scale=attn_scale, mlp_scale=mlp_scale,
             )
             skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
-        for skip_idx, i in enumerate(dec_iter):
+        for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
                 if lane0 is None:
@@ -1202,9 +1264,13 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
+                resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
+                    extra_pass, loop_local_idx
+                )
                 x = self.blocks[i](
                     x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                    resid_mix=resid_mix, attn_scale=attn_scale, mlp_scale=mlp_scale,
                 )
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
@@ -1237,33 +1303,29 @@ class GPT(nn.Module):
         x0 = x
         skips = []
         enc_iter = (
-            self.encoder_indices
+            self.encoder_loop_entries
             if self.looping_active
-            else list(range(self.num_encoder_layers))
+            else self.base_encoder_loop_entries
         )
         dec_iter = (
-            self.decoder_indices
+            self.decoder_loop_entries
             if self.looping_active
-            else list(
-                range(
-                    self.num_encoder_layers,
-                    self.num_encoder_layers + self.num_decoder_layers,
-                )
-            )
+            else self.base_decoder_loop_entries
         )
         slot = 0
-        for i in enc_iter:
+        for i, extra_pass, loop_local_idx in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             x = self._block_with_lora(
                 self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w,
                 down_w, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                extra_pass=extra_pass, loop_local_idx=loop_local_idx,
             )
             slot += 1
             skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
-        for skip_idx, i in enumerate(dec_iter):
+        for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
                 if lane0 is None:
@@ -1297,6 +1359,7 @@ class GPT(nn.Module):
                 x = self._block_with_lora(
                     self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w,
                     down_w, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                    extra_pass=extra_pass, loop_local_idx=loop_local_idx,
                 )
             slot += 1
         if lane0 is not None:
@@ -1315,9 +1378,15 @@ class GPT(nn.Module):
 
     def _block_with_lora(
         self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
-        max_seqlen=0, rotary_slot=None,
+        max_seqlen=0, rotary_slot=None, extra_pass=-1, loop_local_idx=-1,
     ):
-        mix = block.resid_mix.to(dtype=x.dtype)
+        resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
+            extra_pass, loop_local_idx
+        )
+        mix_src = block.resid_mix if resid_mix is None else resid_mix
+        attn_scale_src = block.attn_scale if attn_scale is None else attn_scale
+        mlp_scale_src = block.mlp_scale if mlp_scale is None else mlp_scale
+        mix = mix_src.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1365,12 +1434,12 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_in + attn_scale_src.to(dtype=x_in.dtype)[None, None, :] * attn_out
         mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+        x_out = x_out + mlp_scale_src.to(dtype=x_out.dtype)[None, None, :] * mlp_out
         return x_out
 
     def _parallel_block_with_lora(
@@ -1676,7 +1745,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,loop_extra_attn_scale,loop_extra_mlp_scale,loop_extra_resid_mix,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda",
     ).split(",")
     if pattern
 )
@@ -1708,6 +1777,10 @@ class Optimizers:
             scalar_params.append(base_model.parallel_post_lambdas)
         if base_model.parallel_resid_lambdas is not None:
             scalar_params.append(base_model.parallel_resid_lambdas)
+        if getattr(base_model, "loop_extra_attn_scale", None) is not None:
+            scalar_params.append(base_model.loop_extra_attn_scale)
+            scalar_params.append(base_model.loop_extra_mlp_scale)
+            scalar_params.append(base_model.loop_extra_resid_mix)
         # SmearGate params live on GPT root (not in .blocks), so add them by hand.
         # Both are tiny (gate_window scalars + 1 lambda). Optimized via scalar Adam.
         if getattr(base_model, "smear_gate_enabled", False):
@@ -2970,6 +3043,21 @@ def train_model(h, device, val_data):
     )
     model = base_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
+    if base_model.loop_extra_attn_scale is not None:
+        extra_scalar_count = (
+            base_model.loop_extra_attn_scale.numel()
+            + base_model.loop_extra_mlp_scale.numel()
+            + base_model.loop_extra_resid_mix.numel()
+        )
+        log(
+            "loop_extra_scalars:enabled "
+            f"shape_attn:{tuple(base_model.loop_extra_attn_scale.shape)} "
+            f"shape_mlp:{tuple(base_model.loop_extra_mlp_scale.shape)} "
+            f"shape_resid_mix:{tuple(base_model.loop_extra_resid_mix.shape)} "
+            f"numel:{extra_scalar_count} raw_fp32_bytes:{4 * extra_scalar_count}"
+        )
+    elif h.num_loops > 0:
+        log("loop_extra_scalars:disabled")
     optimizers = Optimizers(h, base_model)
     train_loader = DocumentPackingLoader(h, device)
     max_wallclock_ms = (
@@ -3165,6 +3253,104 @@ def train_model(h, device, val_data):
                 f"grad_norm:{grad_norm:.8e} param_norm:{param_norm:.8e} "
                 f"grad_param_ratio:{grad_norm / max(param_norm, 1e-12):.8e}"
             )
+
+    def loop_scalar_log_path():
+        log_dir = h.artifact_dir if h.artifact_dir else "logs"
+        return os.path.join(log_dir, f"{h.run_id}_loop_extra_scalars.jsonl")
+
+    def _scalar_values(t):
+        return t.detach().float().cpu().tolist()
+
+    def _scalar_summary(t):
+        tf = t.detach().float()
+        return {
+            "mean": float(tf.mean().item()),
+            "min": float(tf.min().item()),
+            "max": float(tf.max().item()),
+            "norm": float(tf.norm().item()),
+        }
+
+    def loop_scalar_log_active(step):
+        if (
+            not h.loop_scalar_log_enabled
+            or h.loop_scalar_log_every <= 0
+            or base_model.loop_extra_attn_scale is None
+        ):
+            return False
+        if h.loop_scalar_log_start_step >= 0 and h.loop_scalar_log_end_step > h.loop_scalar_log_start_step:
+            start, end = h.loop_scalar_log_start_step, h.loop_scalar_log_end_step
+        elif h.bump_obs_start_step >= 0 and h.bump_obs_end_step > h.bump_obs_start_step:
+            start, end = h.bump_obs_start_step, h.bump_obs_end_step
+        elif h.enable_looping_step >= 0:
+            start = h.enable_looping_step - h.loop_scalar_log_pre_steps
+            end = h.enable_looping_step + h.loop_scalar_log_post_steps
+        elif max_wallclock_ms is None:
+            bump_step = int(math.ceil(h.enable_looping_at * h.iterations))
+            start = bump_step - h.loop_scalar_log_pre_steps
+            end = bump_step + h.loop_scalar_log_post_steps
+        else:
+            return False
+        start = max(start, 0)
+        return start <= step < end and (step - start) % h.loop_scalar_log_every == 0
+
+    def write_control_scalar_record(step, frac, phase, reason, include_all_control=False):
+        if not h.is_main_process or not h.loop_scalar_log_enabled:
+            return
+        if base_model.loop_extra_attn_scale is None and not include_all_control:
+            return
+        path = loop_scalar_log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        record = {
+            "step": int(step),
+            "frac": float(frac),
+            "phase": phase,
+            "reason": reason,
+            "looping_active": bool(base_model.looping_active),
+            "encoder_indices": list(base_model.encoder_indices),
+            "decoder_indices": list(base_model.decoder_indices),
+        }
+        if base_model.loop_extra_attn_scale is not None:
+            record["loop_extra"] = {
+                "attn_scale": _scalar_values(base_model.loop_extra_attn_scale),
+                "mlp_scale": _scalar_values(base_model.loop_extra_mlp_scale),
+                "resid_mix": _scalar_values(base_model.loop_extra_resid_mix),
+                "summaries": {
+                    "attn_scale": _scalar_summary(base_model.loop_extra_attn_scale),
+                    "mlp_scale": _scalar_summary(base_model.loop_extra_mlp_scale),
+                    "resid_mix": _scalar_summary(base_model.loop_extra_resid_mix),
+                },
+            }
+        if include_all_control:
+            record["blocks"] = []
+            for i, block in enumerate(base_model.blocks):
+                block_record = {
+                    "layer": i,
+                    "looped": bool(h.loop_start <= i <= h.loop_end),
+                    "attn_scale": _scalar_values(block.attn_scale),
+                    "mlp_scale": _scalar_values(block.mlp_scale),
+                    "resid_mix": _scalar_values(block.resid_mix),
+                    "q_gain": _scalar_values(block.attn.q_gain),
+                }
+                if getattr(block.attn, "attn_out_gate", False):
+                    block_record["attn_gate_proj_weight"] = _scalar_values(
+                        block.attn.attn_gate_proj.weight
+                    )
+                if getattr(block.attn, "gated_attn", False):
+                    block_record["attn_gate_w"] = _scalar_values(block.attn.attn_gate_w)
+                record["blocks"].append(block_record)
+            record["skip_weights"] = _scalar_values(base_model.skip_weights)
+            if base_model.skip_gates is not None:
+                record["skip_gates"] = _scalar_values(base_model.skip_gates)
+            record["parallel_post_lambdas"] = _scalar_values(base_model.parallel_post_lambdas)
+            record["parallel_resid_lambdas"] = _scalar_values(base_model.parallel_resid_lambdas)
+            record["parallel_final_lane"] = base_model.parallel_final_lane
+            if getattr(base_model, "smear_gate_enabled", False):
+                record["smear_lambda"] = _scalar_values(base_model.smear_lambda)
+                record["smear_gate_weight"] = _scalar_values(base_model.smear_gate.weight)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        if reason != "bump_step":
+            log(f"control_scalars_jsonl reason:{reason} step:{step} path:{path}")
 
     def lr_mul(frac):
         if h.warmdown_frac <= 0:
@@ -3405,6 +3591,8 @@ def train_model(h, device, val_data):
             )
         active_train_forward = compiled_train_long if bumped else compiled_train_short
         train_loss = step_fn(step, scale, active_train_forward, obs_phase, frac)
+        if loop_scalar_log_active(step):
+            write_control_scalar_record(step, frac, obs_phase, "bump_step")
         with torch.no_grad():
             for (name, t) in base_model.state_dict().items():
                 ema_state[name].mul_(ema_decay).add_(
@@ -3432,12 +3620,14 @@ def train_model(h, device, val_data):
     log(
         f"peak memory allocated: {torch.cuda.max_memory_allocated()//1024//1024} MiB reserved: {torch.cuda.max_memory_reserved()//1024//1024} MiB"
     )
+    write_control_scalar_record(step, 1.0, "final", "final_pre_ema", include_all_control=True)
     log("ema:applying EMA weights")
     current_state = base_model.state_dict()
     avg_state = {
         name: t.to(dtype=current_state[name].dtype) for (name, t) in ema_state.items()
     }
     base_model.load_state_dict(avg_state, strict=True)
+    write_control_scalar_record(step, 1.0, "final", "final_post_ema", include_all_control=True)
     return base_model, base_model, compiled_forward_logits_long
 
 

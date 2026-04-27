@@ -1,0 +1,1000 @@
+W0426 22:12:49.529000 16766 torch/distributed/run.py:803] 
+W0426 22:12:49.529000 16766 torch/distributed/run.py:803] *****************************************
+W0426 22:12:49.529000 16766 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0426 22:12:49.529000 16766 torch/distributed/run.py:803] *****************************************
+[W426 22:13:01.722419450 Utils.hpp:137] Warning: Environment variable TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated; use TORCH_FR_BUFFER_SIZE instead (function operator())
+[W426 22:13:01.726431009 Utils.hpp:137] Warning: Environment variable TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated; use TORCH_FR_BUFFER_SIZE instead (function operator())
+[W426 22:13:01.726661506 Utils.hpp:137] Warning: Environment variable TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated; use TORCH_FR_BUFFER_SIZE instead (function operator())
+[W426 22:13:01.729967577 Utils.hpp:137] Warning: Environment variable TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated; use TORCH_FR_BUFFER_SIZE instead (function operator())
+[W426 22:13:01.730292184 Utils.hpp:137] Warning: Environment variable TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated; use TORCH_FR_BUFFER_SIZE instead (function operator())
+[W426 22:13:01.732816520 Utils.hpp:137] Warning: Environment variable TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated; use TORCH_FR_BUFFER_SIZE instead (function operator())
+[W426 22:13:01.734612696 Utils.hpp:137] Warning: Environment variable TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated; use TORCH_FR_BUFFER_SIZE instead (function operator())
+[W426 22:13:01.734644866 Utils.hpp:137] Warning: Environment variable TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated; use TORCH_FR_BUFFER_SIZE instead (function operator())
+Hyperparameters:
+  adam_eps: 1e-08
+  adam_wd: 0.02
+  artifact_dir: 
+  attn_clip_sigmas: 13.0
+  attn_out_gate_enabled: False
+  attn_out_gate_src: proj
+  beta1: 0.9
+  beta2: 0.95
+  bump_obs_counterfactual: True
+  bump_obs_enabled: True
+  bump_obs_end_step: -1
+  bump_obs_every: 1
+  bump_obs_layer_stats: True
+  bump_obs_n: 20
+  bump_obs_post_late_offset: 100
+  bump_obs_probe_batches: 4
+  bump_obs_start_step: -1
+  caseops_enabled: True
+  compressor: brotli
+  data_dir: .
+  datasets_dir: ./datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved
+  distributed: True
+  ema_decay: 0.9965
+  embed_bits: 7
+  embed_clip_sigmas: 15.0
+  embed_lr: 0.6
+  embed_wd: 0.085
+  enable_looping_at: 999.0
+  enable_looping_step: 2200
+  eval_only_path: 
+  eval_seq_len: 8192
+  eval_stride: 64
+  force_serialize_in_eval_only: False
+  gate_window: 12
+  gated_attn_enabled: True
+  gated_attn_init_std: 0.005
+  gated_attn_quant_gate: True
+  global_ttt_batch_seqs: 32
+  global_ttt_chunk_tokens: 65536
+  global_ttt_epochs: 1
+  global_ttt_grad_clip: 1.0
+  global_ttt_lr: 0.001
+  global_ttt_momentum: 0.9
+  global_ttt_respect_doc_boundaries: True
+  global_ttt_warmup_chunks: 0
+  global_ttt_warmup_start_lr: 0.0
+  gptq_calibration_batches: 16
+  gptq_reserve_seconds: 4.0
+  grad_accum_steps: 1
+  grad_clip_norm: 0.3
+  is_main_process: True
+  iterations: 20000
+  ln_scale: True
+  local_rank: 0
+  logfile: logs/9ae4269b-f624-4547-ab84-2279c1f14475.txt
+  logit_softcap: 30.0
+  loop_end: 5
+  loop_ramp_steps: 0
+  loop_scalar_log_enabled: True
+  loop_scalar_log_end_step: -1
+  loop_scalar_log_every: 1
+  loop_scalar_log_post_steps: 400
+  loop_scalar_log_pre_steps: 100
+  loop_scalar_log_start_step: -1
+  loop_start: 3
+  loop_untie_extra_scalars: True
+  matrix_bits: 6
+  matrix_clip_sigmas: 12.85
+  matrix_lr: 0.026
+  max_wallclock_seconds: 600.0
+  min_lr: 0.0
+  mlp_clip_sigmas: 12.0
+  mlp_mult: 4.0
+  model_dim: 512
+  model_path: final_model.pt
+  muon_backend_steps: 5
+  muon_momentum: 0.97
+  muon_momentum_warmup_start: 0.92
+  muon_momentum_warmup_steps: 1500
+  muon_row_normalize: True
+  muon_wd: 0.095
+  num_heads: 8
+  num_kv_heads: 4
+  num_layers: 11
+  num_loops: 2
+  parallel_final_lane: mean
+  parallel_start_layer: 8
+  phased_ttt_num_phases: 3
+  phased_ttt_prefix_docs: 2000
+  qk_gain_init: 5.0
+  quantized_model_path: final_model.int6.ptz
+  rank: 0
+  rope_base: 10000.0
+  rope_dims: 16
+  rope_train_seq_len: 2048
+  rope_yarn: True
+  run_id: 9ae4269b-f624-4547-ab84-2279c1f14475
+  scalar_lr: 0.02
+  seed: 1337
+  seq_len_bump_frac: 0.85
+  skip_gates_enabled: True
+  smear_gate_enabled: False
+  tie_embeddings: True
+  tied_embed_init_std: 0.005
+  tied_embed_lr: 0.03
+  tokenizer_path: ./tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model
+  train_batch_tokens: 786432
+  train_files: ./datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved/fineweb_train_*.bin
+  train_log_every: 500
+  train_seq_len: 2048
+  train_seq_len_end: 8192
+  ttt_batch_size: 16
+  ttt_beta1: 0.0
+  ttt_beta2: 0.999
+  ttt_chunk_size: 64
+  ttt_enabled: True
+  ttt_eval_batches: 
+  ttt_eval_seq_len: 8192
+  ttt_grad_steps: 1
+  ttt_k_lora: True
+  ttt_lora_lr: 7.5e-05
+  ttt_lora_rank: 96
+  ttt_mlp_lora: True
+  ttt_o_lora: True
+  ttt_optimizer: adam
+  ttt_weight_decay: 0.5
+  val_batch_tokens: 524288
+  val_bytes_files: ./datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved/fineweb_val_bytes_*.bin
+  val_doc_fraction: 1.0
+  val_files: ./datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved/fineweb_val_*.bin
+  val_loss_every: 4000
+  vocab_size: 8192
+  warmdown_frac: 0.75
+  warmup_steps: 20
+  world_size: 8
+  xsa_last_n: 11
+train_shards: 80
+val_tokens: 47849472
+model_params:36001946
+loop_extra_scalars:enabled shape_attn:(2, 3, 512) shape_mlp:(2, 3, 512) shape_resid_mix:(2, 3, 2, 512) numel:12288 raw_fp32_bytes:49152
+gptq:reserving 4s, effective=596000ms
+warmup_cu_buckets:64,128,192,256 iters_each:3
+warmup_step: 1/20
+warmup_step: 2/20
+warmup_step: 3/20
+warmup_step: 4/20
+warmup_step: 5/20
+warmup_step: 6/20
+warmup_step: 10/20
+warmup_step: 20/20
+loop_warmup:enabled encoder:[0, 1, 2, 3, 4, 5, 3, 4] decoder:[5, 3, 4, 5, 6, 7, 8, 9, 10]
+loop_warmup_step: 1/20
+loop_warmup_step: 2/20
+loop_warmup_step: 3/20
+loop_warmup_step: 4/20
+loop_warmup_step: 5/20
+loop_warmup_step: 6/20
+loop_warmup_step: 10/20
+loop_warmup_step: 20/20
+bump_prewarm:seq_len:2048->8192 looping:1
+bump_loop_warmup_step: 1/20
+bump_loop_warmup_step: 2/20
+bump_loop_warmup_step: 3/20
+bump_loop_warmup_step: 4/20
+bump_loop_warmup_step: 5/20
+bump_loop_warmup_step: 6/20
+bump_loop_warmup_step: 10/20
+bump_loop_warmup_step: 20/20
+0/20000 val_loss: 9.0034 val_bpb: 4.1142
+1/20000 train_loss: 9.0036 train_time: 0.0m tok/s: 12369635
+2/20000 train_loss: 12.9209 train_time: 0.0m tok/s: 11366462
+3/20000 train_loss: 10.2061 train_time: 0.0m tok/s: 10092958
+4/20000 train_loss: 8.6129 train_time: 0.0m tok/s: 9589549
+5/20000 train_loss: 7.8274 train_time: 0.0m tok/s: 9289402
+500/20000 train_loss: 2.5832 train_time: 0.8m tok/s: 8088500
+1000/20000 train_loss: 2.8046 train_time: 1.6m tok/s: 8049713
+1500/20000 train_loss: 2.6353 train_time: 2.4m tok/s: 8039470
+2000/20000 train_loss: 2.6694 train_time: 3.3m tok/s: 8039147
+bump_probe step:2180 frac:0.358636 phase:pre loop_active:0 loss:2.57478502 bpb:1.18468521 eval_time:111ms
+bump_counterfactual step:2180 frac:0.358636 phase:pre p_loop:0.000000 policy_loss:2.57478502 policy_bpb:1.18468521 loop_off_loss:2.57478502 loop_off_bpb:1.18468521 loop_on_loss:2.87955092 loop_on_bpb:1.32491116 delta_loss:0.30476590 delta_bpb:0.14022594
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:0 looped:0 grad_norm:4.81814365e-02 param_norm:1.36131975e+02 grad_param_ratio:3.53931811e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:1 looped:0 grad_norm:4.44842264e-02 param_norm:1.36185747e+02 grad_param_ratio:3.26643773e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:2 looped:0 grad_norm:4.32515282e-02 param_norm:1.37539758e+02 grad_param_ratio:3.14465642e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:3 looped:1 grad_norm:4.72565216e-02 param_norm:1.35757931e+02 grad_param_ratio:3.48094004e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:4 looped:1 grad_norm:4.20703973e-02 param_norm:1.36848904e+02 grad_param_ratio:3.07422244e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:5 looped:1 grad_norm:3.79301152e-02 param_norm:1.36685830e+02 grad_param_ratio:2.77498517e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:6 looped:0 grad_norm:3.91470157e-02 param_norm:1.38801898e+02 grad_param_ratio:2.82035161e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:7 looped:0 grad_norm:4.04521006e-02 param_norm:1.38700949e+02 grad_param_ratio:2.91649775e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:8 looped:0 grad_norm:4.82535395e-02 param_norm:1.40748332e+02 grad_param_ratio:3.42835604e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:9 looped:0 grad_norm:4.28597292e-02 param_norm:1.41312869e+02 grad_param_ratio:3.03296717e-04
+bump_layer_stats step:2180 frac:0.358636 phase:pre layer:10 looped:0 grad_norm:7.60310244e-02 param_norm:1.36325127e+02 grad_param_ratio:5.57718347e-04
+bump_probe step:2181 frac:0.358819 phase:pre loop_active:0 loss:2.58090011 bpb:1.18749883 eval_time:109ms
+bump_counterfactual step:2181 frac:0.358819 phase:pre p_loop:0.000000 policy_loss:2.58090011 policy_bpb:1.18749883 loop_off_loss:2.58090011 loop_off_bpb:1.18749883 loop_on_loss:2.88097365 loop_on_bpb:1.32556577 delta_loss:0.30007354 delta_bpb:0.13806694
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:0 looped:0 grad_norm:5.54442802e-02 param_norm:1.36122625e+02 grad_param_ratio:4.07311276e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:1 looped:0 grad_norm:4.96675724e-02 param_norm:1.36183545e+02 grad_param_ratio:3.64710526e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:2 looped:0 grad_norm:4.79781171e-02 param_norm:1.37535442e+02 grad_param_ratio:3.48841844e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:3 looped:1 grad_norm:5.26830542e-02 param_norm:1.35753997e+02 grad_param_ratio:3.88077370e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:4 looped:1 grad_norm:4.74891683e-02 param_norm:1.36843857e+02 grad_param_ratio:3.47031787e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:5 looped:1 grad_norm:4.16977263e-02 param_norm:1.36683844e+02 grad_param_ratio:3.05066972e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:6 looped:0 grad_norm:4.24076565e-02 param_norm:1.38797000e+02 grad_param_ratio:3.05537270e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:7 looped:0 grad_norm:4.26872418e-02 param_norm:1.38700059e+02 grad_param_ratio:3.07766572e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:8 looped:0 grad_norm:5.24156823e-02 param_norm:1.40739762e+02 grad_param_ratio:3.72429806e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:9 looped:0 grad_norm:4.62290171e-02 param_norm:1.41304012e+02 grad_param_ratio:3.27159974e-04
+bump_layer_stats step:2181 frac:0.358819 phase:pre layer:10 looped:0 grad_norm:7.45473770e-02 param_norm:1.36316641e+02 grad_param_ratio:5.46869234e-04
+bump_probe step:2182 frac:0.358996 phase:pre loop_active:0 loss:2.57403427 bpb:1.18433978 eval_time:109ms
+bump_counterfactual step:2182 frac:0.358996 phase:pre p_loop:0.000000 policy_loss:2.57403427 policy_bpb:1.18433978 loop_off_loss:2.57403427 loop_off_bpb:1.18433978 loop_on_loss:2.87565645 loop_on_bpb:1.32311927 delta_loss:0.30162218 delta_bpb:0.13877948
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:0 looped:0 grad_norm:4.54643547e-02 param_norm:1.36112204e+02 grad_param_ratio:3.34021149e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:1 looped:0 grad_norm:4.07955652e-02 param_norm:1.36170139e+02 grad_param_ratio:2.99592594e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:2 looped:0 grad_norm:4.21914238e-02 param_norm:1.37524179e+02 grad_param_ratio:3.06792771e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:3 looped:1 grad_norm:4.60997342e-02 param_norm:1.35741379e+02 grad_param_ratio:3.39614454e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:4 looped:1 grad_norm:4.31377845e-02 param_norm:1.36834161e+02 grad_param_ratio:3.15255959e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:5 looped:1 grad_norm:3.86388930e-02 param_norm:1.36663141e+02 grad_param_ratio:2.82730901e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:6 looped:0 grad_norm:3.87181658e-02 param_norm:1.38780089e+02 grad_param_ratio:2.78989343e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:7 looped:0 grad_norm:3.89089252e-02 param_norm:1.38686951e+02 grad_param_ratio:2.80552172e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:8 looped:0 grad_norm:4.19294894e-02 param_norm:1.40724888e+02 grad_param_ratio:2.97953617e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:9 looped:0 grad_norm:3.98576536e-02 param_norm:1.41291713e+02 grad_param_ratio:2.82094772e-04
+bump_layer_stats step:2182 frac:0.358996 phase:pre layer:10 looped:0 grad_norm:7.01091217e-02 param_norm:1.36303045e+02 grad_param_ratio:5.14362109e-04
+bump_probe step:2183 frac:0.359173 phase:pre loop_active:0 loss:2.57788011 bpb:1.18610930 eval_time:109ms
+bump_counterfactual step:2183 frac:0.359173 phase:pre p_loop:0.000000 policy_loss:2.57788011 policy_bpb:1.18610930 loop_off_loss:2.57788011 loop_off_bpb:1.18610930 loop_on_loss:2.88286979 loop_on_bpb:1.32643820 delta_loss:0.30498968 delta_bpb:0.14032890
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:0 looped:0 grad_norm:4.54855524e-02 param_norm:1.36108748e+02 grad_param_ratio:3.34185370e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:1 looped:0 grad_norm:4.22583736e-02 param_norm:1.36171053e+02 grad_param_ratio:3.10333017e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:2 looped:0 grad_norm:3.99698212e-02 param_norm:1.37522487e+02 grad_param_ratio:2.90642078e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:3 looped:1 grad_norm:4.20578830e-02 param_norm:1.35738735e+02 grad_param_ratio:3.09844371e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:4 looped:1 grad_norm:3.82679912e-02 param_norm:1.36828941e+02 grad_param_ratio:2.79677610e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:5 looped:1 grad_norm:3.48957680e-02 param_norm:1.36662099e+02 grad_param_ratio:2.55343423e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:6 looped:0 grad_norm:3.62297020e-02 param_norm:1.38772799e+02 grad_param_ratio:2.61072071e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:7 looped:0 grad_norm:3.70091490e-02 param_norm:1.38678827e+02 grad_param_ratio:2.66869499e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:8 looped:0 grad_norm:4.03169089e-02 param_norm:1.40711100e+02 grad_param_ratio:2.86522591e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:9 looped:0 grad_norm:3.82061017e-02 param_norm:1.41277142e+02 grad_param_ratio:2.70433710e-04
+bump_layer_stats step:2183 frac:0.359173 phase:pre layer:10 looped:0 grad_norm:6.86641771e-02 param_norm:1.36293110e+02 grad_param_ratio:5.03797860e-04
+bump_probe step:2184 frac:0.359351 phase:pre loop_active:0 loss:2.57363319 bpb:1.18415525 eval_time:110ms
+bump_counterfactual step:2184 frac:0.359351 phase:pre p_loop:0.000000 policy_loss:2.57363319 policy_bpb:1.18415525 loop_off_loss:2.57363319 loop_off_bpb:1.18415525 loop_on_loss:2.86639426 loop_on_bpb:1.31885764 delta_loss:0.29276107 delta_bpb:0.13470239
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:0 looped:0 grad_norm:4.97334387e-02 param_norm:1.36102054e+02 grad_param_ratio:3.65412845e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:1 looped:0 grad_norm:4.42729749e-02 param_norm:1.36164449e+02 grad_param_ratio:3.25143421e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:2 looped:0 grad_norm:4.34359829e-02 param_norm:1.37520931e+02 grad_param_ratio:3.15849976e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:3 looped:1 grad_norm:4.44499031e-02 param_norm:1.35734677e+02 grad_param_ratio:3.27476397e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:4 looped:1 grad_norm:4.11216319e-02 param_norm:1.36823863e+02 grad_param_ratio:3.00544299e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:5 looped:1 grad_norm:3.83654880e-02 param_norm:1.36651441e+02 grad_param_ratio:2.80754360e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:6 looped:0 grad_norm:4.07274711e-02 param_norm:1.38763979e+02 grad_param_ratio:2.93501752e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:7 looped:0 grad_norm:4.18494096e-02 param_norm:1.38671142e+02 grad_param_ratio:3.01788888e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:8 looped:0 grad_norm:4.56651889e-02 param_norm:1.40704980e+02 grad_param_ratio:3.24545648e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:9 looped:0 grad_norm:4.48338489e-02 param_norm:1.41274307e+02 grad_param_ratio:3.17353169e-04
+bump_layer_stats step:2184 frac:0.359351 phase:pre layer:10 looped:0 grad_norm:8.19301088e-02 param_norm:1.36287471e+02 grad_param_ratio:6.01156573e-04
+bump_probe step:2185 frac:0.359526 phase:pre loop_active:0 loss:2.58277496 bpb:1.18836147 eval_time:110ms
+bump_counterfactual step:2185 frac:0.359526 phase:pre p_loop:0.000000 policy_loss:2.58277496 policy_bpb:1.18836147 loop_off_loss:2.58277496 loop_off_bpb:1.18836147 loop_on_loss:2.89645675 loop_on_bpb:1.33268970 delta_loss:0.31368179 delta_bpb:0.14432824
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:0 looped:0 grad_norm:6.37745430e-02 param_norm:1.36096861e+02 grad_param_ratio:4.68596721e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:1 looped:0 grad_norm:6.35007814e-02 param_norm:1.36157417e+02 grad_param_ratio:4.66377688e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:2 looped:0 grad_norm:6.28622773e-02 param_norm:1.37510988e+02 grad_param_ratio:4.57143668e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:3 looped:1 grad_norm:7.21173530e-02 param_norm:1.35725159e+02 grad_param_ratio:5.31348452e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:4 looped:1 grad_norm:6.08547466e-02 param_norm:1.36816647e+02 grad_param_ratio:4.44790512e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:5 looped:1 grad_norm:5.25794930e-02 param_norm:1.36646229e+02 grad_param_ratio:3.84785541e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:6 looped:0 grad_norm:5.41862438e-02 param_norm:1.38750812e+02 grad_param_ratio:3.90529202e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:7 looped:0 grad_norm:5.45206929e-02 param_norm:1.38657350e+02 grad_param_ratio:3.93204492e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:8 looped:0 grad_norm:6.09105999e-02 param_norm:1.40687223e+02 grad_param_ratio:4.32950474e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:9 looped:0 grad_norm:6.03743632e-02 param_norm:1.41257293e+02 grad_param_ratio:4.27407052e-04
+bump_layer_stats step:2185 frac:0.359526 phase:pre layer:10 looped:0 grad_norm:1.00669889e-01 param_norm:1.36273882e+02 grad_param_ratio:7.38732089e-04
+bump_probe step:2186 frac:0.359707 phase:pre loop_active:0 loss:2.57487576 bpb:1.18472696 eval_time:109ms
+bump_counterfactual step:2186 frac:0.359707 phase:pre p_loop:0.000000 policy_loss:2.57487576 policy_bpb:1.18472696 loop_off_loss:2.57487576 loop_off_bpb:1.18472696 loop_on_loss:2.86796932 loop_on_bpb:1.31958234 delta_loss:0.29309356 delta_bpb:0.13485538
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:0 looped:0 grad_norm:4.98094972e-02 param_norm:1.36089010e+02 grad_param_ratio:3.66006756e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:1 looped:0 grad_norm:4.40135616e-02 param_norm:1.36147292e+02 grad_param_ratio:3.23279009e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:2 looped:0 grad_norm:4.40585213e-02 param_norm:1.37505574e+02 grad_param_ratio:3.20412621e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:3 looped:1 grad_norm:4.54965425e-02 param_norm:1.35721361e+02 grad_param_ratio:3.35220205e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:4 looped:1 grad_norm:4.31531612e-02 param_norm:1.36812040e+02 grad_param_ratio:3.15419325e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:5 looped:1 grad_norm:3.91605003e-02 param_norm:1.36634575e+02 grad_param_ratio:2.86607547e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:6 looped:0 grad_norm:4.12779558e-02 param_norm:1.38740670e+02 grad_param_ratio:2.97518788e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:7 looped:0 grad_norm:4.17806923e-02 param_norm:1.38649049e+02 grad_param_ratio:3.01341354e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:8 looped:0 grad_norm:4.44400880e-02 param_norm:1.40677938e+02 grad_param_ratio:3.15899485e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:9 looped:0 grad_norm:4.41605987e-02 param_norm:1.41250276e+02 grad_param_ratio:3.12640795e-04
+bump_layer_stats step:2186 frac:0.359707 phase:pre layer:10 looped:0 grad_norm:8.45749564e-02 param_norm:1.36262505e+02 grad_param_ratio:6.20676661e-04
+bump_probe step:2187 frac:0.359888 phase:pre loop_active:0 loss:2.58198512 bpb:1.18799806 eval_time:110ms
+bump_counterfactual step:2187 frac:0.359888 phase:pre p_loop:0.000000 policy_loss:2.58198512 policy_bpb:1.18799806 loop_off_loss:2.58198512 loop_off_bpb:1.18799806 loop_on_loss:2.89065171 loop_on_bpb:1.33001875 delta_loss:0.30866659 delta_bpb:0.14202069
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:0 looped:0 grad_norm:4.88306972e-02 param_norm:1.36087627e+02 grad_param_ratio:3.58818051e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:1 looped:0 grad_norm:4.35229204e-02 param_norm:1.36143311e+02 grad_param_ratio:3.19684603e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:2 looped:0 grad_norm:4.21725179e-02 param_norm:1.37496330e+02 grad_param_ratio:3.06717408e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:3 looped:1 grad_norm:4.65772361e-02 param_norm:1.35712464e+02 grad_param_ratio:3.43205294e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:4 looped:1 grad_norm:4.45547585e-02 param_norm:1.36805075e+02 grad_param_ratio:3.25680597e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:5 looped:1 grad_norm:3.94941838e-02 param_norm:1.36631896e+02 grad_param_ratio:2.89055374e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:6 looped:0 grad_norm:4.04937523e-02 param_norm:1.38732347e+02 grad_param_ratio:2.91884000e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:7 looped:0 grad_norm:4.05341801e-02 param_norm:1.38641966e+02 grad_param_ratio:2.92365878e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:8 looped:0 grad_norm:4.58088666e-02 param_norm:1.40665498e+02 grad_param_ratio:3.25658156e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:9 looped:0 grad_norm:4.01297161e-02 param_norm:1.41233923e+02 grad_param_ratio:2.84136526e-04
+bump_layer_stats step:2187 frac:0.359888 phase:pre layer:10 looped:0 grad_norm:7.04250966e-02 param_norm:1.36248709e+02 grad_param_ratio:5.16886341e-04
+bump_probe step:2188 frac:0.360068 phase:pre loop_active:0 loss:2.57465131 bpb:1.18462369 eval_time:109ms
+bump_counterfactual step:2188 frac:0.360068 phase:pre p_loop:0.000000 policy_loss:2.57465131 policy_bpb:1.18462369 loop_off_loss:2.57465131 loop_off_bpb:1.18462369 loop_on_loss:2.87037244 loop_on_bpb:1.32068804 delta_loss:0.29572113 delta_bpb:0.13606435
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:0 looped:0 grad_norm:5.18072034e-02 param_norm:1.36084281e+02 grad_param_ratio:3.80699393e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:1 looped:0 grad_norm:4.61077670e-02 param_norm:1.36139825e+02 grad_param_ratio:3.38679494e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:2 looped:0 grad_norm:4.57181101e-02 param_norm:1.37495478e+02 grad_param_ratio:3.32506280e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:3 looped:1 grad_norm:5.09863898e-02 param_norm:1.35709120e+02 grad_param_ratio:3.75703489e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:4 looped:1 grad_norm:4.80522052e-02 param_norm:1.36803188e+02 grad_param_ratio:3.51250625e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:5 looped:1 grad_norm:4.15416604e-02 param_norm:1.36622309e+02 grad_param_ratio:3.04062058e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:6 looped:0 grad_norm:4.15978265e-02 param_norm:1.38720683e+02 grad_param_ratio:2.99867515e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:7 looped:0 grad_norm:4.04622163e-02 param_norm:1.38633228e+02 grad_param_ratio:2.91865211e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:8 looped:0 grad_norm:4.85937550e-02 param_norm:1.40659857e+02 grad_param_ratio:3.45469958e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:9 looped:0 grad_norm:4.13046149e-02 param_norm:1.41234380e+02 grad_param_ratio:2.92454393e-04
+bump_layer_stats step:2188 frac:0.360068 phase:pre layer:10 looped:0 grad_norm:7.16932877e-02 param_norm:1.36244279e+02 grad_param_ratio:5.26211362e-04
+bump_probe step:2189 frac:0.360246 phase:pre loop_active:0 loss:2.58475798 bpb:1.18927388 eval_time:109ms
+bump_counterfactual step:2189 frac:0.360246 phase:pre p_loop:0.000000 policy_loss:2.58475798 policy_bpb:1.18927388 loop_off_loss:2.58475798 loop_off_bpb:1.18927388 loop_on_loss:2.89732311 loop_on_bpb:1.33308832 delta_loss:0.31256513 delta_bpb:0.14381445
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:0 looped:0 grad_norm:5.75144486e-02 param_norm:1.36078223e+02 grad_param_ratio:4.22657257e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:1 looped:0 grad_norm:5.06457684e-02 param_norm:1.36131172e+02 grad_param_ratio:3.72036526e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:2 looped:0 grad_norm:4.91250365e-02 param_norm:1.37480323e+02 grad_param_ratio:3.57324128e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:3 looped:1 grad_norm:5.18126338e-02 param_norm:1.35693689e+02 grad_param_ratio:3.81835250e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:4 looped:1 grad_norm:4.86388383e-02 param_norm:1.36791442e+02 grad_param_ratio:3.55569308e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:5 looped:1 grad_norm:4.42126261e-02 param_norm:1.36612907e+02 grad_param_ratio:3.23634325e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:6 looped:0 grad_norm:4.47113138e-02 param_norm:1.38712237e+02 grad_param_ratio:3.22331431e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:7 looped:0 grad_norm:4.28312924e-02 param_norm:1.38625077e+02 grad_param_ratio:3.08972181e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:8 looped:0 grad_norm:4.81746199e-02 param_norm:1.40643727e+02 grad_param_ratio:3.42529460e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:9 looped:0 grad_norm:4.15131955e-02 param_norm:1.41215661e+02 grad_param_ratio:2.93970196e-04
+bump_layer_stats step:2189 frac:0.360246 phase:pre layer:10 looped:0 grad_norm:6.46484681e-02 param_norm:1.36226800e+02 grad_param_ratio:4.74564978e-04
+bump_probe step:2190 frac:0.360423 phase:pre loop_active:0 loss:2.57856691 bpb:1.18642530 eval_time:109ms
+bump_counterfactual step:2190 frac:0.360423 phase:pre p_loop:0.000000 policy_loss:2.57856691 policy_bpb:1.18642530 loop_off_loss:2.57856691 loop_off_bpb:1.18642530 loop_on_loss:2.86930011 loop_on_bpb:1.32019465 delta_loss:0.29073320 delta_bpb:0.13376935
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:0 looped:0 grad_norm:5.24907100e-02 param_norm:1.36068406e+02 grad_param_ratio:3.85767067e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:1 looped:0 grad_norm:4.70181754e-02 param_norm:1.36123921e+02 grad_param_ratio:3.45407149e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:2 looped:0 grad_norm:4.56376454e-02 param_norm:1.37473237e+02 grad_param_ratio:3.31974763e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:3 looped:1 grad_norm:5.06197711e-02 param_norm:1.35684483e+02 grad_param_ratio:3.73069712e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:4 looped:1 grad_norm:4.91204000e-02 param_norm:1.36784906e+02 grad_param_ratio:3.59106875e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:5 looped:1 grad_norm:4.34920489e-02 param_norm:1.36604503e+02 grad_param_ratio:3.18379321e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:6 looped:0 grad_norm:4.26775658e-02 param_norm:1.38701549e+02 grad_param_ratio:3.07693504e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:7 looped:0 grad_norm:4.15443445e-02 param_norm:1.38615687e+02 grad_param_ratio:2.99708824e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:8 looped:0 grad_norm:4.68656252e-02 param_norm:1.40637304e+02 grad_param_ratio:3.33237511e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:9 looped:0 grad_norm:4.25705883e-02 param_norm:1.41210230e+02 grad_param_ratio:3.01469577e-04
+bump_layer_stats step:2190 frac:0.360423 phase:pre layer:10 looped:0 grad_norm:7.16018315e-02 param_norm:1.36221462e+02 grad_param_ratio:5.25628126e-04
+bump_probe step:2191 frac:0.360601 phase:pre loop_active:0 loss:2.58330898 bpb:1.18860718 eval_time:109ms
+bump_counterfactual step:2191 frac:0.360601 phase:pre p_loop:0.000000 policy_loss:2.58330898 policy_bpb:1.18860718 loop_off_loss:2.58330898 loop_off_bpb:1.18860718 loop_on_loss:2.90223257 loop_on_bpb:1.33534722 delta_loss:0.31892359 delta_bpb:0.14674004
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:0 looped:0 grad_norm:5.58272926e-02 param_norm:1.36061995e+02 grad_param_ratio:4.10307761e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:1 looped:0 grad_norm:4.79172264e-02 param_norm:1.36115910e+02 grad_param_ratio:3.52032518e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:2 looped:0 grad_norm:4.42065988e-02 param_norm:1.37456401e+02 grad_param_ratio:3.21604513e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:3 looped:1 grad_norm:4.67051406e-02 param_norm:1.35672035e+02 grad_param_ratio:3.44250313e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:4 looped:1 grad_norm:4.41453408e-02 param_norm:1.36772858e+02 grad_param_ratio:3.22763897e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:5 looped:1 grad_norm:4.00069815e-02 param_norm:1.36591253e+02 grad_param_ratio:2.92895632e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:6 looped:0 grad_norm:4.13685252e-02 param_norm:1.38689612e+02 grad_param_ratio:2.98281353e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:7 looped:0 grad_norm:4.14291961e-02 param_norm:1.38606443e+02 grad_param_ratio:2.98898053e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:8 looped:0 grad_norm:4.54231809e-02 param_norm:1.40624704e+02 grad_param_ratio:3.23009967e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:9 looped:0 grad_norm:4.30226848e-02 param_norm:1.41193846e+02 grad_param_ratio:3.04706515e-04
+bump_layer_stats step:2191 frac:0.360601 phase:pre layer:10 looped:0 grad_norm:7.53967405e-02 param_norm:1.36205592e+02 grad_param_ratio:5.53550993e-04
+bump_probe step:2192 frac:0.360779 phase:pre loop_active:0 loss:2.57796195 bpb:1.18614695 eval_time:109ms
+bump_counterfactual step:2192 frac:0.360779 phase:pre p_loop:0.000000 policy_loss:2.57796195 policy_bpb:1.18614695 loop_off_loss:2.57796195 loop_off_bpb:1.18614695 loop_on_loss:2.86388061 loop_on_bpb:1.31770109 delta_loss:0.28591866 delta_bpb:0.13155413
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:0 looped:0 grad_norm:5.14535763e-02 param_norm:1.36052097e+02 grad_param_ratio:3.78190248e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:1 looped:0 grad_norm:4.70931097e-02 param_norm:1.36109975e+02 grad_param_ratio:3.45993082e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:2 looped:0 grad_norm:4.65849291e-02 param_norm:1.37453832e+02 grad_param_ratio:3.38913279e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:3 looped:1 grad_norm:4.88129876e-02 param_norm:1.35666848e+02 grad_param_ratio:3.59800410e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:4 looped:1 grad_norm:4.49535662e-02 param_norm:1.36767935e+02 grad_param_ratio:3.28684982e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:5 looped:1 grad_norm:4.16832200e-02 param_norm:1.36592661e+02 grad_param_ratio:3.05164419e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:6 looped:0 grad_norm:4.21231027e-02 param_norm:1.38690214e+02 grad_param_ratio:3.03720799e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:7 looped:0 grad_norm:4.13659589e-02 param_norm:1.38603007e+02 grad_param_ratio:2.98449217e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:8 looped:0 grad_norm:4.22426139e-02 param_norm:1.40622679e+02 grad_param_ratio:3.00396879e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:9 looped:0 grad_norm:4.03862803e-02 param_norm:1.41186764e+02 grad_param_ratio:2.86048629e-04
+bump_layer_stats step:2192 frac:0.360779 phase:pre layer:10 looped:0 grad_norm:8.57199726e-02 param_norm:1.36195308e+02 grad_param_ratio:6.29390058e-04
+bump_probe step:2193 frac:0.360955 phase:pre loop_active:0 loss:2.58339787 bpb:1.18864808 eval_time:110ms
+bump_counterfactual step:2193 frac:0.360955 phase:pre p_loop:0.000000 policy_loss:2.58339787 policy_bpb:1.18864808 loop_off_loss:2.58339787 loop_off_bpb:1.18864808 loop_on_loss:2.90876004 loop_on_bpb:1.33835058 delta_loss:0.32536217 delta_bpb:0.14970250
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:0 looped:0 grad_norm:5.32623480e-02 param_norm:1.36044583e+02 grad_param_ratio:3.91506569e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:1 looped:0 grad_norm:5.07239655e-02 param_norm:1.36096587e+02 grad_param_ratio:3.72705639e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:2 looped:0 grad_norm:4.90863924e-02 param_norm:1.37430182e+02 grad_param_ratio:3.57173306e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:3 looped:1 grad_norm:5.18294826e-02 param_norm:1.35646195e+02 grad_param_ratio:3.82093155e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:4 looped:1 grad_norm:5.04659927e-02 param_norm:1.36752588e+02 grad_param_ratio:3.69031354e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:5 looped:1 grad_norm:4.96013431e-02 param_norm:1.36574767e+02 grad_param_ratio:3.63180873e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:6 looped:0 grad_norm:4.94963041e-02 param_norm:1.38661544e+02 grad_param_ratio:3.56957687e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:7 looped:0 grad_norm:4.69791680e-02 param_norm:1.38578856e+02 grad_param_ratio:3.39006754e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:8 looped:0 grad_norm:5.22621566e-02 param_norm:1.40601209e+02 grad_param_ratio:3.71704888e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:9 looped:0 grad_norm:4.72325122e-02 param_norm:1.41159364e+02 grad_param_ratio:3.34604173e-04
+bump_layer_stats step:2193 frac:0.360955 phase:pre layer:10 looped:0 grad_norm:8.96786911e-02 param_norm:1.36190905e+02 grad_param_ratio:6.58477826e-04
+bump_probe step:2194 frac:0.361133 phase:pre loop_active:0 loss:2.58021906 bpb:1.18718547 eval_time:109ms
+bump_counterfactual step:2194 frac:0.361133 phase:pre p_loop:0.000000 policy_loss:2.58021906 policy_bpb:1.18718547 loop_off_loss:2.58021906 loop_off_bpb:1.18718547 loop_on_loss:2.86043775 loop_on_bpb:1.31611699 delta_loss:0.28021869 delta_bpb:0.12893152
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:0 looped:0 grad_norm:5.65848801e-02 param_norm:1.36036802e+02 grad_param_ratio:4.15952737e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:1 looped:0 grad_norm:5.20099100e-02 param_norm:1.36087540e+02 grad_param_ratio:3.82179810e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:2 looped:0 grad_norm:5.10575794e-02 param_norm:1.37427244e+02 grad_param_ratio:3.71524436e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:3 looped:1 grad_norm:5.39121127e-02 param_norm:1.35642603e+02 grad_param_ratio:3.97457078e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:4 looped:1 grad_norm:5.08350829e-02 param_norm:1.36748324e+02 grad_param_ratio:3.71741907e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:5 looped:1 grad_norm:4.87385832e-02 param_norm:1.36577594e+02 grad_param_ratio:3.56856360e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:6 looped:0 grad_norm:5.02470381e-02 param_norm:1.38665963e+02 grad_param_ratio:3.62360288e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:7 looped:0 grad_norm:4.95790776e-02 param_norm:1.38583134e+02 grad_param_ratio:3.57756937e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:8 looped:0 grad_norm:5.49945622e-02 param_norm:1.40597065e+02 grad_param_ratio:3.91150144e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:9 looped:0 grad_norm:4.66229004e-02 param_norm:1.41153764e+02 grad_param_ratio:3.30298668e-04
+bump_layer_stats step:2194 frac:0.361133 phase:pre layer:10 looped:0 grad_norm:1.02614356e-01 param_norm:1.36169851e+02 grad_param_ratio:7.53576178e-04
+bump_probe step:2195 frac:0.361311 phase:pre loop_active:0 loss:2.57751184 bpb:1.18593985 eval_time:110ms
+bump_counterfactual step:2195 frac:0.361311 phase:pre p_loop:0.000000 policy_loss:2.57751184 policy_bpb:1.18593985 loop_off_loss:2.57751184 loop_off_bpb:1.18593985 loop_on_loss:2.89195127 loop_on_bpb:1.33061669 delta_loss:0.31443943 delta_bpb:0.14467683
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:0 looped:0 grad_norm:5.36623510e-02 param_norm:1.36024293e+02 grad_param_ratio:3.94505642e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:1 looped:0 grad_norm:5.13124016e-02 param_norm:1.36069084e+02 grad_param_ratio:3.77105513e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:2 looped:0 grad_norm:5.00594055e-02 param_norm:1.37400756e+02 grad_param_ratio:3.64331369e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:3 looped:1 grad_norm:5.32276549e-02 param_norm:1.35619295e+02 grad_param_ratio:3.92478481e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:4 looped:1 grad_norm:4.84759746e-02 param_norm:1.36731598e+02 grad_param_ratio:3.54533812e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:5 looped:1 grad_norm:4.42746026e-02 param_norm:1.36555004e+02 grad_param_ratio:3.24225412e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:6 looped:0 grad_norm:4.54074170e-02 param_norm:1.38631512e+02 grad_param_ratio:3.27540372e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:7 looped:0 grad_norm:4.33524053e-02 param_norm:1.38550173e+02 grad_param_ratio:3.12900404e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:8 looped:0 grad_norm:5.31264820e-02 param_norm:1.40567744e+02 grad_param_ratio:3.77942197e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:9 looped:0 grad_norm:4.31281950e-02 param_norm:1.41123726e+02 grad_param_ratio:3.05605557e-04
+bump_layer_stats step:2195 frac:0.361311 phase:pre layer:10 looped:0 grad_norm:8.44093709e-02 param_norm:1.36172687e+02 grad_param_ratio:6.19870053e-04
+bump_probe step:2196 frac:0.361488 phase:pre loop_active:0 loss:2.58128739 bpb:1.18767702 eval_time:109ms
+bump_counterfactual step:2196 frac:0.361488 phase:pre p_loop:0.000000 policy_loss:2.58128739 policy_bpb:1.18767702 loop_off_loss:2.58128739 loop_off_bpb:1.18767702 loop_on_loss:2.86782756 loop_on_bpb:1.31951712 delta_loss:0.28654017 delta_bpb:0.13184010
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:0 looped:0 grad_norm:5.00733840e-02 param_norm:1.36020731e+02 grad_param_ratio:3.68130531e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:1 looped:0 grad_norm:4.58332577e-02 param_norm:1.36065164e+02 grad_param_ratio:3.36847847e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:2 looped:0 grad_norm:4.42352024e-02 param_norm:1.37402352e+02 grad_param_ratio:3.21939195e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:3 looped:1 grad_norm:4.59935831e-02 param_norm:1.35619245e+02 grad_param_ratio:3.39137584e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:4 looped:1 grad_norm:4.28701756e-02 param_norm:1.36723332e+02 grad_param_ratio:3.13554205e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:5 looped:1 grad_norm:4.03252499e-02 param_norm:1.36556059e+02 grad_param_ratio:2.95301798e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:6 looped:0 grad_norm:4.25121309e-02 param_norm:1.38632646e+02 grad_param_ratio:3.06653101e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:7 looped:0 grad_norm:4.20737333e-02 param_norm:1.38550699e+02 grad_param_ratio:3.03670306e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:8 looped:0 grad_norm:5.66495149e-02 param_norm:1.40561940e+02 grad_param_ratio:4.03021721e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:9 looped:0 grad_norm:4.28358331e-02 param_norm:1.41118600e+02 grad_param_ratio:3.03544912e-04
+bump_layer_stats step:2196 frac:0.361488 phase:pre layer:10 looped:0 grad_norm:6.98258302e-02 param_norm:1.36147450e+02 grad_param_ratio:5.12869173e-04
+bump_probe step:2197 frac:0.361666 phase:pre loop_active:0 loss:2.57757553 bpb:1.18596916 eval_time:110ms
+bump_counterfactual step:2197 frac:0.361666 phase:pre p_loop:0.000000 policy_loss:2.57757553 policy_bpb:1.18596916 loop_off_loss:2.57757553 loop_off_bpb:1.18596916 loop_on_loss:2.88949532 loop_on_bpb:1.32948668 delta_loss:0.31191979 delta_bpb:0.14351752
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:0 looped:0 grad_norm:5.96229366e-02 param_norm:1.36006427e+02 grad_param_ratio:4.38383229e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:1 looped:0 grad_norm:5.37008145e-02 param_norm:1.36047854e+02 grad_param_ratio:3.94720040e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:2 looped:0 grad_norm:5.20739348e-02 param_norm:1.37382939e+02 grad_param_ratio:3.79042225e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:3 looped:1 grad_norm:5.56886335e-02 param_norm:1.35598152e+02 grad_param_ratio:4.10688735e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:4 looped:1 grad_norm:5.16251717e-02 param_norm:1.36707692e+02 grad_param_ratio:3.77631799e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:5 looped:1 grad_norm:4.78000396e-02 param_norm:1.36537506e+02 grad_param_ratio:3.50087248e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:6 looped:0 grad_norm:4.80784360e-02 param_norm:1.38611971e+02 grad_param_ratio:3.46856305e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:7 looped:0 grad_norm:4.70813324e-02 param_norm:1.38524235e+02 grad_param_ratio:3.39877947e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:8 looped:0 grad_norm:5.50886780e-02 param_norm:1.40541117e+02 grad_param_ratio:3.91975523e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:9 looped:0 grad_norm:4.55449622e-02 param_norm:1.41095484e+02 grad_param_ratio:3.22795322e-04
+bump_layer_stats step:2197 frac:0.361666 phase:pre layer:10 looped:0 grad_norm:8.20019533e-02 param_norm:1.36144999e+02 grad_param_ratio:6.02313370e-04
+bump_probe step:2198 frac:0.361843 phase:pre loop_active:0 loss:2.57657289 bpb:1.18550783 eval_time:109ms
+bump_counterfactual step:2198 frac:0.361843 phase:pre p_loop:0.000000 policy_loss:2.57657289 policy_bpb:1.18550783 loop_off_loss:2.57657289 loop_off_bpb:1.18550783 loop_on_loss:2.87167158 loop_on_bpb:1.32128579 delta_loss:0.29509869 delta_bpb:0.13577796
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:0 looped:0 grad_norm:5.86037556e-02 param_norm:1.36002111e+02 grad_param_ratio:4.30903278e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:1 looped:0 grad_norm:5.59910981e-02 param_norm:1.36045530e+02 grad_param_ratio:4.11561469e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:2 looped:0 grad_norm:5.12700703e-02 param_norm:1.37388014e+02 grad_param_ratio:3.73177170e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:3 looped:1 grad_norm:5.33998409e-02 param_norm:1.35594346e+02 grad_param_ratio:3.93820557e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:4 looped:1 grad_norm:4.81763733e-02 param_norm:1.36701409e+02 grad_param_ratio:3.52420458e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:5 looped:1 grad_norm:4.39140746e-02 param_norm:1.36530717e+02 grad_param_ratio:3.21642452e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:6 looped:0 grad_norm:4.54377483e-02 param_norm:1.38602181e+02 grad_param_ratio:3.27828522e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:7 looped:0 grad_norm:4.48710287e-02 param_norm:1.38517818e+02 grad_param_ratio:3.23936872e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:8 looped:0 grad_norm:4.44101593e-02 param_norm:1.40536168e+02 grad_param_ratio:3.16005196e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:9 looped:0 grad_norm:4.06958090e-02 param_norm:1.41087645e+02 grad_param_ratio:2.88443463e-04
+bump_layer_stats step:2198 frac:0.361843 phase:pre layer:10 looped:0 grad_norm:6.83541525e-02 param_norm:1.36122160e+02 grad_param_ratio:5.02153009e-04
+bump_probe step:2199 frac:0.362021 phase:pre loop_active:0 loss:2.57876348 bpb:1.18651575 eval_time:110ms
+bump_counterfactual step:2199 frac:0.362021 phase:pre p_loop:0.000000 policy_loss:2.57876348 policy_bpb:1.18651575 loop_off_loss:2.57876348 loop_off_bpb:1.18651575 loop_on_loss:2.88359071 loop_on_bpb:1.32676990 delta_loss:0.30482722 delta_bpb:0.14025416
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:0 looped:0 grad_norm:4.75129506e-02 param_norm:1.35984792e+02 grad_param_ratio:3.49399002e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:1 looped:0 grad_norm:4.35954437e-02 param_norm:1.36027067e+02 grad_param_ratio:3.20490950e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:2 looped:0 grad_norm:4.22944844e-02 param_norm:1.37368645e+02 grad_param_ratio:3.07890381e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:3 looped:1 grad_norm:4.44865181e-02 param_norm:1.35579635e+02 grad_param_ratio:3.28120947e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:4 looped:1 grad_norm:4.21047631e-02 param_norm:1.36687791e+02 grad_param_ratio:3.08036020e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:5 looped:1 grad_norm:3.94729908e-02 param_norm:1.36521857e+02 grad_param_ratio:2.89133122e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:6 looped:0 grad_norm:4.07504887e-02 param_norm:1.38589902e+02 grad_param_ratio:2.94036493e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:7 looped:0 grad_norm:3.97814571e-02 param_norm:1.38501431e+02 grad_param_ratio:2.87227769e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:8 looped:0 grad_norm:4.33994648e-02 param_norm:1.40522155e+02 grad_param_ratio:3.08844287e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:9 looped:0 grad_norm:3.76325965e-02 param_norm:1.41070836e+02 grad_param_ratio:2.66763830e-04
+bump_layer_stats step:2199 frac:0.362021 phase:pre layer:10 looped:0 grad_norm:6.31536371e-02 param_norm:1.36114438e+02 grad_param_ratio:4.63974565e-04
+layer_loop:enabled step:2200 frac:0.362 trigger:step p_loop:1.000000 encoder:[0, 1, 2, 3, 4, 5, 3, 4] decoder:[5, 3, 4, 5, 6, 7, 8, 9, 10]
+bump_probe step:2200 frac:0.362199 phase:post_early loop_active:1 loss:2.87611670 bpb:1.32333104 eval_time:155ms
+bump_counterfactual step:2200 frac:0.362199 phase:post_early p_loop:1.000000 policy_loss:2.87611670 policy_bpb:1.32333104 loop_off_loss:2.57920365 loop_off_bpb:1.18671827 loop_on_loss:2.87611670 loop_on_bpb:1.32333104 delta_loss:0.29691305 delta_bpb:0.13661276
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:0 looped:0 grad_norm:1.27982419e-01 param_norm:1.35977879e+02 grad_param_ratio:9.41200288e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:1 looped:0 grad_norm:6.24883045e-02 param_norm:1.36025058e+02 grad_param_ratio:4.59388184e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:2 looped:0 grad_norm:5.28358081e-02 param_norm:1.37365713e+02 grad_param_ratio:3.84636071e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:3 looped:1 grad_norm:6.01034802e-02 param_norm:1.35574628e+02 grad_param_ratio:4.43323953e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:4 looped:1 grad_norm:6.09353343e-02 param_norm:1.36683794e+02 grad_param_ratio:4.45812429e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:5 looped:1 grad_norm:4.46328205e-02 param_norm:1.36517441e+02 grad_param_ratio:3.26938596e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:6 looped:0 grad_norm:7.55465249e-02 param_norm:1.38581359e+02 grad_param_ratio:5.45142043e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:7 looped:0 grad_norm:6.21113592e-02 param_norm:1.38495459e+02 grad_param_ratio:4.48472173e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:8 looped:0 grad_norm:7.46796139e-02 param_norm:1.40514608e+02 grad_param_ratio:5.31472241e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:9 looped:0 grad_norm:9.02837098e-02 param_norm:1.41063263e+02 grad_param_ratio:6.40022838e-04
+bump_layer_stats step:2200 frac:0.362199 phase:post_early layer:10 looped:0 grad_norm:1.35785596e-01 param_norm:1.36094146e+02 grad_param_ratio:9.97732813e-04
+bump_probe step:2201 frac:0.362461 phase:post_early loop_active:1 loss:2.72562671 bpb:1.25408904 eval_time:154ms
+bump_counterfactual step:2201 frac:0.362461 phase:post_early p_loop:1.000000 policy_loss:2.72562671 policy_bpb:1.25408904 loop_off_loss:2.62106285 loop_off_bpb:1.20597812 loop_on_loss:2.72562671 loop_on_bpb:1.25408904 delta_loss:0.10456387 delta_bpb:0.04811092
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:0 looped:0 grad_norm:1.04790635e-01 param_norm:1.35853413e+02 grad_param_ratio:7.71350777e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:1 looped:0 grad_norm:6.92356989e-02 param_norm:1.35997763e+02 grad_param_ratio:5.09094394e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:2 looped:0 grad_norm:6.02158610e-02 param_norm:1.37350792e+02 grad_param_ratio:4.38409275e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:3 looped:1 grad_norm:5.42896045e-02 param_norm:1.35563205e+02 grad_param_ratio:4.00474482e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:4 looped:1 grad_norm:5.39407370e-02 param_norm:1.36702442e+02 grad_param_ratio:3.94585027e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:5 looped:1 grad_norm:3.95603151e-02 param_norm:1.36599063e+02 grad_param_ratio:2.89608980e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:6 looped:0 grad_norm:7.07623009e-02 param_norm:1.38608741e+02 grad_param_ratio:5.10518315e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:7 looped:0 grad_norm:7.56507369e-02 param_norm:1.38492693e+02 grad_param_ratio:5.46243524e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:8 looped:0 grad_norm:6.91570526e-02 param_norm:1.40509952e+02 grad_param_ratio:4.92186152e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:9 looped:0 grad_norm:6.41362289e-02 param_norm:1.41062066e+02 grad_param_ratio:4.54666735e-04
+bump_layer_stats step:2201 frac:0.362461 phase:post_early layer:10 looped:0 grad_norm:1.39710914e-01 param_norm:1.36082665e+02 grad_param_ratio:1.02666209e-03
+bump_probe step:2202 frac:0.362719 phase:post_early loop_active:1 loss:2.67645941 bpb:1.23146665 eval_time:155ms
+bump_counterfactual step:2202 frac:0.362719 phase:post_early p_loop:1.000000 policy_loss:2.67645941 policy_bpb:1.23146665 loop_off_loss:2.64973011 loop_off_bpb:1.21916822 loop_on_loss:2.67645941 loop_on_bpb:1.23146665 delta_loss:0.02672931 delta_bpb:0.01229843
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:0 looped:0 grad_norm:8.29755190e-02 param_norm:1.35697888e+02 grad_param_ratio:6.11472444e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:1 looped:0 grad_norm:6.15212618e-02 param_norm:1.35925689e+02 grad_param_ratio:4.52609527e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:2 looped:0 grad_norm:5.81584101e-02 param_norm:1.37294198e+02 grad_param_ratio:4.23604283e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:3 looped:1 grad_norm:5.32174993e-02 param_norm:1.35533742e+02 grad_param_ratio:3.92651295e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:4 looped:1 grad_norm:5.19298022e-02 param_norm:1.36706560e+02 grad_param_ratio:3.79863278e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:5 looped:1 grad_norm:3.88219989e-02 param_norm:1.36716444e+02 grad_param_ratio:2.83959982e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:6 looped:0 grad_norm:6.30512900e-02 param_norm:1.38591836e+02 grad_param_ratio:4.54942309e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:7 looped:0 grad_norm:6.20676517e-02 param_norm:1.38407185e+02 grad_param_ratio:4.48442413e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:8 looped:0 grad_norm:6.29661096e-02 param_norm:1.40451907e+02 grad_param_ratio:4.48310821e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:9 looped:0 grad_norm:5.83662407e-02 param_norm:1.41009288e+02 grad_param_ratio:4.13917704e-04
+bump_layer_stats step:2202 frac:0.362719 phase:post_early layer:10 looped:0 grad_norm:9.58873017e-02 param_norm:1.36064104e+02 grad_param_ratio:7.04721519e-04
+bump_probe step:2203 frac:0.362980 phase:post_early loop_active:1 loss:2.65852473 bpb:1.22321472 eval_time:156ms
+bump_counterfactual step:2203 frac:0.362980 phase:post_early p_loop:1.000000 policy_loss:2.65852473 policy_bpb:1.22321472 loop_off_loss:2.67823199 loop_off_bpb:1.23228224 loop_on_loss:2.65852473 loop_on_bpb:1.22321472 delta_loss:-0.01970726 delta_bpb:-0.00906751
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:0 looped:0 grad_norm:6.27193150e-02 param_norm:1.35565892e+02 grad_param_ratio:4.62648195e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:1 looped:0 grad_norm:5.08733892e-02 param_norm:1.35859889e+02 grad_param_ratio:3.74454811e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:2 looped:0 grad_norm:4.85953332e-02 param_norm:1.37250641e+02 grad_param_ratio:3.54062705e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:3 looped:1 grad_norm:4.64658173e-02 param_norm:1.35512349e+02 grad_param_ratio:3.42889912e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:4 looped:1 grad_norm:4.54842034e-02 param_norm:1.36706972e+02 grad_param_ratio:3.32713121e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:5 looped:1 grad_norm:3.55382568e-02 param_norm:1.36839000e+02 grad_param_ratio:2.59708540e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:6 looped:0 grad_norm:4.94268112e-02 param_norm:1.38561474e+02 grad_param_ratio:3.56713954e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:7 looped:0 grad_norm:5.02462666e-02 param_norm:1.38325404e+02 grad_param_ratio:3.63246846e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:8 looped:0 grad_norm:5.33798422e-02 param_norm:1.40407515e+02 grad_param_ratio:3.80177957e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:9 looped:0 grad_norm:4.20514060e-02 param_norm:1.40967554e+02 grad_param_ratio:2.98305566e-04
+bump_layer_stats step:2203 frac:0.362980 phase:post_early layer:10 looped:0 grad_norm:7.13627632e-02 param_norm:1.36033920e+02 grad_param_ratio:5.24595358e-04
+bump_probe step:2204 frac:0.363239 phase:post_early loop_active:1 loss:2.64227492 bpb:1.21573801 eval_time:155ms
+bump_counterfactual step:2204 frac:0.363239 phase:post_early p_loop:1.000000 policy_loss:2.64227492 policy_bpb:1.21573801 loop_off_loss:2.67971306 loop_off_bpb:1.23296369 loop_on_loss:2.64227492 loop_on_bpb:1.21573801 delta_loss:-0.03743815 delta_bpb:-0.01722568
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:0 looped:0 grad_norm:6.10376346e-02 param_norm:1.35448346e+02 grad_param_ratio:4.50634034e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:1 looped:0 grad_norm:5.16909013e-02 param_norm:1.35790588e+02 grad_param_ratio:3.80666304e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:2 looped:0 grad_norm:4.84120234e-02 param_norm:1.37209408e+02 grad_param_ratio:3.52833120e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:3 looped:1 grad_norm:4.64460298e-02 param_norm:1.35505020e+02 grad_param_ratio:3.42762429e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:4 looped:1 grad_norm:4.50608158e-02 param_norm:1.36710576e+02 grad_param_ratio:3.29607388e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:5 looped:1 grad_norm:3.60974787e-02 param_norm:1.36966544e+02 grad_param_ratio:2.63549607e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:6 looped:0 grad_norm:4.92411858e-02 param_norm:1.38531809e+02 grad_param_ratio:3.55450392e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:7 looped:0 grad_norm:4.98245884e-02 param_norm:1.38253725e+02 grad_param_ratio:3.60385142e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:8 looped:0 grad_norm:5.24687318e-02 param_norm:1.40368801e+02 grad_param_ratio:3.73791978e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:9 looped:0 grad_norm:4.31980038e-02 param_norm:1.40937135e+02 grad_param_ratio:3.06505476e-04
+bump_layer_stats step:2204 frac:0.363239 phase:post_early layer:10 looped:0 grad_norm:7.31841296e-02 param_norm:1.36018307e+02 grad_param_ratio:5.38046172e-04
+bump_probe step:2205 frac:0.363497 phase:post_early loop_active:1 loss:2.63818021 bpb:1.21385400 eval_time:155ms
+bump_counterfactual step:2205 frac:0.363497 phase:post_early p_loop:1.000000 policy_loss:2.63818021 policy_bpb:1.21385400 loop_off_loss:2.69606792 loop_off_bpb:1.24048873 loop_on_loss:2.63818021 loop_on_bpb:1.21385400 delta_loss:-0.05788771 delta_bpb:-0.02663473
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:0 looped:0 grad_norm:6.03602161e-02 param_norm:1.35350163e+02 grad_param_ratio:4.45955993e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:1 looped:0 grad_norm:5.04315484e-02 param_norm:1.35730603e+02 grad_param_ratio:3.71556210e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:2 looped:0 grad_norm:4.81638763e-02 param_norm:1.37175495e+02 grad_param_ratio:3.51111371e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:3 looped:1 grad_norm:4.73531271e-02 param_norm:1.35491652e+02 grad_param_ratio:3.49491105e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:4 looped:1 grad_norm:4.65644887e-02 param_norm:1.36702817e+02 grad_param_ratio:3.40625672e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:5 looped:1 grad_norm:3.60585558e-02 param_norm:1.37078837e+02 grad_param_ratio:2.63049764e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:6 looped:0 grad_norm:4.68899395e-02 param_norm:1.38490661e+02 grad_param_ratio:3.38578350e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:7 looped:0 grad_norm:4.68651755e-02 param_norm:1.38181088e+02 grad_param_ratio:3.39157666e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:8 looped:0 grad_norm:5.12521666e-02 param_norm:1.40332519e+02 grad_param_ratio:3.65219457e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:9 looped:0 grad_norm:3.98952030e-02 param_norm:1.40912200e+02 grad_param_ratio:2.83121000e-04
+bump_layer_stats step:2205 frac:0.363497 phase:post_early layer:10 looped:0 grad_norm:6.45505430e-02 param_norm:1.35987399e+02 grad_param_ratio:4.74680326e-04
+bump_probe step:2206 frac:0.363756 phase:post_early loop_active:1 loss:2.62462608 bpb:1.20761760 eval_time:157ms
+bump_counterfactual step:2206 frac:0.363756 phase:post_early p_loop:1.000000 policy_loss:2.62462608 policy_bpb:1.20761760 loop_off_loss:2.68140360 loop_off_bpb:1.23374153 loop_on_loss:2.62462608 loop_on_bpb:1.20761760 delta_loss:-0.05677752 delta_bpb:-0.02612392
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:0 looped:0 grad_norm:5.54086153e-02 param_norm:1.35267248e+02 grad_param_ratio:4.09623291e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:1 looped:0 grad_norm:5.03334773e-02 param_norm:1.35666661e+02 grad_param_ratio:3.71008448e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:2 looped:0 grad_norm:4.84603931e-02 param_norm:1.37143538e+02 grad_param_ratio:3.53355278e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:3 looped:1 grad_norm:4.68518063e-02 param_norm:1.35482651e+02 grad_param_ratio:3.45814066e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:4 looped:1 grad_norm:4.54422727e-02 param_norm:1.36695344e+02 grad_param_ratio:3.32434677e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:5 looped:1 grad_norm:3.56403251e-02 param_norm:1.37181372e+02 grad_param_ratio:2.59804408e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:6 looped:0 grad_norm:4.68141255e-02 param_norm:1.38445310e+02 grad_param_ratio:3.38141650e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:7 looped:0 grad_norm:4.75216861e-02 param_norm:1.38110516e+02 grad_param_ratio:3.44084488e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:8 looped:0 grad_norm:4.51250258e-02 param_norm:1.40302536e+02 grad_param_ratio:3.21626586e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:9 looped:0 grad_norm:4.13528883e-02 param_norm:1.40896505e+02 grad_param_ratio:2.93498326e-04
+bump_layer_stats step:2206 frac:0.363756 phase:post_early layer:10 looped:0 grad_norm:7.04578549e-02 param_norm:1.35968787e+02 grad_param_ratio:5.18191393e-04
+bump_probe step:2207 frac:0.364018 phase:post_early loop_active:1 loss:2.62079794 bpb:1.20585624 eval_time:156ms
+bump_counterfactual step:2207 frac:0.364018 phase:post_early p_loop:1.000000 policy_loss:2.62079794 policy_bpb:1.20585624 loop_off_loss:2.68795921 loop_off_bpb:1.23675783 loop_on_loss:2.62079794 loop_on_bpb:1.20585624 delta_loss:-0.06716127 delta_bpb:-0.03090159
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:0 looped:0 grad_norm:5.46411999e-02 param_norm:1.35191766e+02 grad_param_ratio:4.04175503e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:1 looped:0 grad_norm:4.96838611e-02 param_norm:1.35607643e+02 grad_param_ratio:3.66379505e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:2 looped:0 grad_norm:4.91742272e-02 param_norm:1.37114047e+02 grad_param_ratio:3.58637414e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:3 looped:1 grad_norm:4.82128124e-02 param_norm:1.35476666e+02 grad_param_ratio:3.55875397e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:4 looped:1 grad_norm:4.57465208e-02 param_norm:1.36688334e+02 grad_param_ratio:3.34677581e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:5 looped:1 grad_norm:3.43903923e-02 param_norm:1.37285048e+02 grad_param_ratio:2.50503552e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:6 looped:0 grad_norm:4.11171363e-02 param_norm:1.38404240e+02 grad_param_ratio:2.97080035e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:7 looped:0 grad_norm:4.19391677e-02 param_norm:1.38046473e+02 grad_param_ratio:3.03804703e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:8 looped:0 grad_norm:4.03636871e-02 param_norm:1.40279355e+02 grad_param_ratio:2.87737900e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:9 looped:0 grad_norm:3.75502087e-02 param_norm:1.40887249e+02 grad_param_ratio:2.66526666e-04
+bump_layer_stats step:2207 frac:0.364018 phase:post_early layer:10 looped:0 grad_norm:5.72315049e-02 param_norm:1.35950601e+02 grad_param_ratio:4.20972799e-04
+bump_probe step:2208 frac:0.364280 phase:post_early loop_active:1 loss:2.61459518 bpb:1.20300228 eval_time:155ms
+bump_counterfactual step:2208 frac:0.364280 phase:post_early p_loop:1.000000 policy_loss:2.61459518 policy_bpb:1.20300228 loop_off_loss:2.67713627 loop_off_bpb:1.23177808 loop_on_loss:2.61459518 loop_on_bpb:1.20300228 delta_loss:-0.06254109 delta_bpb:-0.02877580
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:0 looped:0 grad_norm:5.36848954e-02 param_norm:1.35126848e+02 grad_param_ratio:3.97292590e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:1 looped:0 grad_norm:4.87771380e-02 param_norm:1.35542082e+02 grad_param_ratio:3.59867116e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:2 looped:0 grad_norm:4.54561535e-02 param_norm:1.37078750e+02 grad_param_ratio:3.31606128e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:3 looped:1 grad_norm:4.36646416e-02 param_norm:1.35471621e+02 grad_param_ratio:3.22315783e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:4 looped:1 grad_norm:4.28644409e-02 param_norm:1.36674923e+02 grad_param_ratio:3.13623304e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:5 looped:1 grad_norm:3.33087513e-02 param_norm:1.37381026e+02 grad_param_ratio:2.42455251e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:6 looped:0 grad_norm:3.98848373e-02 param_norm:1.38359704e+02 grad_param_ratio:2.88269173e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:7 looped:0 grad_norm:3.96363334e-02 param_norm:1.37986690e+02 grad_param_ratio:2.87247512e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:8 looped:0 grad_norm:3.83191282e-02 param_norm:1.40259695e+02 grad_param_ratio:2.73201281e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:9 looped:0 grad_norm:3.64498546e-02 param_norm:1.40881295e+02 grad_param_ratio:2.58727424e-04
+bump_layer_stats step:2208 frac:0.364280 phase:post_early layer:10 looped:0 grad_norm:5.35855233e-02 param_norm:1.35938987e+02 grad_param_ratio:3.94188043e-04
+bump_probe step:2209 frac:0.364539 phase:post_early loop_active:1 loss:2.61210793 bpb:1.20185787 eval_time:156ms
+bump_counterfactual step:2209 frac:0.364539 phase:post_early p_loop:1.000000 policy_loss:2.61210793 policy_bpb:1.20185787 loop_off_loss:2.67935012 loop_off_bpb:1.23279670 loop_on_loss:2.61210793 loop_on_bpb:1.20185787 delta_loss:-0.06724218 delta_bpb:-0.03093882
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:0 looped:0 grad_norm:5.72518887e-02 param_norm:1.35064583e+02 grad_param_ratio:4.23885280e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:1 looped:0 grad_norm:5.12822612e-02 param_norm:1.35481479e+02 grad_param_ratio:3.78518610e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:2 looped:0 grad_norm:4.68591069e-02 param_norm:1.37042671e+02 grad_param_ratio:3.41930776e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:3 looped:1 grad_norm:4.50848672e-02 param_norm:1.35465669e+02 grad_param_ratio:3.32813972e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:4 looped:1 grad_norm:4.29903208e-02 param_norm:1.36658472e+02 grad_param_ratio:3.14582185e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:5 looped:1 grad_norm:3.36951981e-02 param_norm:1.37475045e+02 grad_param_ratio:2.45100470e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:6 looped:0 grad_norm:4.20955325e-02 param_norm:1.38322110e+02 grad_param_ratio:3.04329745e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:7 looped:0 grad_norm:4.33285978e-02 param_norm:1.37930339e+02 grad_param_ratio:3.14133918e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:8 looped:0 grad_norm:4.43605841e-02 param_norm:1.40241162e+02 grad_param_ratio:3.16316434e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:9 looped:0 grad_norm:4.28896253e-02 param_norm:1.40870185e+02 grad_param_ratio:3.04462050e-04
+bump_layer_stats step:2209 frac:0.364539 phase:post_early layer:10 looped:0 grad_norm:6.94594144e-02 param_norm:1.35917662e+02 grad_param_ratio:5.11040386e-04
+bump_probe step:2210 frac:0.364798 phase:post_early loop_active:1 loss:2.60690314 bpb:1.19946309 eval_time:155ms
+bump_counterfactual step:2210 frac:0.364798 phase:post_early p_loop:1.000000 policy_loss:2.60690314 policy_bpb:1.19946309 loop_off_loss:2.67265144 loop_off_bpb:1.22971457 loop_on_loss:2.60690314 loop_on_bpb:1.19946309 delta_loss:-0.06574831 delta_bpb:-0.03025148
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:0 looped:0 grad_norm:6.11805671e-02 param_norm:1.35008959e+02 grad_param_ratio:4.53159314e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:1 looped:0 grad_norm:5.66466418e-02 param_norm:1.35423285e+02 grad_param_ratio:4.18293220e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:2 looped:0 grad_norm:5.38251667e-02 param_norm:1.37004573e+02 grad_param_ratio:3.92871314e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:3 looped:1 grad_norm:5.53569163e-02 param_norm:1.35462980e+02 grad_param_ratio:4.08649775e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:4 looped:1 grad_norm:5.18808706e-02 param_norm:1.36642901e+02 grad_param_ratio:3.79682151e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:5 looped:1 grad_norm:3.87728143e-02 param_norm:1.37563451e+02 grad_param_ratio:2.81854040e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:6 looped:0 grad_norm:4.42046786e-02 param_norm:1.38282074e+02 grad_param_ratio:3.19670347e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:7 looped:0 grad_norm:4.63148236e-02 param_norm:1.37881605e+02 grad_param_ratio:3.35902847e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:8 looped:0 grad_norm:4.59745643e-02 param_norm:1.40229206e+02 grad_param_ratio:3.27852989e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:9 looped:0 grad_norm:4.74255900e-02 param_norm:1.40866087e+02 grad_param_ratio:3.36671452e-04
+bump_layer_stats step:2210 frac:0.364798 phase:post_early layer:10 looped:0 grad_norm:8.37861618e-02 param_norm:1.35909154e+02 grad_param_ratio:6.16486524e-04
+bump_probe step:2211 frac:0.365060 phase:post_early loop_active:1 loss:2.60764104 bpb:1.19980261 eval_time:155ms
+bump_counterfactual step:2211 frac:0.365060 phase:post_early p_loop:1.000000 policy_loss:2.60764104 policy_bpb:1.19980261 loop_off_loss:2.67068201 loop_off_bpb:1.22880841 loop_on_loss:2.60764104 loop_on_bpb:1.19980261 delta_loss:-0.06304098 delta_bpb:-0.02900581
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:0 looped:0 grad_norm:5.05460486e-02 param_norm:1.34949690e+02 grad_param_ratio:3.74554759e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:1 looped:0 grad_norm:4.79976107e-02 param_norm:1.35358934e+02 grad_param_ratio:3.54595069e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:2 looped:0 grad_norm:4.69700465e-02 param_norm:1.36958004e+02 grad_param_ratio:3.42952182e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:3 looped:1 grad_norm:4.62209948e-02 param_norm:1.35452648e+02 grad_param_ratio:3.41233602e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:4 looped:1 grad_norm:4.49106782e-02 param_norm:1.36618954e+02 grad_param_ratio:3.28729484e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:5 looped:1 grad_norm:3.56472813e-02 param_norm:1.37639392e+02 grad_param_ratio:2.58990400e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:6 looped:0 grad_norm:4.12367191e-02 param_norm:1.38238546e+02 grad_param_ratio:2.98301163e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:7 looped:0 grad_norm:4.25781130e-02 param_norm:1.37832332e+02 grad_param_ratio:3.08912375e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:8 looped:0 grad_norm:4.08641381e-02 param_norm:1.40216193e+02 grad_param_ratio:2.91436653e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:9 looped:0 grad_norm:4.02765315e-02 param_norm:1.40856292e+02 grad_param_ratio:2.85940592e-04
+bump_layer_stats step:2211 frac:0.365060 phase:post_early layer:10 looped:0 grad_norm:6.35381183e-02 param_norm:1.35890593e+02 grad_param_ratio:4.67568188e-04
+bump_probe step:2212 frac:0.365318 phase:post_early loop_active:1 loss:2.60070096 bpb:1.19660941 eval_time:156ms
+bump_counterfactual step:2212 frac:0.365318 phase:post_early p_loop:1.000000 policy_loss:2.60070096 policy_bpb:1.19660941 loop_off_loss:2.66651239 loop_off_bpb:1.22688993 loop_on_loss:2.60070096 loop_on_bpb:1.19660941 delta_loss:-0.06581143 delta_bpb:-0.03028052
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:0 looped:0 grad_norm:5.42254691e-02 param_norm:1.34899633e+02 grad_param_ratio:4.01968988e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:1 looped:0 grad_norm:5.12780944e-02 param_norm:1.35305716e+02 grad_param_ratio:3.78979512e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:2 looped:0 grad_norm:4.75921411e-02 param_norm:1.36921134e+02 grad_param_ratio:3.47587985e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:3 looped:1 grad_norm:4.59883813e-02 param_norm:1.35449074e+02 grad_param_ratio:3.39525254e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:4 looped:1 grad_norm:4.49587946e-02 param_norm:1.36602947e+02 grad_param_ratio:3.29120239e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:5 looped:1 grad_norm:3.64293833e-02 param_norm:1.37718871e+02 grad_param_ratio:2.64519910e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:6 looped:0 grad_norm:4.22123824e-02 param_norm:1.38204695e+02 grad_param_ratio:3.05433780e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:7 looped:0 grad_norm:4.37679984e-02 param_norm:1.37797920e+02 grad_param_ratio:3.17624522e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:8 looped:0 grad_norm:4.47320416e-02 param_norm:1.40213865e+02 grad_param_ratio:3.19027235e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:9 looped:0 grad_norm:4.11932829e-02 param_norm:1.40854741e+02 grad_param_ratio:2.92452228e-04
+bump_layer_stats step:2212 frac:0.365318 phase:post_early layer:10 looped:0 grad_norm:6.19466673e-02 param_norm:1.35881926e+02 grad_param_ratio:4.55885998e-04
+bump_probe step:2213 frac:0.365578 phase:post_early loop_active:1 loss:2.60042855 bpb:1.19648407 eval_time:156ms
+bump_counterfactual step:2213 frac:0.365578 phase:post_early p_loop:1.000000 policy_loss:2.60042855 policy_bpb:1.19648407 loop_off_loss:2.65716778 loop_off_bpb:1.22259037 loop_on_loss:2.60042855 loop_on_bpb:1.19648407 delta_loss:-0.05673924 delta_bpb:-0.02610631
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:0 looped:0 grad_norm:5.42561461e-02 param_norm:1.34844841e+02 grad_param_ratio:4.02359821e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:1 looped:0 grad_norm:4.93189564e-02 param_norm:1.35244162e+02 grad_param_ratio:3.64666065e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:2 looped:0 grad_norm:4.79080911e-02 param_norm:1.36873434e+02 grad_param_ratio:3.50017455e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:3 looped:1 grad_norm:4.68428444e-02 param_norm:1.35438903e+02 grad_param_ratio:3.45859598e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:4 looped:1 grad_norm:4.35440151e-02 param_norm:1.36578925e+02 grad_param_ratio:3.18819431e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:5 looped:1 grad_norm:3.46811677e-02 param_norm:1.37784921e+02 grad_param_ratio:2.51705103e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:6 looped:0 grad_norm:4.12937836e-02 param_norm:1.38162043e+02 grad_param_ratio:2.98879364e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:7 looped:0 grad_norm:4.39555960e-02 param_norm:1.37756002e+02 grad_param_ratio:3.19082984e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:8 looped:0 grad_norm:4.28485060e-02 param_norm:1.40202483e+02 grad_param_ratio:3.05618739e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:9 looped:0 grad_norm:4.13816178e-02 param_norm:1.40841531e+02 grad_param_ratio:2.93816870e-04
+bump_layer_stats step:2213 frac:0.365578 phase:post_early layer:10 looped:0 grad_norm:6.43138280e-02 param_norm:1.35861591e+02 grad_param_ratio:4.73377558e-04
+bump_probe step:2214 frac:0.365836 phase:post_early loop_active:1 loss:2.59685148 bpb:1.19483822 eval_time:156ms
+bump_counterfactual step:2214 frac:0.365836 phase:post_early p_loop:1.000000 policy_loss:2.59685148 policy_bpb:1.19483822 loop_off_loss:2.66341262 loop_off_bpb:1.22546369 loop_on_loss:2.59685148 loop_on_bpb:1.19483822 delta_loss:-0.06656114 delta_bpb:-0.03062547
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:0 looped:0 grad_norm:5.08945326e-02 param_norm:1.34802690e+02 grad_param_ratio:3.77548347e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:1 looped:0 grad_norm:4.64049734e-02 param_norm:1.35197329e+02 grad_param_ratio:3.43238832e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:2 looped:0 grad_norm:4.55808081e-02 param_norm:1.36841112e+02 grad_param_ratio:3.33092938e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:3 looped:1 grad_norm:4.60651297e-02 param_norm:1.35437583e+02 grad_param_ratio:3.40120731e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:4 looped:1 grad_norm:4.43202302e-02 param_norm:1.36565121e+02 grad_param_ratio:3.24535504e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:5 looped:1 grad_norm:3.51593809e-02 param_norm:1.37856163e+02 grad_param_ratio:2.55043954e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:6 looped:0 grad_norm:3.95928449e-02 param_norm:1.38141954e+02 grad_param_ratio:2.86609850e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:7 looped:0 grad_norm:4.16354032e-02 param_norm:1.37738620e+02 grad_param_ratio:3.02278353e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:8 looped:0 grad_norm:4.11236348e-02 param_norm:1.40205008e+02 grad_param_ratio:2.93310741e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:9 looped:0 grad_norm:3.87232762e-02 param_norm:1.40842286e+02 grad_param_ratio:2.74940696e-04
+bump_layer_stats step:2214 frac:0.365836 phase:post_early layer:10 looped:0 grad_norm:5.76359991e-02 param_norm:1.35848073e+02 grad_param_ratio:4.24268066e-04
+bump_probe step:2215 frac:0.366094 phase:post_early loop_active:1 loss:2.59521402 bpb:1.19408481 eval_time:155ms
+bump_counterfactual step:2215 frac:0.366094 phase:post_early p_loop:1.000000 policy_loss:2.59521402 policy_bpb:1.19408481 loop_off_loss:2.65165422 loop_off_bpb:1.22005353 loop_on_loss:2.59521402 loop_on_bpb:1.19408481 delta_loss:-0.05644020 delta_bpb:-0.02596872
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:0 looped:0 grad_norm:5.50348702e-02 param_norm:1.34756113e+02 grad_param_ratio:4.08403515e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:1 looped:0 grad_norm:5.09533206e-02 param_norm:1.35145788e+02 grad_param_ratio:3.77024852e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:2 looped:0 grad_norm:5.00990092e-02 param_norm:1.36796182e+02 grad_param_ratio:3.66231048e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:3 looped:1 grad_norm:5.08253683e-02 param_norm:1.35431306e+02 grad_param_ratio:3.75285225e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:4 looped:1 grad_norm:4.81662626e-02 param_norm:1.36545287e+02 grad_param_ratio:3.52749361e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:5 looped:1 grad_norm:3.77471602e-02 param_norm:1.37917756e+02 grad_param_ratio:2.73693260e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:6 looped:0 grad_norm:4.18689840e-02 param_norm:1.38110969e+02 grad_param_ratio:3.03154661e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:7 looped:0 grad_norm:4.28038482e-02 param_norm:1.37713476e+02 grad_param_ratio:3.10818151e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:8 looped:0 grad_norm:4.23189728e-02 param_norm:1.40198504e+02 grad_param_ratio:3.01850387e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:9 looped:0 grad_norm:3.95660130e-02 param_norm:1.40829933e+02 grad_param_ratio:2.80948887e-04
+bump_layer_stats step:2215 frac:0.366094 phase:post_early layer:10 looped:0 grad_norm:5.95352242e-02 param_norm:1.35836924e+02 grad_param_ratio:4.38284544e-04
+bump_probe step:2216 frac:0.366356 phase:post_early loop_active:1 loss:2.59413124 bpb:1.19358661 eval_time:156ms
+bump_counterfactual step:2216 frac:0.366356 phase:post_early p_loop:1.000000 policy_loss:2.59413124 policy_bpb:1.19358661 loop_off_loss:2.66092184 loop_off_bpb:1.22431766 loop_on_loss:2.59413124 loop_on_bpb:1.19358661 delta_loss:-0.06679060 delta_bpb:-0.03073104
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:0 looped:0 grad_norm:4.89210658e-02 param_norm:1.34713520e+02 grad_param_ratio:3.63148894e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:1 looped:0 grad_norm:4.54150412e-02 param_norm:1.35099095e+02 grad_param_ratio:3.36160958e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:2 looped:0 grad_norm:4.59785075e-02 param_norm:1.36759991e+02 grad_param_ratio:3.36198527e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:3 looped:1 grad_norm:4.67356717e-02 param_norm:1.35426995e+02 grad_param_ratio:3.45098640e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:4 looped:1 grad_norm:4.31846881e-02 param_norm:1.36532292e+02 grad_param_ratio:3.16296515e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:5 looped:1 grad_norm:3.45581715e-02 param_norm:1.37983544e+02 grad_param_ratio:2.50451398e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:6 looped:0 grad_norm:3.78485996e-02 param_norm:1.38102950e+02 grad_param_ratio:2.74060761e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:7 looped:0 grad_norm:3.96095700e-02 param_norm:1.37708879e+02 grad_param_ratio:2.87632651e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:8 looped:0 grad_norm:3.78096520e-02 param_norm:1.40202660e+02 grad_param_ratio:2.69678563e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:9 looped:0 grad_norm:3.62911973e-02 param_norm:1.40830446e+02 grad_param_ratio:2.57694257e-04
+bump_layer_stats step:2216 frac:0.366356 phase:post_early layer:10 looped:0 grad_norm:5.20161058e-02 param_norm:1.35828967e+02 grad_param_ratio:3.82952967e-04
+bump_probe step:2217 frac:0.366614 phase:post_early loop_active:1 loss:2.59323641 bpb:1.19317489 eval_time:156ms
+bump_counterfactual step:2217 frac:0.366614 phase:post_early p_loop:1.000000 policy_loss:2.59323641 policy_bpb:1.19317489 loop_off_loss:2.64498917 loop_off_bpb:1.21698687 loop_on_loss:2.59323641 loop_on_bpb:1.19317489 delta_loss:-0.05175275 delta_bpb:-0.02381198
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:0 looped:0 grad_norm:5.19374346e-02 param_norm:1.34669189e+02 grad_param_ratio:3.85666796e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:1 looped:0 grad_norm:4.75725767e-02 param_norm:1.35052795e+02 grad_param_ratio:3.52251700e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:2 looped:0 grad_norm:4.49097979e-02 param_norm:1.36719664e+02 grad_param_ratio:3.28480898e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:3 looped:1 grad_norm:4.51016303e-02 param_norm:1.35420520e+02 grad_param_ratio:3.33048715e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:4 looped:1 grad_norm:4.16392470e-02 param_norm:1.36516155e+02 grad_param_ratio:3.05013329e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:5 looped:1 grad_norm:3.31827307e-02 param_norm:1.38042130e+02 grad_param_ratio:2.40381185e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:6 looped:0 grad_norm:3.62036709e-02 param_norm:1.38076906e+02 grad_param_ratio:2.62199320e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:7 looped:0 grad_norm:3.74170874e-02 param_norm:1.37693169e+02 grad_param_ratio:2.71742510e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:8 looped:0 grad_norm:4.26298188e-02 param_norm:1.40199618e+02 grad_param_ratio:3.04065158e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:9 looped:0 grad_norm:3.60251004e-02 param_norm:1.40820115e+02 grad_param_ratio:2.55823540e-04
+bump_layer_stats step:2217 frac:0.366614 phase:post_early layer:10 looped:0 grad_norm:5.64325346e-02 param_norm:1.35822960e+02 grad_param_ratio:4.15485972e-04
+bump_probe step:2218 frac:0.366873 phase:post_early loop_active:1 loss:2.59550658 bpb:1.19421942 eval_time:156ms
+bump_counterfactual step:2218 frac:0.366873 phase:post_early p_loop:1.000000 policy_loss:2.59550658 policy_bpb:1.19421942 loop_off_loss:2.66249128 loop_off_bpb:1.22503977 loop_on_loss:2.59550658 loop_on_bpb:1.19421942 delta_loss:-0.06698471 delta_bpb:-0.03082036
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:0 looped:0 grad_norm:5.72644438e-02 param_norm:1.34630275e+02 grad_param_ratio:4.25345962e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:1 looped:0 grad_norm:5.19193464e-02 param_norm:1.35010535e+02 grad_param_ratio:3.84557741e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:2 looped:0 grad_norm:4.89756460e-02 param_norm:1.36691410e+02 grad_param_ratio:3.58293516e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:3 looped:1 grad_norm:4.97052665e-02 param_norm:1.35417981e+02 grad_param_ratio:3.67050713e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:4 looped:1 grad_norm:4.79238270e-02 param_norm:1.36504631e+02 grad_param_ratio:3.51078397e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:5 looped:1 grad_norm:3.80118352e-02 param_norm:1.38101241e+02 grad_param_ratio:2.75246152e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:6 looped:0 grad_norm:4.21433088e-02 param_norm:1.38076941e+02 grad_param_ratio:3.05216124e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:7 looped:0 grad_norm:4.39168205e-02 param_norm:1.37697533e+02 grad_param_ratio:3.18936872e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:8 looped:0 grad_norm:4.88434423e-02 param_norm:1.40207700e+02 grad_param_ratio:3.48364907e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:9 looped:0 grad_norm:4.02583656e-02 param_norm:1.40819995e+02 grad_param_ratio:2.85885294e-04
+bump_layer_stats step:2218 frac:0.366873 phase:post_early layer:10 looped:0 grad_norm:6.04666001e-02 param_norm:1.35809271e+02 grad_param_ratio:4.45231755e-04
+bump_probe step:2219 frac:0.367133 phase:post_early loop_active:1 loss:2.59283544 bpb:1.19299040 eval_time:156ms
+bump_counterfactual step:2219 frac:0.367133 phase:post_early p_loop:1.000000 policy_loss:2.59283544 policy_bpb:1.19299040 loop_off_loss:2.64081694 loop_off_bpb:1.21506718 loop_on_loss:2.59283544 loop_on_bpb:1.19299040 delta_loss:-0.04798150 delta_bpb:-0.02207678
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:0 looped:0 grad_norm:5.83350626e-02 param_norm:1.34586862e+02 grad_param_ratio:4.33438017e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:1 looped:0 grad_norm:5.51866458e-02 param_norm:1.34961971e+02 grad_param_ratio:4.08905156e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:2 looped:0 grad_norm:5.17079512e-02 param_norm:1.36647544e+02 grad_param_ratio:3.78403808e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:3 looped:1 grad_norm:5.34621602e-02 param_norm:1.35405744e+02 grad_param_ratio:3.94829337e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:4 looped:1 grad_norm:4.91085956e-02 param_norm:1.36488746e+02 grad_param_ratio:3.59799596e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:5 looped:1 grad_norm:3.81834914e-02 param_norm:1.38146341e+02 grad_param_ratio:2.76398862e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:6 looped:0 grad_norm:4.04591374e-02 param_norm:1.38055292e+02 grad_param_ratio:2.93064734e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:7 looped:0 grad_norm:4.03095195e-02 param_norm:1.37687311e+02 grad_param_ratio:2.92761324e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:8 looped:0 grad_norm:4.31910982e-02 param_norm:1.40205101e+02 grad_param_ratio:3.08056539e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:9 looped:0 grad_norm:3.80827598e-02 param_norm:1.40812992e+02 grad_param_ratio:2.70449191e-04
+bump_layer_stats step:2219 frac:0.367133 phase:post_early layer:10 looped:0 grad_norm:5.58918945e-02 param_norm:1.35809050e+02 grad_param_ratio:4.11547643e-04
+bump_probe step:2300 frac:0.387463 phase:post_late loop_active:1 loss:2.57242520 bpb:1.18359944 eval_time:157ms
+bump_counterfactual step:2300 frac:0.387463 phase:post_late p_loop:1.000000 policy_loss:2.57242520 policy_bpb:1.18359944 loop_off_loss:2.61317315 loop_off_bpb:1.20234799 loop_on_loss:2.57242520 loop_on_bpb:1.18359944 delta_loss:-0.04074795 delta_bpb:-0.01874855
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:0 looped:0 grad_norm:5.83939869e-02 param_norm:1.33305881e+02 grad_param_ratio:4.38045091e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:1 looped:0 grad_norm:5.17408795e-02 param_norm:1.33622266e+02 grad_param_ratio:3.87217498e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:2 looped:0 grad_norm:5.04359966e-02 param_norm:1.35416147e+02 grad_param_ratio:3.72451865e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:3 looped:1 grad_norm:5.19622532e-02 param_norm:1.34330641e+02 grad_param_ratio:3.86823535e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:4 looped:1 grad_norm:5.27639221e-02 param_norm:1.35182389e+02 grad_param_ratio:3.90316537e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:5 looped:1 grad_norm:4.68509713e-02 param_norm:1.38504123e+02 grad_param_ratio:3.38264092e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:6 looped:0 grad_norm:4.23385839e-02 param_norm:1.38434163e+02 grad_param_ratio:3.05839130e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:7 looped:0 grad_norm:4.23361727e-02 param_norm:1.37718479e+02 grad_param_ratio:3.07410981e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:8 looped:0 grad_norm:4.15701821e-02 param_norm:1.40120829e+02 grad_param_ratio:2.96673823e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:9 looped:0 grad_norm:4.23906625e-02 param_norm:1.40397871e+02 grad_param_ratio:3.01932373e-04
+bump_layer_stats step:2300 frac:0.387463 phase:post_late layer:10 looped:0 grad_norm:6.64664495e-02 param_norm:1.35261726e+02 grad_param_ratio:4.91391403e-04
+bump_probe step:2301 frac:0.387722 phase:post_late loop_active:1 loss:2.56790618 bpb:1.18152019 eval_time:157ms
+bump_counterfactual step:2301 frac:0.387722 phase:post_late p_loop:1.000000 policy_loss:2.56790618 policy_bpb:1.18152019 loop_off_loss:2.60151827 loop_off_bpb:1.19698546 loop_on_loss:2.56790618 loop_on_bpb:1.18152019 delta_loss:-0.03361209 delta_bpb:-0.01546527
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:0 looped:0 grad_norm:5.31194960e-02 param_norm:1.33299966e+02 grad_param_ratio:3.98495946e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:1 looped:0 grad_norm:4.69079984e-02 param_norm:1.33612949e+02 grad_param_ratio:3.51073745e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:2 looped:0 grad_norm:4.59528291e-02 param_norm:1.35406125e+02 grad_param_ratio:3.39370386e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:3 looped:1 grad_norm:4.62803574e-02 param_norm:1.34317990e+02 grad_param_ratio:3.44558143e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:4 looped:1 grad_norm:4.72012865e-02 param_norm:1.35169912e+02 grad_param_ratio:3.49199654e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:5 looped:1 grad_norm:4.33127176e-02 param_norm:1.38478752e+02 grad_param_ratio:3.12775186e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:6 looped:0 grad_norm:4.12099152e-02 param_norm:1.38426571e+02 grad_param_ratio:2.97702349e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:7 looped:0 grad_norm:4.10393748e-02 param_norm:1.37710768e+02 grad_param_ratio:2.98011371e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:8 looped:0 grad_norm:4.14832530e-02 param_norm:1.40115412e+02 grad_param_ratio:2.96064882e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:9 looped:0 grad_norm:3.93035799e-02 param_norm:1.40391017e+02 grad_param_ratio:2.79957939e-04
+bump_layer_stats step:2301 frac:0.387722 phase:post_late layer:10 looped:0 grad_norm:5.91896307e-02 param_norm:1.35257645e+02 grad_param_ratio:4.37606546e-04
+bump_probe step:2302 frac:0.387980 phase:post_late loop_active:1 loss:2.57440784 bpb:1.18451167 eval_time:156ms
+bump_counterfactual step:2302 frac:0.387980 phase:post_late p_loop:1.000000 policy_loss:2.57440784 policy_bpb:1.18451167 loop_off_loss:2.61664880 loop_off_bpb:1.20394717 loop_on_loss:2.57440784 loop_on_bpb:1.18451167 delta_loss:-0.04224096 delta_bpb:-0.01943550
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:0 looped:0 grad_norm:5.88704413e-02 param_norm:1.33289923e+02 grad_param_ratio:4.41672109e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:1 looped:0 grad_norm:5.40287407e-02 param_norm:1.33605239e+02 grad_param_ratio:4.04390884e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:2 looped:0 grad_norm:5.15274336e-02 param_norm:1.35394128e+02 grad_param_ratio:3.80573620e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:3 looped:1 grad_norm:5.36124490e-02 param_norm:1.34304717e+02 grad_param_ratio:3.99185152e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:4 looped:1 grad_norm:5.34137064e-02 param_norm:1.35147857e+02 grad_param_ratio:3.95224220e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:5 looped:1 grad_norm:4.75306231e-02 param_norm:1.38458815e+02 grad_param_ratio:3.43283474e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:6 looped:0 grad_norm:4.33338220e-02 param_norm:1.38413751e+02 grad_param_ratio:3.13074544e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:7 looped:0 grad_norm:4.39066141e-02 param_norm:1.37699262e+02 grad_param_ratio:3.18858746e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:8 looped:0 grad_norm:4.47609548e-02 param_norm:1.40103238e+02 grad_param_ratio:3.19485512e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:9 looped:0 grad_norm:4.30792773e-02 param_norm:1.40370806e+02 grad_param_ratio:3.06896274e-04
+bump_layer_stats step:2302 frac:0.387980 phase:post_late layer:10 looped:0 grad_norm:6.41886269e-02 param_norm:1.35237948e+02 grad_param_ratio:4.74634731e-04
+bump_probe step:2303 frac:0.388239 phase:post_late loop_active:1 loss:2.57084433 bpb:1.18287206 eval_time:155ms
+bump_counterfactual step:2303 frac:0.388239 phase:post_late p_loop:1.000000 policy_loss:2.57084433 policy_bpb:1.18287206 loop_off_loss:2.60051060 loop_off_bpb:1.19652182 loop_on_loss:2.57084433 loop_on_bpb:1.18287206 delta_loss:-0.02966627 delta_bpb:-0.01364976
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:0 looped:0 grad_norm:5.40297856e-02 param_norm:1.33276285e+02 grad_param_ratio:4.05396847e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:1 looped:0 grad_norm:4.96310292e-02 param_norm:1.33589405e+02 grad_param_ratio:3.71519202e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:2 looped:0 grad_norm:4.72528180e-02 param_norm:1.35381984e+02 grad_param_ratio:3.49033280e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:3 looped:1 grad_norm:4.88448150e-02 param_norm:1.34292610e+02 grad_param_ratio:3.63719306e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:4 looped:1 grad_norm:4.87375246e-02 param_norm:1.35134401e+02 grad_param_ratio:3.60659643e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:5 looped:1 grad_norm:4.41062066e-02 param_norm:1.38432355e+02 grad_param_ratio:3.18611979e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:6 looped:0 grad_norm:4.23926164e-02 param_norm:1.38400258e+02 grad_param_ratio:3.06304461e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:7 looped:0 grad_norm:4.35719999e-02 param_norm:1.37684424e+02 grad_param_ratio:3.16462810e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:8 looped:0 grad_norm:4.68561905e-02 param_norm:1.40094992e+02 grad_param_ratio:3.34460139e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:9 looped:0 grad_norm:4.53163514e-02 param_norm:1.40362491e+02 grad_param_ratio:3.22852290e-04
+bump_layer_stats step:2303 frac:0.388239 phase:post_late layer:10 looped:0 grad_norm:7.00037203e-02 param_norm:1.35240609e+02 grad_param_ratio:5.17623522e-04
+bump_probe step:2304 frac:0.388499 phase:post_late loop_active:1 loss:2.57295480 bpb:1.18384311 eval_time:156ms
+bump_counterfactual step:2304 frac:0.388499 phase:post_late p_loop:1.000000 policy_loss:2.57295480 policy_bpb:1.18384311 loop_off_loss:2.61695671 loop_off_bpb:1.20408885 loop_on_loss:2.57295480 loop_on_bpb:1.18384311 delta_loss:-0.04400192 delta_bpb:-0.02024574
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:0 looped:0 grad_norm:5.17038824e-02 param_norm:1.33270551e+02 grad_param_ratio:3.87961797e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:1 looped:0 grad_norm:4.68199489e-02 param_norm:1.33584733e+02 grad_param_ratio:3.50488772e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:2 looped:0 grad_norm:4.49789822e-02 param_norm:1.35374100e+02 grad_param_ratio:3.32256924e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:3 looped:1 grad_norm:4.78441357e-02 param_norm:1.34281605e+02 grad_param_ratio:3.56297019e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:4 looped:1 grad_norm:4.87901911e-02 param_norm:1.35121647e+02 grad_param_ratio:3.61083454e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:5 looped:1 grad_norm:4.39933803e-02 param_norm:1.38419424e+02 grad_param_ratio:3.17826640e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:6 looped:0 grad_norm:4.21391613e-02 param_norm:1.38402274e+02 grad_param_ratio:3.04468705e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:7 looped:0 grad_norm:4.34663016e-02 param_norm:1.37677928e+02 grad_param_ratio:3.15710021e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:8 looped:0 grad_norm:4.87331835e-02 param_norm:1.40086033e+02 grad_param_ratio:3.47880387e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:9 looped:0 grad_norm:4.20211186e-02 param_norm:1.40348002e+02 grad_param_ratio:2.99406604e-04
+bump_layer_stats step:2304 frac:0.388499 phase:post_late layer:10 looped:0 grad_norm:6.59401639e-02 param_norm:1.35215688e+02 grad_param_ratio:4.87666518e-04
+bump_probe step:2305 frac:0.388758 phase:post_late loop_active:1 loss:2.57204700 bpb:1.18342542 eval_time:156ms
+bump_counterfactual step:2305 frac:0.388758 phase:post_late p_loop:1.000000 policy_loss:2.57204700 policy_bpb:1.18342542 loop_off_loss:2.60224778 loop_off_bpb:1.19732111 loop_on_loss:2.57204700 loop_on_bpb:1.18342542 delta_loss:-0.03020078 delta_bpb:-0.01389569
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:0 looped:0 grad_norm:4.94138761e-02 param_norm:1.33259755e+02 grad_param_ratio:3.70808697e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:1 looped:0 grad_norm:4.61192197e-02 param_norm:1.33572168e+02 grad_param_ratio:3.45275670e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:2 looped:0 grad_norm:4.40475773e-02 param_norm:1.35357980e+02 grad_param_ratio:3.25415445e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:3 looped:1 grad_norm:4.97039146e-02 param_norm:1.34266369e+02 grad_param_ratio:3.70188863e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:4 looped:1 grad_norm:5.11455792e-02 param_norm:1.35104953e+02 grad_param_ratio:3.78561838e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:5 looped:1 grad_norm:4.51444404e-02 param_norm:1.38391167e+02 grad_param_ratio:3.26208973e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:6 looped:0 grad_norm:4.24701887e-02 param_norm:1.38384142e+02 grad_param_ratio:3.06900689e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:7 looped:0 grad_norm:4.17763942e-02 param_norm:1.37657736e+02 grad_param_ratio:3.03480179e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:8 looped:0 grad_norm:5.40621493e-02 param_norm:1.40073563e+02 grad_param_ratio:3.85955408e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:9 looped:0 grad_norm:4.25482044e-02 param_norm:1.40336001e+02 grad_param_ratio:3.03188093e-04
+bump_layer_stats step:2305 frac:0.388758 phase:post_late layer:10 looped:0 grad_norm:6.63227680e-02 param_norm:1.35216538e+02 grad_param_ratio:4.90493018e-04
+bump_probe step:2306 frac:0.389018 phase:post_late loop_active:1 loss:2.57316969 bpb:1.18394198 eval_time:156ms
+bump_counterfactual step:2306 frac:0.389018 phase:post_late p_loop:1.000000 policy_loss:2.57316969 policy_bpb:1.18394198 loop_off_loss:2.61745366 loop_off_bpb:1.20431750 loop_on_loss:2.57316969 loop_on_bpb:1.18394198 delta_loss:-0.04428398 delta_bpb:-0.02037552
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:0 looped:0 grad_norm:5.39333253e-02 param_norm:1.33256927e+02 grad_param_ratio:4.04731870e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:1 looped:0 grad_norm:4.75374085e-02 param_norm:1.33569073e+02 grad_param_ratio:3.55901314e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:2 looped:0 grad_norm:4.67594814e-02 param_norm:1.35357846e+02 grad_param_ratio:3.45450838e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:3 looped:1 grad_norm:5.07755868e-02 param_norm:1.34256351e+02 grad_param_ratio:3.78198769e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:4 looped:1 grad_norm:5.13138102e-02 param_norm:1.35091593e+02 grad_param_ratio:3.79844586e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:5 looped:1 grad_norm:4.53590303e-02 param_norm:1.38376728e+02 grad_param_ratio:3.27793777e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:6 looped:0 grad_norm:4.21899437e-02 param_norm:1.38388251e+02 grad_param_ratio:3.04866513e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:7 looped:0 grad_norm:4.25592452e-02 param_norm:1.37657231e+02 grad_param_ratio:3.09168250e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:8 looped:0 grad_norm:5.48570958e-02 param_norm:1.40069081e+02 grad_param_ratio:3.91643148e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:9 looped:0 grad_norm:4.22687777e-02 param_norm:1.40327237e+02 grad_param_ratio:3.01215777e-04
+bump_layer_stats step:2306 frac:0.389018 phase:post_late layer:10 looped:0 grad_norm:7.03983888e-02 param_norm:1.35194152e+02 grad_param_ratio:5.20720663e-04
+bump_probe step:2307 frac:0.389277 phase:post_late loop_active:1 loss:2.56878080 bpb:1.18192261 eval_time:156ms
+bump_counterfactual step:2307 frac:0.389277 phase:post_late p_loop:1.000000 policy_loss:2.56878080 policy_bpb:1.18192261 loop_off_loss:2.59930701 loop_off_bpb:1.19596804 loop_on_loss:2.56878080 loop_on_bpb:1.18192261 delta_loss:-0.03052622 delta_bpb:-0.01404543
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:0 looped:0 grad_norm:4.52409643e-02 param_norm:1.33248265e+02 grad_param_ratio:3.39523853e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:1 looped:0 grad_norm:4.20008978e-02 param_norm:1.33557944e+02 grad_param_ratio:3.14476972e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:2 looped:0 grad_norm:4.06863211e-02 param_norm:1.35342708e+02 grad_param_ratio:3.00617018e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:3 looped:1 grad_norm:4.49533326e-02 param_norm:1.34240899e+02 grad_param_ratio:3.34870617e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:4 looped:1 grad_norm:4.53784687e-02 param_norm:1.35070281e+02 grad_param_ratio:3.35961903e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:5 looped:1 grad_norm:3.92930787e-02 param_norm:1.38346652e+02 grad_param_ratio:2.84019007e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:6 looped:0 grad_norm:3.72536539e-02 param_norm:1.38365311e+02 grad_param_ratio:2.69241283e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:7 looped:0 grad_norm:3.70007576e-02 param_norm:1.37633979e+02 grad_param_ratio:2.68834467e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:8 looped:0 grad_norm:5.02540586e-02 param_norm:1.40054320e+02 grad_param_ratio:3.58818340e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:9 looped:0 grad_norm:3.88079446e-02 param_norm:1.40310677e+02 grad_param_ratio:2.76585827e-04
+bump_layer_stats step:2307 frac:0.389277 phase:post_late layer:10 looped:0 grad_norm:6.76624910e-02 param_norm:1.35198289e+02 grad_param_ratio:5.00468546e-04
+bump_probe step:2308 frac:0.389535 phase:post_late loop_active:1 loss:2.57309746 bpb:1.18390875 eval_time:156ms
+bump_counterfactual step:2308 frac:0.389535 phase:post_late p_loop:1.000000 policy_loss:2.57309746 policy_bpb:1.18390875 loop_off_loss:2.61752425 loop_off_bpb:1.20434998 loop_on_loss:2.57309746 loop_on_bpb:1.18390875 delta_loss:-0.04442679 delta_bpb:-0.02044123
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:0 looped:0 grad_norm:4.97920302e-02 param_norm:1.33247852e+02 grad_param_ratio:3.73679797e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:1 looped:0 grad_norm:4.50844086e-02 param_norm:1.33559658e+02 grad_param_ratio:3.37560077e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:2 looped:0 grad_norm:4.38553687e-02 param_norm:1.35348270e+02 grad_param_ratio:3.24018688e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:3 looped:1 grad_norm:4.97166645e-02 param_norm:1.34234141e+02 grad_param_ratio:3.70372726e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:4 looped:1 grad_norm:5.06550698e-02 param_norm:1.35060715e+02 grad_param_ratio:3.75054062e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:5 looped:1 grad_norm:4.40933152e-02 param_norm:1.38331108e+02 grad_param_ratio:3.18751983e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:6 looped:0 grad_norm:4.07099244e-02 param_norm:1.38367246e+02 grad_param_ratio:2.94216484e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:7 looped:0 grad_norm:3.93117657e-02 param_norm:1.37635454e+02 grad_param_ratio:2.85622378e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:8 looped:0 grad_norm:4.95891880e-02 param_norm:1.40053239e+02 grad_param_ratio:3.54073839e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:9 looped:0 grad_norm:3.92613101e-02 param_norm:1.40302800e+02 grad_param_ratio:2.79832690e-04
+bump_layer_stats step:2308 frac:0.389535 phase:post_late layer:10 looped:0 grad_norm:6.50095144e-02 param_norm:1.35174943e+02 grad_param_ratio:4.80928734e-04
+bump_probe step:2309 frac:0.389796 phase:post_late loop_active:1 loss:2.56994929 bpb:1.18246025 eval_time:157ms
+bump_counterfactual step:2309 frac:0.389796 phase:post_late p_loop:1.000000 policy_loss:2.56994929 policy_bpb:1.18246025 loop_off_loss:2.59935185 loop_off_bpb:1.19598866 loop_on_loss:2.56994929 loop_on_bpb:1.18246025 delta_loss:-0.02940255 delta_bpb:-0.01352842
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:0 looped:0 grad_norm:5.38069281e-02 param_norm:1.33234615e+02 grad_param_ratio:4.03850968e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:1 looped:0 grad_norm:4.99621487e-02 param_norm:1.33545163e+02 grad_param_ratio:3.74121740e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:2 looped:0 grad_norm:4.69700464e-02 param_norm:1.35329319e+02 grad_param_ratio:3.47079605e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:3 looped:1 grad_norm:5.17230841e-02 param_norm:1.34215676e+02 grad_param_ratio:3.85372899e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:4 looped:1 grad_norm:5.27968115e-02 param_norm:1.35040431e+02 grad_param_ratio:3.90970402e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:5 looped:1 grad_norm:4.69379642e-02 param_norm:1.38303332e+02 grad_param_ratio:3.39384190e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:6 looped:0 grad_norm:4.45346912e-02 param_norm:1.38353375e+02 grad_param_ratio:3.21890891e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:7 looped:0 grad_norm:4.48155855e-02 param_norm:1.37620304e+02 grad_param_ratio:3.25646611e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:8 looped:0 grad_norm:4.72748454e-02 param_norm:1.40042233e+02 grad_param_ratio:3.37575633e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:9 looped:0 grad_norm:4.51710642e-02 param_norm:1.40286415e+02 grad_param_ratio:3.21991721e-04
+bump_layer_stats step:2309 frac:0.389796 phase:post_late layer:10 looped:0 grad_norm:8.46538645e-02 param_norm:1.35176097e+02 grad_param_ratio:6.26248771e-04
+bump_probe step:2310 frac:0.390059 phase:post_late loop_active:1 loss:2.57097563 bpb:1.18293247 eval_time:158ms
+bump_counterfactual step:2310 frac:0.390059 phase:post_late p_loop:1.000000 policy_loss:2.57097563 policy_bpb:1.18293247 loop_off_loss:2.61291932 loop_off_bpb:1.20223120 loop_on_loss:2.57097563 loop_on_bpb:1.18293247 delta_loss:-0.04194369 delta_bpb:-0.01929873
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:0 looped:0 grad_norm:4.59416219e-02 param_norm:1.33228431e+02 grad_param_ratio:3.44833469e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:1 looped:0 grad_norm:4.19335391e-02 param_norm:1.33539458e+02 grad_param_ratio:3.14016096e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:2 looped:0 grad_norm:4.11654758e-02 param_norm:1.35325740e+02 grad_param_ratio:3.04195460e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:3 looped:1 grad_norm:4.51789567e-02 param_norm:1.34204132e+02 grad_param_ratio:3.36643559e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:4 looped:1 grad_norm:4.63764278e-02 param_norm:1.35024570e+02 grad_param_ratio:3.43466583e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:5 looped:1 grad_norm:4.25042646e-02 param_norm:1.38279624e+02 grad_param_ratio:3.07379088e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:6 looped:0 grad_norm:3.88115518e-02 param_norm:1.38340565e+02 grad_param_ratio:2.80550769e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:7 looped:0 grad_norm:3.80157955e-02 param_norm:1.37610393e+02 grad_param_ratio:2.76256717e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:8 looped:0 grad_norm:4.54486248e-02 param_norm:1.40031291e+02 grad_param_ratio:3.24560492e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:9 looped:0 grad_norm:4.01412363e-02 param_norm:1.40267946e+02 grad_param_ratio:2.86175406e-04
+bump_layer_stats step:2310 frac:0.390059 phase:post_late layer:10 looped:0 grad_norm:6.86842575e-02 param_norm:1.35147701e+02 grad_param_ratio:5.08216249e-04
+bump_probe step:2311 frac:0.390318 phase:post_late loop_active:1 loss:2.56727059 bpb:1.18122775 eval_time:158ms
+bump_counterfactual step:2311 frac:0.390318 phase:post_late p_loop:1.000000 policy_loss:2.56727059 policy_bpb:1.18122775 loop_off_loss:2.60068162 loop_off_bpb:1.19660051 loop_on_loss:2.56727059 loop_on_bpb:1.18122775 delta_loss:-0.03341103 delta_bpb:-0.01537276
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:0 looped:0 grad_norm:4.81490087e-02 param_norm:1.33216703e+02 grad_param_ratio:3.61433723e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:1 looped:0 grad_norm:4.37115177e-02 param_norm:1.33528485e+02 grad_param_ratio:3.27357251e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:2 looped:0 grad_norm:4.35126527e-02 param_norm:1.35314741e+02 grad_param_ratio:3.21566242e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:3 looped:1 grad_norm:4.61012473e-02 param_norm:1.34188738e+02 grad_param_ratio:3.43555263e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:4 looped:1 grad_norm:4.59551862e-02 param_norm:1.35005578e+02 grad_param_ratio:3.40394723e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:5 looped:1 grad_norm:4.13338158e-02 param_norm:1.38257531e+02 grad_param_ratio:2.98962492e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:6 looped:0 grad_norm:3.72901407e-02 param_norm:1.38334256e+02 grad_param_ratio:2.69565485e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:7 looped:0 grad_norm:3.78427715e-02 param_norm:1.37600190e+02 grad_param_ratio:2.75019763e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:8 looped:0 grad_norm:4.44353649e-02 param_norm:1.40022984e+02 grad_param_ratio:3.17343365e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:9 looped:0 grad_norm:3.88651712e-02 param_norm:1.40255086e+02 grad_param_ratio:2.77103471e-04
+bump_layer_stats step:2311 frac:0.390318 phase:post_late layer:10 looped:0 grad_norm:6.25025958e-02 param_norm:1.35146377e+02 grad_param_ratio:4.62480736e-04
+bump_probe step:2312 frac:0.390574 phase:post_late loop_active:1 loss:2.56971428 bpb:1.18235211 eval_time:156ms
+bump_counterfactual step:2312 frac:0.390574 phase:post_late p_loop:1.000000 policy_loss:2.56971428 policy_bpb:1.18235211 loop_off_loss:2.61006719 loop_off_bpb:1.20091891 loop_on_loss:2.56971428 loop_on_bpb:1.18235211 delta_loss:-0.04035291 delta_bpb:-0.01856679
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:0 looped:0 grad_norm:5.61686767e-02 param_norm:1.33209016e+02 grad_param_ratio:4.21658220e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:1 looped:0 grad_norm:5.28949217e-02 param_norm:1.33520571e+02 grad_param_ratio:3.96155600e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:2 looped:0 grad_norm:4.78655550e-02 param_norm:1.35308206e+02 grad_param_ratio:3.53752047e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:3 looped:1 grad_norm:5.27659367e-02 param_norm:1.34177204e+02 grad_param_ratio:3.93255599e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:4 looped:1 grad_norm:5.27052905e-02 param_norm:1.34991277e+02 grad_param_ratio:3.90434787e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:5 looped:1 grad_norm:4.73607413e-02 param_norm:1.38235911e+02 grad_param_ratio:3.42608090e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:6 looped:0 grad_norm:4.46184374e-02 param_norm:1.38323880e+02 grad_param_ratio:3.22564965e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:7 looped:0 grad_norm:4.48655661e-02 param_norm:1.37592075e+02 grad_param_ratio:3.26076672e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:8 looped:0 grad_norm:6.17877275e-02 param_norm:1.40014869e+02 grad_param_ratio:4.41294043e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:9 looped:0 grad_norm:4.65118561e-02 param_norm:1.40239162e+02 grad_param_ratio:3.31660967e-04
+bump_layer_stats step:2312 frac:0.390574 phase:post_late layer:10 looped:0 grad_norm:6.94473148e-02 param_norm:1.35124590e+02 grad_param_ratio:5.13950236e-04
+bump_probe step:2313 frac:0.390832 phase:post_late loop_active:1 loss:2.56929242 bpb:1.18215801 eval_time:157ms
+bump_counterfactual step:2313 frac:0.390832 phase:post_late p_loop:1.000000 policy_loss:2.56929242 policy_bpb:1.18215801 loop_off_loss:2.60433871 loop_off_bpb:1.19828317 loop_on_loss:2.56929242 loop_on_bpb:1.18215801 delta_loss:-0.03504629 delta_bpb:-0.01612516
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:0 looped:0 grad_norm:8.32019847e-02 param_norm:1.33200705e+02 grad_param_ratio:6.24636219e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:1 looped:0 grad_norm:6.92225347e-02 param_norm:1.33508633e+02 grad_param_ratio:5.18487331e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:2 looped:0 grad_norm:6.38659019e-02 param_norm:1.35291006e+02 grad_param_ratio:4.72063177e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:3 looped:1 grad_norm:6.94115457e-02 param_norm:1.34156376e+02 grad_param_ratio:5.17392820e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:4 looped:1 grad_norm:7.12243071e-02 param_norm:1.34968072e+02 grad_param_ratio:5.27712265e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:5 looped:1 grad_norm:6.44295580e-02 param_norm:1.38205303e+02 grad_param_ratio:4.66187307e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:6 looped:0 grad_norm:6.69584626e-02 param_norm:1.38311941e+02 grad_param_ratio:4.84111944e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:7 looped:0 grad_norm:7.13788750e-02 param_norm:1.37576831e+02 grad_param_ratio:5.18829185e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:8 looped:0 grad_norm:7.51325155e-02 param_norm:1.40001810e+02 grad_param_ratio:5.36653887e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:9 looped:0 grad_norm:7.31794784e-02 param_norm:1.40222453e+02 grad_param_ratio:5.21881315e-04
+bump_layer_stats step:2313 frac:0.390832 phase:post_late layer:10 looped:0 grad_norm:1.12820371e-01 param_norm:1.35118575e+02 grad_param_ratio:8.34973067e-04
+bump_probe step:2314 frac:0.391095 phase:post_late loop_active:1 loss:2.56828456 bpb:1.18169428 eval_time:156ms
+bump_counterfactual step:2314 frac:0.391095 phase:post_late p_loop:1.000000 policy_loss:2.56828456 policy_bpb:1.18169428 loop_off_loss:2.60399311 loop_off_bpb:1.19812416 loop_on_loss:2.56828456 loop_on_bpb:1.18169428 delta_loss:-0.03570855 delta_bpb:-0.01642987
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:0 looped:0 grad_norm:5.59960107e-02 param_norm:1.33181812e+02 grad_param_ratio:4.20447881e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:1 looped:0 grad_norm:5.20754744e-02 param_norm:1.33496930e+02 grad_param_ratio:3.90087431e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:2 looped:0 grad_norm:4.96498659e-02 param_norm:1.35279047e+02 grad_param_ratio:3.67018152e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:3 looped:1 grad_norm:5.48217208e-02 param_norm:1.34137745e+02 grad_param_ratio:4.08697199e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:4 looped:1 grad_norm:5.38708772e-02 param_norm:1.34950523e+02 grad_param_ratio:3.99189836e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:5 looped:1 grad_norm:4.80068646e-02 param_norm:1.38179236e+02 grad_param_ratio:3.47424591e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:6 looped:0 grad_norm:4.39951862e-02 param_norm:1.38304615e+02 grad_param_ratio:3.18103531e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:7 looped:0 grad_norm:4.49116036e-02 param_norm:1.37565781e+02 grad_param_ratio:3.26473658e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:8 looped:0 grad_norm:4.43530901e-02 param_norm:1.39992526e+02 grad_param_ratio:3.16824699e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:9 looped:0 grad_norm:4.43170512e-02 param_norm:1.40206005e+02 grad_param_ratio:3.16085258e-04
+bump_layer_stats step:2314 frac:0.391095 phase:post_late layer:10 looped:0 grad_norm:7.06577366e-02 param_norm:1.35096686e+02 grad_param_ratio:5.23016060e-04
+bump_probe step:2315 frac:0.391352 phase:post_late loop_active:1 loss:2.57038144 bpb:1.18265908 eval_time:156ms
+bump_counterfactual step:2315 frac:0.391352 phase:post_late p_loop:1.000000 policy_loss:2.57038144 policy_bpb:1.18265908 loop_off_loss:2.60886790 loop_off_bpb:1.20036710 loop_on_loss:2.57038144 loop_on_bpb:1.18265908 delta_loss:-0.03848646 delta_bpb:-0.01770802
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:0 looped:0 grad_norm:5.61915734e-02 param_norm:1.33172099e+02 grad_param_ratio:4.21947043e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:1 looped:0 grad_norm:5.07543653e-02 param_norm:1.33481501e+02 grad_param_ratio:3.80235202e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:2 looped:0 grad_norm:4.73270590e-02 param_norm:1.35259898e+02 grad_param_ratio:3.49897194e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:3 looped:1 grad_norm:5.19610157e-02 param_norm:1.34117731e+02 grad_param_ratio:3.87428383e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:4 looped:1 grad_norm:5.13113904e-02 param_norm:1.34928611e+02 grad_param_ratio:3.80285471e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:5 looped:1 grad_norm:4.37719078e-02 param_norm:1.38143726e+02 grad_param_ratio:3.16857733e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:6 looped:0 grad_norm:3.84434077e-02 param_norm:1.38284922e+02 grad_param_ratio:2.78001443e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:7 looped:0 grad_norm:3.91790978e-02 param_norm:1.37542936e+02 grad_param_ratio:2.84849945e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:8 looped:0 grad_norm:4.00930199e-02 param_norm:1.39971389e+02 grad_param_ratio:2.86437251e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:9 looped:0 grad_norm:3.85466554e-02 param_norm:1.40179746e+02 grad_param_ratio:2.74980206e-04
+bump_layer_stats step:2315 frac:0.391352 phase:post_late layer:10 looped:0 grad_norm:6.23326900e-02 param_norm:1.35074863e+02 grad_param_ratio:4.61467729e-04
+bump_probe step:2316 frac:0.391612 phase:post_late loop_active:1 loss:2.56522127 bpb:1.18028484 eval_time:157ms
+bump_counterfactual step:2316 frac:0.391612 phase:post_late p_loop:1.000000 policy_loss:2.56522127 policy_bpb:1.18028484 loop_off_loss:2.60130539 loop_off_bpb:1.19688751 loop_on_loss:2.56522127 loop_on_bpb:1.18028484 delta_loss:-0.03608411 delta_bpb:-0.01660267
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:0 looped:0 grad_norm:5.40576461e-02 param_norm:1.33157689e+02 grad_param_ratio:4.05967140e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:1 looped:0 grad_norm:5.03387577e-02 param_norm:1.33475983e+02 grad_param_ratio:3.77137195e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:2 looped:0 grad_norm:4.67778802e-02 param_norm:1.35252020e+02 grad_param_ratio:3.45857165e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:3 looped:1 grad_norm:5.20502376e-02 param_norm:1.34105710e+02 grad_param_ratio:3.88128421e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:4 looped:1 grad_norm:5.08361758e-02 param_norm:1.34915246e+02 grad_param_ratio:3.76800822e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:5 looped:1 grad_norm:4.51378624e-02 param_norm:1.38125089e+02 grad_param_ratio:3.26789743e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:6 looped:0 grad_norm:4.02089991e-02 param_norm:1.38278488e+02 grad_param_ratio:2.90782751e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:7 looped:0 grad_norm:4.12968659e-02 param_norm:1.37537211e+02 grad_param_ratio:3.00259585e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:8 looped:0 grad_norm:4.31691332e-02 param_norm:1.39965543e+02 grad_param_ratio:3.08426862e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:9 looped:0 grad_norm:4.18076032e-02 param_norm:1.40171319e+02 grad_param_ratio:2.98260752e-04
+bump_layer_stats step:2316 frac:0.391612 phase:post_late layer:10 looped:0 grad_norm:7.03662872e-02 param_norm:1.35066631e+02 grad_param_ratio:5.20974622e-04
+bump_probe step:2317 frac:0.391873 phase:post_late loop_active:1 loss:2.57373186 bpb:1.18420065 eval_time:156ms
+bump_counterfactual step:2317 frac:0.391873 phase:post_late p_loop:1.000000 policy_loss:2.57373186 policy_bpb:1.18420065 loop_off_loss:2.61055030 loop_off_bpb:1.20114119 loop_on_loss:2.57373186 loop_on_bpb:1.18420065 delta_loss:-0.03681844 delta_bpb:-0.01694054
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:0 looped:0 grad_norm:5.14972385e-02 param_norm:1.33152268e+02 grad_param_ratio:3.86754498e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:1 looped:0 grad_norm:4.72311179e-02 param_norm:1.33464678e+02 grad_param_ratio:3.53884778e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:2 looped:0 grad_norm:4.66826159e-02 param_norm:1.35233420e+02 grad_param_ratio:3.45200291e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:3 looped:1 grad_norm:5.30835256e-02 param_norm:1.34085094e+02 grad_param_ratio:3.95894308e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:4 looped:1 grad_norm:5.43042617e-02 param_norm:1.34892273e+02 grad_param_ratio:4.02575036e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:5 looped:1 grad_norm:4.82014471e-02 param_norm:1.38092431e+02 grad_param_ratio:3.49052057e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:6 looped:0 grad_norm:4.14769386e-02 param_norm:1.38259467e+02 grad_param_ratio:2.99993479e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:7 looped:0 grad_norm:4.15206579e-02 param_norm:1.37516272e+02 grad_param_ratio:3.01932691e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:8 looped:0 grad_norm:4.23654291e-02 param_norm:1.39943019e+02 grad_param_ratio:3.02733421e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:9 looped:0 grad_norm:4.12078228e-02 param_norm:1.40147338e+02 grad_param_ratio:2.94032148e-04
+bump_layer_stats step:2317 frac:0.391873 phase:post_late layer:10 looped:0 grad_norm:7.67380454e-02 param_norm:1.35051355e+02 grad_param_ratio:5.68213813e-04
+bump_probe step:2318 frac:0.392133 phase:post_late loop_active:1 loss:2.56409364 bpb:1.17976600 eval_time:155ms
+bump_counterfactual step:2318 frac:0.392133 phase:post_late p_loop:1.000000 policy_loss:2.56409364 policy_bpb:1.17976600 loop_off_loss:2.60032823 loop_off_bpb:1.19643791 loop_on_loss:2.56409364 loop_on_bpb:1.17976600 delta_loss:-0.03623459 delta_bpb:-0.01667191
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:0 looped:0 grad_norm:5.11071917e-02 param_norm:1.33142384e+02 grad_param_ratio:3.83853662e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:1 looped:0 grad_norm:4.63501895e-02 param_norm:1.33458583e+02 grad_param_ratio:3.47300177e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:2 looped:0 grad_norm:4.50108630e-02 param_norm:1.35230182e+02 grad_param_ratio:3.32846280e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:3 looped:1 grad_norm:4.77535826e-02 param_norm:1.34077684e+02 grad_param_ratio:3.56163539e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:4 looped:1 grad_norm:4.81385803e-02 param_norm:1.34880258e+02 grad_param_ratio:3.56898636e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:5 looped:1 grad_norm:4.35463138e-02 param_norm:1.38078527e+02 grad_param_ratio:3.15373539e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:6 looped:0 grad_norm:3.91691090e-02 param_norm:1.38257292e+02 grad_param_ratio:2.83305918e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:7 looped:0 grad_norm:4.00842858e-02 param_norm:1.37515456e+02 grad_param_ratio:2.91489312e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:8 looped:0 grad_norm:4.26218135e-02 param_norm:1.39939879e+02 grad_param_ratio:3.04572319e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:9 looped:0 grad_norm:4.11914761e-02 param_norm:1.40141451e+02 grad_param_ratio:2.93927856e-04
+bump_layer_stats step:2318 frac:0.392133 phase:post_late layer:10 looped:0 grad_norm:6.75324823e-02 param_norm:1.35042649e+02 grad_param_ratio:5.00082625e-04
+bump_probe step:2319 frac:0.392394 phase:post_late loop_active:1 loss:2.57046968 bpb:1.18269968 eval_time:155ms
+bump_counterfactual step:2319 frac:0.392394 phase:post_late p_loop:1.000000 policy_loss:2.57046968 policy_bpb:1.18269968 loop_off_loss:2.60823194 loop_off_bpb:1.20007449 loop_on_loss:2.57046968 loop_on_bpb:1.18269968 delta_loss:-0.03776225 delta_bpb:-0.01737480
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:0 looped:0 grad_norm:5.10951316e-02 param_norm:1.33138635e+02 grad_param_ratio:3.83773888e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:1 looped:0 grad_norm:4.67754995e-02 param_norm:1.33451445e+02 grad_param_ratio:3.50505755e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:2 looped:0 grad_norm:4.46523624e-02 param_norm:1.35215876e+02 grad_param_ratio:3.30230174e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:3 looped:1 grad_norm:4.73829629e-02 param_norm:1.34060331e+02 grad_param_ratio:3.53445068e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:4 looped:1 grad_norm:4.77474111e-02 param_norm:1.34860777e+02 grad_param_ratio:3.54049652e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:5 looped:1 grad_norm:4.23382982e-02 param_norm:1.38045799e+02 grad_param_ratio:3.06697477e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:6 looped:0 grad_norm:3.78293044e-02 param_norm:1.38239528e+02 grad_param_ratio:2.73650416e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:7 looped:0 grad_norm:3.97184265e-02 param_norm:1.37499014e+02 grad_param_ratio:2.88863354e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:8 looped:0 grad_norm:4.12270729e-02 param_norm:1.39921132e+02 grad_param_ratio:2.94645078e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:9 looped:0 grad_norm:3.83646529e-02 param_norm:1.40120664e+02 grad_param_ratio:2.73797253e-04
+bump_layer_stats step:2319 frac:0.392394 phase:post_late layer:10 looped:0 grad_norm:6.24380081e-02 param_norm:1.35024666e+02 grad_param_ratio:4.62419275e-04
+2500/20000 train_loss: 2.5563 train_time: 4.3m tok/s: 7541519
+3000/20000 train_loss: 2.5610 train_time: 5.5m tok/s: 7088386
+3500/20000 train_loss: 2.5634 train_time: 6.7m tok/s: 6806682
+4000/20000 train_loss: 2.3922 train_time: 8.3m tok/s: 6350960
+4000/20000 val_loss: 2.4112 val_bpb: 1.1018
+seq_len_curriculum:bump step:4035 frac:0.850 seq_len:2048->8192
+4500/20000 train_loss: 2.1731 train_time: 9.8m tok/s: 6031870
+4555/20000 val_loss: 2.3193 val_bpb: 1.0598
+stopping_early: wallclock_cap train_time: 596138ms step: 4555/20000
+peak memory allocated: 40055 MiB reserved: 44084 MiB
+control_scalars_jsonl reason:final_pre_ema step:4555 path:logs/9ae4269b-f624-4547-ab84-2279c1f14475_loop_extra_scalars.jsonl
+ema:applying EMA weights
+control_scalars_jsonl reason:final_post_ema step:4555 path:logs/9ae4269b-f624-4547-ab84-2279c1f14475_loop_extra_scalars.jsonl
+diagnostic pre-quantization post-ema val_loss:2.32019824 val_bpb:1.06022994 eval_time:14957ms
+Serialized model: 135643006 bytes
+Code size (uncompressed): 166482 bytes
+Code size (compressed): 33185 bytes
+GPTQ:collecting Hessians from calibration data...
+GPTQ:collected 67 Hessians in 3.7s
+Quantized weights:
+  gate_int8_row: blocks.attn.attn_gate_w
+  gptq (int6): blocks.attn.c_k.weight, blocks.attn.c_q.weight, blocks.attn.c_v.weight, blocks.attn.proj.weight, blocks.mlp.fc.weight, blocks.mlp.proj.weight
+  gptq (int7): tok_emb.weight
+  passthrough (float16): blocks.attn.q_gain, blocks.attn_scale, blocks.mlp_scale, blocks.resid_mix, loop_extra_attn_scale, loop_extra_mlp_scale, loop_extra_resid_mix, parallel_post_lambdas, parallel_resid_lambdas, skip_gates, skip_weights
+Serialized model quantized+brotli: 15967121 bytes
+Total submission size quantized+brotli: 16000306 bytes
+diagnostic quantized val_loss:2.33967272 val_bpb:1.06912894 eval_time:36237ms
+ttt_lora:warming up compile (random tokens, no val data)

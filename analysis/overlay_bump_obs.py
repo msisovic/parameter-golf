@@ -38,30 +38,23 @@ def to_int(row, key, default=0):
         return default
 
 
-def read_counterfactuals(path):
+def read_probes(path):
     rows = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         parts = line.strip().split()
-        if not parts or parts[0] != "bump_counterfactual":
+        if not parts or parts[0] != "bump_probe":
             continue
         row = parse_kv(parts[1:])
         step = to_int(row, "step", -1)
         if step < 0:
             continue
-        off = to_float(row, "loop_off_loss")
-        on = to_float(row, "loop_on_loss")
-        p_loop = to_float(row, "p_loop")
-        policy = to_float(row, "policy_loss")
-        if math.isnan(policy) and not math.isnan(off) and not math.isnan(on) and not math.isnan(p_loop):
-            policy = (1.0 - p_loop) * off + p_loop * on
         rows.append(
             {
                 "step": step,
-                "p_loop": p_loop,
-                "policy_loss": policy,
-                "loop_off_loss": off,
-                "loop_on_loss": on,
-                "delta_loss": to_float(row, "delta_loss"),
+                "phase": row.get("phase", ""),
+                "probe_loss": to_float(row, "loss"),
+                "probe_bpb": to_float(row, "bpb"),
+                "loop_active": to_float(row, "loop_active"),
             }
         )
     return rows
@@ -73,6 +66,15 @@ def metric_points(rows, metric):
         for row in rows
         if metric in row and not math.isnan(row[metric])
     ]
+
+
+def phase_mean(rows, metric, phase):
+    vals = [
+        row[metric]
+        for row in rows
+        if row.get("phase") == phase and metric in row and not math.isnan(row[metric])
+    ]
+    return sum(vals) / len(vals) if vals else math.nan
 
 
 def write_svg(path, series, title, ylabel, markers):
@@ -135,22 +137,20 @@ def write_svg(path, series, title, ylabel, markers):
     Path(path).write_text("\n".join(elems), encoding="utf-8")
 
 
-def summarize(name, rows):
-    policy = metric_points(rows, "policy_loss")
-    delta = metric_points(rows, "delta_loss")
-    if not policy:
-        print(f"{name}: no policy_loss rows")
+def summarize_probes(name, rows):
+    pts = metric_points(rows, "probe_loss")
+    if not pts:
+        print(f"{name}: no bump_probe rows")
         return
-    vals = [y for _, y in policy]
-    pvals = [row["p_loop"] for row in rows if not math.isnan(row["p_loop"])]
+    vals = [y for _, y in pts]
     print(
-        f"{name}: rows={len(rows)} steps={policy[0][0]}..{policy[-1][0]} "
-        f"policy_min={min(vals):.6f} policy_max={max(vals):.6f} "
-        f"p_loop={min(pvals):.3f}..{max(pvals):.3f}"
+        f"{name} probes: rows={len(rows)} steps={pts[0][0]}..{pts[-1][0]} "
+        f"loss_min={min(vals):.6f} loss_max={max(vals):.6f}"
     )
-    if delta:
-        dvals = [y for _, y in delta]
-        print(f"  delta_min={min(dvals):.6f} delta_max={max(dvals):.6f}")
+    for phase in ("pre", "post_early", "post_late"):
+        pm = phase_mean(rows, "probe_loss", phase)
+        if not math.isnan(pm):
+            print(f"  {phase}: probe_loss_mean={pm:.6f}")
 
 
 def main():
@@ -171,27 +171,34 @@ def main():
         else:
             path = spec
             label = Path(path).stem
-        rows = read_counterfactuals(path)
-        runs.append({"label": label, "path": path, "rows": rows, "color": COLORS[idx % len(COLORS)]})
-        summarize(label, rows)
+        probes = read_probes(path)
+        runs.append(
+            {
+                "label": label,
+                "path": path,
+                "probes": probes,
+                "color": COLORS[idx % len(COLORS)],
+            }
+        )
+        summarize_probes(label, probes)
     markers = [
-        {"step": 2000, "label": "ramp start", "color": "#777", "lane": 0},
-        {"step": 2200, "label": "hard switch / midpoint", "color": "#111", "lane": 1},
-        {"step": 2400, "label": "ramp end", "color": "#777", "lane": 2},
+        {"step": 2180, "label": "pre probes", "color": "#777", "lane": 0},
+        {"step": 2200, "label": "hard switch", "color": "#111", "lane": 1},
+        {"step": 2300, "label": "post-late probes", "color": "#777", "lane": 2},
     ]
-    for metric, title, ylabel in (
-        ("policy_loss", "Policy Loss Overlay", "loss"),
-        ("loop_on_loss", "Loop-On Loss Overlay", "loss"),
-        ("delta_loss", "Loop-On Minus Loop-Off Overlay", "loss delta"),
-        ("p_loop", "Loop Probability Overlay", "p_loop"),
-    ):
-        series = []
-        for run in runs:
-            pts = metric_points(run["rows"], metric)
-            if pts:
-                series.append({"name": run["label"], "points": pts, "color": run["color"]})
-        write_svg(out_dir / f"{metric}_overlay.svg", series, title, ylabel, markers)
-    print(f"wrote {out_dir}")
+    series = []
+    for run in runs:
+        pts = metric_points(run["probes"], "probe_loss")
+        if pts:
+            series.append({"name": run["label"], "points": pts, "color": run["color"]})
+    write_svg(
+        out_dir / "probe_loss_overlay.svg",
+        series,
+        "Bump Probe Loss Overlay",
+        "loss",
+        markers,
+    )
+    print(f"wrote {out_dir / 'probe_loss_overlay.svg'}")
 
 
 if __name__ == "__main__":
