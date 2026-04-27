@@ -1307,6 +1307,59 @@ class GPT(nn.Module):
             x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
+        if not self.looping_active:
+            skips = []
+            for i, extra_pass, loop_local_idx in self.base_encoder_loop_entries:
+                q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
+                x = self.blocks[i](
+                    x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                )
+                skips.append(x)
+            psl = self.parallel_start_layer
+            lane0 = None
+            lane1 = None
+            for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(self.base_decoder_loop_entries):
+                q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
+                if i >= psl and psl > 0:
+                    if lane0 is None:
+                        lane0 = x
+                        lane1 = x
+                    if skip_idx < self.num_skip_weights and skips:
+                        skip = skips.pop()
+                        w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+                            lane0 = torch.lerp(w * skip, lane0, g)
+                        else:
+                            lane0 = lane0 + w * skip
+                    lane0, lane1 = self._parallel_block(
+                        i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                    )
+                else:
+                    if skip_idx < self.num_skip_weights and skips:
+                        scaled_skip = (
+                            self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
+                            * skips.pop()
+                        )
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                            x = torch.lerp(scaled_skip, x, g)
+                        else:
+                            x = x + scaled_skip
+                    x = self.blocks[i](
+                        x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                    )
+            if lane0 is not None:
+                x = self._final_parallel_hidden(lane0, lane1)
+            x = self.final_norm(x)
+            if self.tie_embeddings:
+                logits_proj = F.linear(x, self.tok_emb.weight)
+            else:
+                logits_proj = self.lm_head(x)
+            return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         skips = []
         identity_skips = [None] * self.num_skip_weights if self.loop_identity_topology else None
         use_identity_skips = self.looping_active and self.loop_identity_topology
@@ -1401,6 +1454,69 @@ class GPT(nn.Module):
             x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
+        if not self.looping_active:
+            skips = []
+            slot = 0
+            for i, extra_pass, loop_local_idx in self.base_encoder_loop_entries:
+                q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
+                x = self._block_with_lora(
+                    self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w,
+                    down_w, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                )
+                slot += 1
+                skips.append(x)
+            psl = self.parallel_start_layer
+            lane0 = None
+            lane1 = None
+            for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(self.base_decoder_loop_entries):
+                q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
+                if i >= psl and psl > 0:
+                    if lane0 is None:
+                        lane0 = x
+                        lane1 = x
+                    if skip_idx < self.num_skip_weights and skips:
+                        skip = skips.pop()
+                        w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+                            lane0 = torch.lerp(w * skip, lane0, g)
+                        else:
+                            lane0 = lane0 + w * skip
+                    lane0, lane1 = self._parallel_block_with_lora(
+                        i, lane0, lane1, x0, lora, slot,
+                        q_w, k_w, v_w, out_w, up_w, down_w,
+                        max_seqlen=max_seqlen,
+                        rotary_slot=rotary_slot,
+                    )
+                else:
+                    if skip_idx < self.num_skip_weights and skips:
+                        scaled_skip = (
+                            self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
+                            * skips.pop()
+                        )
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                            x = torch.lerp(scaled_skip, x, g)
+                        else:
+                            x = x + scaled_skip
+                    x = self._block_with_lora(
+                        self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w,
+                        down_w, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                    )
+                slot += 1
+            if lane0 is not None:
+                x = self._final_parallel_hidden(lane0, lane1)
+            x = self.final_norm(x)
+            if self.tie_embeddings:
+                logits = F.linear(x, self.tok_emb.weight)
+            else:
+                logits = self.lm_head(x)
+            logits = logits + lora.lm_head_lora(x)
+            logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+            bsz, sl, V = logits.shape
+            return F.cross_entropy(
+                logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
+            ).reshape(bsz, sl)
         skips = []
         identity_skips = [None] * self.num_skip_weights if self.loop_identity_topology else None
         use_identity_skips = self.looping_active and self.loop_identity_topology
