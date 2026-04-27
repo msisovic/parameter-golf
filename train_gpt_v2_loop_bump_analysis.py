@@ -1045,6 +1045,8 @@ class GPT(nn.Module):
         self.loop_untie_extra_scalars = bool(h.loop_untie_extra_scalars and h.num_loops > 0)
         self.loop_identity_topology = bool(h.loop_identity_topology and h.num_loops > 0)
         self.loop_width = max(h.loop_end - h.loop_start + 1, 0) if h.num_loops > 0 else 0
+        self.loop_identity_aux_skip_start = -1
+        self.loop_identity_aux_skip_count = 0
         self.base_encoder_loop_entries = [
             (i, -1, -1) for i in range(self.num_encoder_layers)
         ]
@@ -1060,21 +1062,35 @@ class GPT(nn.Module):
                     )
             loop_seg = list(range(h.loop_start, h.loop_end + 1))
             if self.loop_identity_topology:
-                if not (0 <= h.loop_start <= h.loop_end < self.num_encoder_layers):
+                if not self.loop_untie_extra_scalars:
                     raise ValueError(
-                        "LOOP_IDENTITY_TOPOLOGY requires the recurrent segment to be "
-                        "inside the base encoder: "
-                        f"loop_start={h.loop_start} loop_end={h.loop_end} "
-                        f"num_encoder_layers={self.num_encoder_layers}"
+                        "LOOP_IDENTITY_TOPOLOGY requires LOOP_UNTIE_EXTRA_SCALARS=1 "
+                        "so recurrent extra calls can initialize to identity"
                     )
-                extra_entries = []
-                for extra_pass in range(h.num_loops):
-                    extra_entries.extend(
-                        (i, extra_pass, local_idx)
-                        for local_idx, i in enumerate(loop_seg)
+                if not (
+                    h.num_layers == 11
+                    and self.num_encoder_layers == 5
+                    and h.loop_start == 3
+                    and h.loop_end == 5
+                    and h.num_loops == 2
+                ):
+                    raise ValueError(
+                        "LOOP_IDENTITY_TOPOLOGY is a special case for "
+                        "NUM_LAYERS=11 NUM_ENCODER_LAYERS=5 LOOP_START=3 "
+                        "LOOP_END=5 NUM_LOOPS=2"
                     )
-                self.encoder_loop_entries = self.base_encoder_loop_entries + extra_entries
-                self.decoder_loop_entries = self.base_decoder_loop_entries
+                self.encoder_loop_entries = self.base_encoder_loop_entries + [
+                    (5, 0, 2),
+                    (3, 0, 0),
+                    (4, 0, 1),
+                ]
+                self.decoder_loop_entries = [
+                    (5, 1, 2),
+                    (3, 1, 0),
+                    (4, 1, 1),
+                ] + self.base_decoder_loop_entries
+                self.loop_identity_aux_skip_start = self.num_encoder_layers
+                self.loop_identity_aux_skip_count = 3
             else:
                 all_entries = [(i, -1, -1) for i in range(h.loop_start)]
                 for pass_idx in range(h.num_loops + 1):
@@ -1110,14 +1126,9 @@ class GPT(nn.Module):
             self.loop_extra_attn_scale = None
             self.loop_extra_mlp_scale = None
             self.loop_extra_resid_mix = None
-        if self.loop_identity_topology:
-            self.num_skip_weights = min(
-                self.num_encoder_layers, len(self.decoder_indices)
-            )
-        else:
-            self.num_skip_weights = min(
-                len(self.encoder_indices), len(self.decoder_indices)
-            )
+        self.num_skip_weights = min(
+            len(self.encoder_indices), len(self.decoder_indices)
+        )
         self.skip_weights = nn.Parameter(
             torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32)
         )
@@ -1127,6 +1138,16 @@ class GPT(nn.Module):
             )
             if h.skip_gates_enabled
             else None
+        )
+        self.base_skip_pairs = [
+            (self.num_encoder_layers + j, self.num_encoder_layers - 1 - j)
+            for j in range(min(self.num_encoder_layers, self.num_decoder_layers))
+        ]
+        self.loop_base_skip_pairs = self.base_skip_pairs
+        self.loop_aux_skip_pairs = (
+            [("5b", "4a"), ("3b", "3a"), ("4b", "5a")]
+            if self.loop_identity_topology
+            else []
         )
         self.parallel_start_layer = h.parallel_start_layer
         self.parallel_final_lane = h.parallel_final_lane.lower()
@@ -1245,6 +1266,8 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
+        aux_skips = []
+        use_identity_skips = self.looping_active and self.loop_identity_topology
         enc_iter = (
             self.encoder_loop_entries
             if self.looping_active
@@ -1265,18 +1288,42 @@ class GPT(nn.Module):
                 cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
                 resid_mix=resid_mix, attn_scale=attn_scale, mlp_scale=mlp_scale,
             )
-            if not self.loop_identity_topology or extra_pass < 0:
+            if use_identity_skips and extra_pass >= 0:
+                aux_skips.append(x)
+            elif not self.loop_identity_topology or extra_pass < 0:
                 skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
+        base_skip_idx = 0
+        aux_skip_idx = 0
         for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
                 if lane0 is None:
                     lane0 = x
                     lane1 = x
-                if skip_idx < self.num_skip_weights and skips:
+                if use_identity_skips:
+                    if extra_pass >= 0 and aux_skip_idx < self.loop_identity_aux_skip_count and aux_skips:
+                        skip = aux_skips.pop()
+                        slot = self.loop_identity_aux_skip_start + aux_skip_idx
+                        w = self.skip_weights[slot].to(dtype=lane0.dtype)[None, None, :]
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[slot].to(dtype=lane0.dtype))[None, None, :]
+                            lane0 = torch.lerp(w * skip, lane0, g)
+                        else:
+                            lane0 = lane0 + w * skip
+                        aux_skip_idx += 1
+                    elif extra_pass < 0 and base_skip_idx < self.num_encoder_layers and skips:
+                        skip = skips.pop()
+                        w = self.skip_weights[base_skip_idx].to(dtype=lane0.dtype)[None, None, :]
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[base_skip_idx].to(dtype=lane0.dtype))[None, None, :]
+                            lane0 = torch.lerp(w * skip, lane0, g)
+                        else:
+                            lane0 = lane0 + w * skip
+                        base_skip_idx += 1
+                elif skip_idx < self.num_skip_weights and skips:
                     skip = skips.pop()
                     w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
                     if self.skip_gates is not None:
@@ -1289,7 +1336,31 @@ class GPT(nn.Module):
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
                 )
             else:
-                if skip_idx < self.num_skip_weights and skips:
+                if use_identity_skips:
+                    if extra_pass >= 0 and aux_skip_idx < self.loop_identity_aux_skip_count and aux_skips:
+                        slot = self.loop_identity_aux_skip_start + aux_skip_idx
+                        scaled_skip = (
+                            self.skip_weights[slot].to(dtype=x.dtype)[None, None, :]
+                            * aux_skips.pop()
+                        )
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[slot].to(dtype=x.dtype))[None, None, :]
+                            x = torch.lerp(scaled_skip, x, g)
+                        else:
+                            x = x + scaled_skip
+                        aux_skip_idx += 1
+                    elif extra_pass < 0 and base_skip_idx < self.num_encoder_layers and skips:
+                        scaled_skip = (
+                            self.skip_weights[base_skip_idx].to(dtype=x.dtype)[None, None, :]
+                            * skips.pop()
+                        )
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[base_skip_idx].to(dtype=x.dtype))[None, None, :]
+                            x = torch.lerp(scaled_skip, x, g)
+                        else:
+                            x = x + scaled_skip
+                        base_skip_idx += 1
+                elif skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
                         self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
                         * skips.pop()
@@ -1337,6 +1408,8 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
+        aux_skips = []
+        use_identity_skips = self.looping_active and self.loop_identity_topology
         enc_iter = (
             self.encoder_loop_entries
             if self.looping_active
@@ -1356,18 +1429,42 @@ class GPT(nn.Module):
                 extra_pass=extra_pass, loop_local_idx=loop_local_idx,
             )
             slot += 1
-            if not self.loop_identity_topology or extra_pass < 0:
+            if use_identity_skips and extra_pass >= 0:
+                aux_skips.append(x)
+            elif not self.loop_identity_topology or extra_pass < 0:
                 skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
+        base_skip_idx = 0
+        aux_skip_idx = 0
         for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
                 if lane0 is None:
                     lane0 = x
                     lane1 = x
-                if skip_idx < self.num_skip_weights and skips:
+                if use_identity_skips:
+                    if extra_pass >= 0 and aux_skip_idx < self.loop_identity_aux_skip_count and aux_skips:
+                        skip = aux_skips.pop()
+                        slot_idx = self.loop_identity_aux_skip_start + aux_skip_idx
+                        w = self.skip_weights[slot_idx].to(dtype=lane0.dtype)[None, None, :]
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[slot_idx].to(dtype=lane0.dtype))[None, None, :]
+                            lane0 = torch.lerp(w * skip, lane0, g)
+                        else:
+                            lane0 = lane0 + w * skip
+                        aux_skip_idx += 1
+                    elif extra_pass < 0 and base_skip_idx < self.num_encoder_layers and skips:
+                        skip = skips.pop()
+                        w = self.skip_weights[base_skip_idx].to(dtype=lane0.dtype)[None, None, :]
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[base_skip_idx].to(dtype=lane0.dtype))[None, None, :]
+                            lane0 = torch.lerp(w * skip, lane0, g)
+                        else:
+                            lane0 = lane0 + w * skip
+                        base_skip_idx += 1
+                elif skip_idx < self.num_skip_weights and skips:
                     skip = skips.pop()
                     w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
                     if self.skip_gates is not None:
@@ -1382,7 +1479,31 @@ class GPT(nn.Module):
                     rotary_slot=rotary_slot,
                 )
             else:
-                if skip_idx < self.num_skip_weights and skips:
+                if use_identity_skips:
+                    if extra_pass >= 0 and aux_skip_idx < self.loop_identity_aux_skip_count and aux_skips:
+                        slot_idx = self.loop_identity_aux_skip_start + aux_skip_idx
+                        scaled_skip = (
+                            self.skip_weights[slot_idx].to(dtype=x.dtype)[None, None, :]
+                            * aux_skips.pop()
+                        )
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[slot_idx].to(dtype=x.dtype))[None, None, :]
+                            x = torch.lerp(scaled_skip, x, g)
+                        else:
+                            x = x + scaled_skip
+                        aux_skip_idx += 1
+                    elif extra_pass < 0 and base_skip_idx < self.num_encoder_layers and skips:
+                        scaled_skip = (
+                            self.skip_weights[base_skip_idx].to(dtype=x.dtype)[None, None, :]
+                            * skips.pop()
+                        )
+                        if self.skip_gates is not None:
+                            g = torch.sigmoid(self.skip_gates[base_skip_idx].to(dtype=x.dtype))[None, None, :]
+                            x = torch.lerp(scaled_skip, x, g)
+                        else:
+                            x = x + scaled_skip
+                        base_skip_idx += 1
+                elif skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
                         self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
                         * skips.pop()
@@ -3079,6 +3200,18 @@ def train_model(h, device, val_data):
     )
     model = base_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
+    log(
+        "loop_topology: "
+        f"identity:{int(base_model.loop_identity_topology)} "
+        f"base_encoder:{base_model.base_encoder_loop_entries} "
+        f"base_decoder:{base_model.base_decoder_loop_entries} "
+        f"loop_encoder:{base_model.encoder_loop_entries} "
+        f"loop_decoder:{base_model.decoder_loop_entries} "
+        f"base_skips:{base_model.base_skip_pairs} "
+        f"loop_base_skips:{base_model.loop_base_skip_pairs} "
+        f"loop_aux_skips:{base_model.loop_aux_skip_pairs} "
+        f"aux_skip_slots:{list(range(base_model.loop_identity_aux_skip_start, base_model.loop_identity_aux_skip_start + base_model.loop_identity_aux_skip_count))}"
+    )
     if base_model.loop_extra_attn_scale is not None:
         extra_scalar_count = (
             base_model.loop_extra_attn_scale.numel()
