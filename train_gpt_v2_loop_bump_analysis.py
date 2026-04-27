@@ -2103,6 +2103,22 @@ class Optimizers:
         for opt in self.optimizers:
             opt.zero_grad(set_to_none=True)
 
+    def reset_identity_aux_skip_state_(self, base_model):
+        if not base_model.loop_identity_topology:
+            return
+        base_model.clamp_identity_aux_skips_()
+        start = base_model.loop_identity_aux_skip_start
+        end = start + base_model.loop_identity_aux_skip_count
+        for p in (base_model.skip_weights, base_model.skip_gates):
+            if p is None:
+                continue
+            state = self.optimizer_scalar.state.get(p)
+            if not state:
+                continue
+            for value in state.values():
+                if torch.is_tensor(value) and value.shape == p.shape:
+                    value[start:end].zero_()
+
     def _all_reduce_packed_grads(self):
         grads_by_key = collections.defaultdict(list)
         for p in self.replicated_packed_params:
@@ -3854,7 +3870,7 @@ def train_model(h, device, val_data):
             base_model.looping_active = sample_looping_active(step, frac)
         if h.num_loops > 0 and base_model.looping_active and not old_looping_active:
             if base_model.loop_identity_topology:
-                base_model.clamp_identity_aux_skips_()
+                optimizers.reset_identity_aux_skip_state_(base_model)
             log(
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} trigger:{loop_trigger_label()} p_loop:{loop_policy_probability(step, frac):.6f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
