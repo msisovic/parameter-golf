@@ -39,6 +39,7 @@ class Hyperparameters:
     bump_obs_layer_stats = bool(int(os.environ.get("BUMP_OBS_LAYER_STATS", "1")))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
+    num_encoder_layers = int(os.environ.get("NUM_ENCODER_LAYERS", -1))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -60,6 +61,7 @@ class Hyperparameters:
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     loop_ramp_steps = int(os.environ.get("LOOP_RAMP_STEPS", 0))
     loop_untie_extra_scalars = bool(int(os.environ.get("LOOP_UNTIE_EXTRA_SCALARS", "1")))
+    loop_identity_topology = bool(int(os.environ.get("LOOP_IDENTITY_TOPOLOGY", "0")))
     loop_scalar_log_enabled = bool(int(os.environ.get("LOOP_SCALAR_LOG_ENABLED", "1")))
     loop_scalar_log_start_step = int(os.environ.get("LOOP_SCALAR_LOG_START_STEP", -1))
     loop_scalar_log_end_step = int(os.environ.get("LOOP_SCALAR_LOG_END_STEP", -1))
@@ -984,7 +986,16 @@ class GPT(nn.Module):
         self.kv_bank = nn.Parameter(torch.empty(2 * h.num_layers, kv_dim, h.model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(h.num_layers, hidden_dim, h.model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(h.num_layers, h.model_dim, hidden_dim))
-        self.num_encoder_layers = h.num_layers // 2
+        self.num_encoder_layers = (
+            h.num_encoder_layers
+            if h.num_encoder_layers > 0
+            else h.num_layers // 2
+        )
+        if not 0 < self.num_encoder_layers < h.num_layers:
+            raise ValueError(
+                f"NUM_ENCODER_LAYERS must be in [1, {h.num_layers - 1}], "
+                f"got {self.num_encoder_layers}"
+            )
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
         self.blocks = nn.ModuleList(
             [
@@ -1032,6 +1043,7 @@ class GPT(nn.Module):
                 self.blocks[i].attn.use_xsa = True
         self.looping_active = False
         self.loop_untie_extra_scalars = bool(h.loop_untie_extra_scalars and h.num_loops > 0)
+        self.loop_identity_topology = bool(h.loop_identity_topology and h.num_loops > 0)
         self.loop_width = max(h.loop_end - h.loop_start + 1, 0) if h.num_loops > 0 else 0
         self.base_encoder_loop_entries = [
             (i, -1, -1) for i in range(self.num_encoder_layers)
@@ -1047,17 +1059,34 @@ class GPT(nn.Module):
                         f"loop_end={h.loop_end} parallel_start_layer={h.parallel_start_layer}"
                     )
             loop_seg = list(range(h.loop_start, h.loop_end + 1))
-            all_entries = [(i, -1, -1) for i in range(h.loop_start)]
-            for pass_idx in range(h.num_loops + 1):
-                extra_pass = pass_idx - 1
-                all_entries.extend(
-                    (i, extra_pass, local_idx)
-                    for local_idx, i in enumerate(loop_seg)
-                )
-            all_entries.extend((i, -1, -1) for i in range(h.loop_end + 1, h.num_layers))
-            num_enc = len(all_entries) // 2
-            self.encoder_loop_entries = all_entries[:num_enc]
-            self.decoder_loop_entries = all_entries[num_enc:]
+            if self.loop_identity_topology:
+                if not (0 <= h.loop_start <= h.loop_end < self.num_encoder_layers):
+                    raise ValueError(
+                        "LOOP_IDENTITY_TOPOLOGY requires the recurrent segment to be "
+                        "inside the base encoder: "
+                        f"loop_start={h.loop_start} loop_end={h.loop_end} "
+                        f"num_encoder_layers={self.num_encoder_layers}"
+                    )
+                extra_entries = []
+                for extra_pass in range(h.num_loops):
+                    extra_entries.extend(
+                        (i, extra_pass, local_idx)
+                        for local_idx, i in enumerate(loop_seg)
+                    )
+                self.encoder_loop_entries = self.base_encoder_loop_entries + extra_entries
+                self.decoder_loop_entries = self.base_decoder_loop_entries
+            else:
+                all_entries = [(i, -1, -1) for i in range(h.loop_start)]
+                for pass_idx in range(h.num_loops + 1):
+                    extra_pass = pass_idx - 1
+                    all_entries.extend(
+                        (i, extra_pass, local_idx)
+                        for local_idx, i in enumerate(loop_seg)
+                    )
+                all_entries.extend((i, -1, -1) for i in range(h.loop_end + 1, h.num_layers))
+                num_enc = len(all_entries) // 2
+                self.encoder_loop_entries = all_entries[:num_enc]
+                self.decoder_loop_entries = all_entries[num_enc:]
             self.encoder_indices = [i for i, _, _ in self.encoder_loop_entries]
             self.decoder_indices = [i for i, _, _ in self.decoder_loop_entries]
         else:
@@ -1081,9 +1110,14 @@ class GPT(nn.Module):
             self.loop_extra_attn_scale = None
             self.loop_extra_mlp_scale = None
             self.loop_extra_resid_mix = None
-        self.num_skip_weights = min(
-            len(self.encoder_indices), len(self.decoder_indices)
-        )
+        if self.loop_identity_topology:
+            self.num_skip_weights = min(
+                self.num_encoder_layers, len(self.decoder_indices)
+            )
+        else:
+            self.num_skip_weights = min(
+                len(self.encoder_indices), len(self.decoder_indices)
+            )
         self.skip_weights = nn.Parameter(
             torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32)
         )
@@ -1231,7 +1265,8 @@ class GPT(nn.Module):
                 cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
                 resid_mix=resid_mix, attn_scale=attn_scale, mlp_scale=mlp_scale,
             )
-            skips.append(x)
+            if not self.loop_identity_topology or extra_pass < 0:
+                skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
@@ -1321,7 +1356,8 @@ class GPT(nn.Module):
                 extra_pass=extra_pass, loop_local_idx=loop_local_idx,
             )
             slot += 1
-            skips.append(x)
+            if not self.loop_identity_topology or extra_pass < 0:
+                skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None

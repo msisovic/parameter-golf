@@ -290,7 +290,7 @@ def write_svg(path, series, title, ylabel, markers=()):
     Path(path).write_text("\n".join(elems), encoding="utf-8")
 
 
-def maybe_plot_svg(path, probes, counterfactuals, scalar_records=None):
+def maybe_plot_svg(path, probes):
     out_dir = Path(path).with_suffix("")
     out_dir.mkdir(parents=True, exist_ok=True)
     markers = ((2200, "loop on"),)
@@ -302,99 +302,10 @@ def maybe_plot_svg(path, probes, counterfactuals, scalar_records=None):
             "loss",
             markers,
         )
-    if counterfactuals:
-        write_svg(
-            out_dir / "bump_counterfactual_loss.svg",
-            [
-                {"name": "loop off", "points": [(to_int(row, "step"), to_float(row, "loop_off_loss")) for row in counterfactuals]},
-                {"name": "loop on", "points": [(to_int(row, "step"), to_float(row, "loop_on_loss")) for row in counterfactuals]},
-                {"name": "policy", "points": [(to_int(row, "step"), to_float(row, "policy_loss")) for row in counterfactuals]},
-            ],
-            "Bump Counterfactual Loss",
-            "loss",
-            markers,
-        )
-        write_svg(
-            out_dir / "bump_counterfactual_delta.svg",
-            [{"name": "loop on - off", "points": [(to_int(row, "step"), to_float(row, "delta_loss")) for row in counterfactuals]}],
-            "Bump Counterfactual Delta",
-            "loss delta",
-            markers,
-        )
-    if scalar_records:
-        rows = [row for row in scalar_records if row.get("_summary")]
-        write_svg(
-            out_dir / "loop_extra_scalar_means.svg",
-            [
-                {"name": "attn_scale", "points": [(int(row["step"]), row["_summary"]["attn_scale"]["mean"]) for row in rows]},
-                {"name": "mlp_scale", "points": [(int(row["step"]), row["_summary"]["mlp_scale"]["mean"]) for row in rows]},
-            ],
-            "Untied Extra-Call Scalar Means",
-            "mean scalar",
-            markers,
-        )
 
 
-def maybe_plot(path, probes, counterfactuals, scalar_records=None):
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        maybe_plot_svg(path, probes, counterfactuals, scalar_records)
-        return
-    out_dir = Path(path).with_suffix("")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if probes:
-        steps = [to_int(row, "step") for row in probes]
-        losses = [to_float(row, "loss") for row in probes]
-        plt.figure()
-        plt.plot(steps, losses, marker="o")
-        plt.xlabel("step")
-        plt.ylabel("fixed probe loss")
-        plt.title("Bump Probe")
-        plt.tight_layout()
-        plt.savefig(out_dir / "bump_probe_loss.png", dpi=160)
-        plt.close()
-    if counterfactuals:
-        steps = [to_int(row, "step") for row in counterfactuals]
-        off = [to_float(row, "loop_off_loss") for row in counterfactuals]
-        on = [to_float(row, "loop_on_loss") for row in counterfactuals]
-        delta = [to_float(row, "delta_loss") for row in counterfactuals]
-        plt.figure()
-        plt.plot(steps, off, marker="o", label="loop off")
-        plt.plot(steps, on, marker="o", label="loop on")
-        plt.xlabel("step")
-        plt.ylabel("fixed probe loss")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(out_dir / "bump_counterfactual_loss.png", dpi=160)
-        plt.close()
-        plt.figure()
-        plt.plot(steps, delta, marker="o")
-        plt.xlabel("step")
-        plt.ylabel("loop_on - loop_off loss")
-        plt.title("Bump Counterfactual Delta")
-        plt.tight_layout()
-        plt.savefig(out_dir / "bump_counterfactual_delta.png", dpi=160)
-        plt.close()
-    if scalar_records:
-        steps = [int(row["step"]) for row in scalar_records if row.get("_summary")]
-        if steps:
-            plt.figure()
-            for name in ("attn_scale", "mlp_scale"):
-                vals = [
-                    row["_summary"][name]["mean"]
-                    for row in scalar_records
-                    if row.get("_summary") and name in row["_summary"]
-                ]
-                plt.plot(steps[: len(vals)], vals, label=name)
-            plt.axvline(2200, color="black", linestyle="--", linewidth=1)
-            plt.xlabel("step")
-            plt.ylabel("mean scalar")
-            plt.title("Untied Extra-Call Scalar Means")
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(out_dir / "loop_extra_scalar_means.png", dpi=160)
-            plt.close()
+def maybe_plot(path, probes):
+    maybe_plot_svg(path, probes)
 
 
 def main():
@@ -427,7 +338,7 @@ def main():
     scalar_records = read_scalar_records(args.scalars_jsonl) if args.scalars_jsonl else []
     summarize_scalar_records(scalar_records)
     if args.plot:
-        maybe_plot(args.logfile, probes, counterfactuals, scalar_records)
+        maybe_plot(args.logfile, probes)
 
 
 if __name__ == "__main__":
