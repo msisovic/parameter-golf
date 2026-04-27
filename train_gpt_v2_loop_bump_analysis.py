@@ -1091,6 +1091,7 @@ class GPT(nn.Module):
                 ] + self.base_decoder_loop_entries
                 self.loop_identity_aux_skip_start = self.num_encoder_layers
                 self.loop_identity_aux_skip_count = 3
+                self.loop_identity_decoder_skip_slots = [5, 6, 7, 0, 1, 2, 3, 4, -1]
             else:
                 all_entries = [(i, -1, -1) for i in range(h.loop_start)]
                 for pass_idx in range(h.num_loops + 1):
@@ -1103,6 +1104,7 @@ class GPT(nn.Module):
                 num_enc = len(all_entries) // 2
                 self.encoder_loop_entries = all_entries[:num_enc]
                 self.decoder_loop_entries = all_entries[num_enc:]
+                self.loop_identity_decoder_skip_slots = []
             self.encoder_indices = [i for i, _, _ in self.encoder_loop_entries]
             self.decoder_indices = [i for i, _, _ in self.decoder_loop_entries]
         else:
@@ -1110,6 +1112,7 @@ class GPT(nn.Module):
             self.decoder_loop_entries = self.base_decoder_loop_entries
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
+            self.loop_identity_decoder_skip_slots = []
         if self.loop_untie_extra_scalars:
             self.loop_extra_attn_scale = nn.Parameter(
                 torch.zeros(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
@@ -1178,30 +1181,6 @@ class GPT(nn.Module):
             self.skip_weights[start:end].fill_(1.0)
             if self.skip_gates is not None:
                 self.skip_gates[start:end].zero_()
-
-    def _identity_encoder_skip_slot(self, i, extra_pass, loop_local_idx):
-        if extra_pass < 0:
-            if 0 <= i < self.num_encoder_layers:
-                return self.num_encoder_layers - 1 - i
-            return -1
-        if extra_pass == 0 and i == 5 and loop_local_idx == 2:
-            return 7
-        if extra_pass == 0 and i == 3 and loop_local_idx == 0:
-            return 6
-        if extra_pass == 0 and i == 4 and loop_local_idx == 1:
-            return 5
-        return -1
-
-    def _identity_decoder_skip_slot(self, i, extra_pass, loop_local_idx):
-        if extra_pass == 1 and i == 5 and loop_local_idx == 2:
-            return 5
-        if extra_pass == 1 and i == 3 and loop_local_idx == 0:
-            return 6
-        if extra_pass == 1 and i == 4 and loop_local_idx == 1:
-            return 7
-        if extra_pass < 0 and self.num_encoder_layers <= i < self.num_layers - 1:
-            return i - self.num_encoder_layers
-        return -1
 
     def _apply_skip(self, x, skip, slot):
         w = self.skip_weights[slot].to(dtype=x.dtype)[None, None, :]
@@ -1308,7 +1287,6 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
-        identity_skips = [None] * self.num_skip_weights if self.loop_identity_topology else None
         use_identity_skips = self.looping_active and self.loop_identity_topology
         enc_iter = (
             self.encoder_loop_entries
@@ -1330,40 +1308,31 @@ class GPT(nn.Module):
                 cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
                 resid_mix=resid_mix, attn_scale=attn_scale, mlp_scale=mlp_scale,
             )
-            if use_identity_skips:
-                skip_slot = self._identity_encoder_skip_slot(i, extra_pass, loop_local_idx)
-                if skip_slot >= 0:
-                    identity_skips[skip_slot] = x
-            elif not self.loop_identity_topology or extra_pass < 0:
-                skips.append(x)
+            skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
         for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            identity_skip_slot = (
-                self._identity_decoder_skip_slot(i, extra_pass, loop_local_idx)
-                if use_identity_skips
-                else -1
+            skip_slot = (
+                self.loop_identity_decoder_skip_slots[skip_idx]
+                if use_identity_skips and skip_idx < len(self.loop_identity_decoder_skip_slots)
+                else skip_idx
             )
             if i >= psl and psl > 0:
                 if lane0 is None:
                     lane0 = x
                     lane1 = x
-                if use_identity_skips and identity_skip_slot >= 0:
-                    lane0 = self._apply_skip(lane0, identity_skips[identity_skip_slot], identity_skip_slot)
-                elif skip_idx < self.num_skip_weights and skips:
+                if 0 <= skip_slot < self.num_skip_weights and skips:
                     skip = skips.pop()
-                    lane0 = self._apply_skip(lane0, skip, skip_idx)
+                    lane0 = self._apply_skip(lane0, skip, skip_slot)
                 lane0, lane1 = self._parallel_block(
                     i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w,
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
                 )
             else:
-                if use_identity_skips and identity_skip_slot >= 0:
-                    x = self._apply_skip(x, identity_skips[identity_skip_slot], identity_skip_slot)
-                elif skip_idx < self.num_skip_weights and skips:
-                    x = self._apply_skip(x, skips.pop(), skip_idx)
+                if 0 <= skip_slot < self.num_skip_weights and skips:
+                    x = self._apply_skip(x, skips.pop(), skip_slot)
                 resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
                     extra_pass, loop_local_idx
                 )
@@ -1402,7 +1371,6 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
-        identity_skips = [None] * self.num_skip_weights if self.loop_identity_topology else None
         use_identity_skips = self.looping_active and self.loop_identity_topology
         enc_iter = (
             self.encoder_loop_entries
@@ -1423,31 +1391,24 @@ class GPT(nn.Module):
                 extra_pass=extra_pass, loop_local_idx=loop_local_idx,
             )
             slot += 1
-            if use_identity_skips:
-                skip_slot = self._identity_encoder_skip_slot(i, extra_pass, loop_local_idx)
-                if skip_slot >= 0:
-                    identity_skips[skip_slot] = x
-            elif not self.loop_identity_topology or extra_pass < 0:
-                skips.append(x)
+            skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
         for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            identity_skip_slot = (
-                self._identity_decoder_skip_slot(i, extra_pass, loop_local_idx)
-                if use_identity_skips
-                else -1
+            skip_slot = (
+                self.loop_identity_decoder_skip_slots[skip_idx]
+                if use_identity_skips and skip_idx < len(self.loop_identity_decoder_skip_slots)
+                else skip_idx
             )
             if i >= psl and psl > 0:
                 if lane0 is None:
                     lane0 = x
                     lane1 = x
-                if use_identity_skips and identity_skip_slot >= 0:
-                    lane0 = self._apply_skip(lane0, identity_skips[identity_skip_slot], identity_skip_slot)
-                elif skip_idx < self.num_skip_weights and skips:
+                if 0 <= skip_slot < self.num_skip_weights and skips:
                     skip = skips.pop()
-                    lane0 = self._apply_skip(lane0, skip, skip_idx)
+                    lane0 = self._apply_skip(lane0, skip, skip_slot)
                 lane0, lane1 = self._parallel_block_with_lora(
                     i, lane0, lane1, x0, lora, slot,
                     q_w, k_w, v_w, out_w, up_w, down_w,
@@ -1455,10 +1416,8 @@ class GPT(nn.Module):
                     rotary_slot=rotary_slot,
                 )
             else:
-                if use_identity_skips and identity_skip_slot >= 0:
-                    x = self._apply_skip(x, identity_skips[identity_skip_slot], identity_skip_slot)
-                elif skip_idx < self.num_skip_weights and skips:
-                    x = self._apply_skip(x, skips.pop(), skip_idx)
+                if 0 <= skip_slot < self.num_skip_weights and skips:
+                    x = self._apply_skip(x, skips.pop(), skip_slot)
                 x = self._block_with_lora(
                     self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w,
                     down_w, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
