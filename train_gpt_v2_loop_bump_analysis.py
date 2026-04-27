@@ -3620,12 +3620,6 @@ def train_model(h, device, val_data):
         if obs_phase is not None:
             log_bump_layer_stats(step, obs_frac, obs_phase)
         optimizers.step(distributed=h.distributed)
-        if (
-            base_model.loop_identity_topology
-            and not base_model.looping_active
-            and not should_enable_looping(step, obs_frac)
-        ):
-            base_model.clamp_identity_aux_skips_()
         return train_loss
 
     if h.warmup_steps > 0:
@@ -3806,8 +3800,18 @@ def train_model(h, device, val_data):
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
         old_looping_active = base_model.looping_active
+        loop_will_be_active = (
+            sample_looping_active(step, frac) if h.num_loops > 0 else False
+        )
+        if (
+            h.num_loops > 0
+            and base_model.loop_identity_topology
+            and not old_looping_active
+            and loop_will_be_active
+        ):
+            base_model.clamp_identity_aux_skips_()
         if h.num_loops > 0:
-            base_model.looping_active = sample_looping_active(step, frac)
+            base_model.looping_active = loop_will_be_active
         if h.num_loops > 0 and base_model.looping_active and not old_looping_active:
             log(
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} trigger:{loop_trigger_label()} p_loop:{loop_policy_probability(step, frac):.6f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
@@ -3815,6 +3819,12 @@ def train_model(h, device, val_data):
         obs_phase = bump_obs_phase(step)
         if obs_phase is not None:
             training_time_ms = elapsed_ms
+            if (
+                h.num_loops > 0
+                and base_model.loop_identity_topology
+                and not base_model.looping_active
+            ):
+                base_model.clamp_identity_aux_skips_()
             run_bump_probe(step, frac, obs_phase)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
