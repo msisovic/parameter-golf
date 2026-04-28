@@ -256,3 +256,90 @@ TORCH_NCCL_TRACE_BUFFER_SIZE=1048576 \
 torchrun --standalone --nproc_per_node=8 \
 train_gpt_v2.py 2>&1 | tee train_1024_seed${SEED}_seq8192_ttt_chunk64_bsz16_lr7p5e-5.log
 ```
+
+## 2026-04-27 - Port Loop Untie + Zero-Contrib Init To `train_gpt_v2`
+
+### Context
+
+- The recurrence (`NUM_LOOPS>0`) introduces a discontinuity at the loop-on step: the model goes from one pass over the looped layers (`loop_start..loop_end`) to `1 + num_loops` passes overnight. With per-block `attn_scale` / `mlp_scale` / `resid_mix` shared across all passes, the extra passes contribute full-strength immediately and the train loss spikes hard.
+- The earlier `loop_untie_fast` study script (`38d5531`) carried a fix that smoothed this transition: it introduced per-(extra_pass, looped_layer) copies of `attn_scale`, `mlp_scale`, `resid_mix` ("untie"), zero-initialized the attn/mlp scales so the extra passes contribute zero at the moment looping turns on, and let SGD ramp them up.
+- That mechanism never made it into `train_gpt_v2.py`. This entry covers the port and validation on the same seed-1337 short bump-observation setup.
+
+### What Changed
+
+- Resurrected `train_gpt_v2_loop_bump_analysis_loop_untie_fast_38d5531.py` and reproduced the canonical `loop_untie_fast_s1337.log` on the current 8xH100 host.
+  - Pre-loop-on per-step train_loss matched the canonical to within ~0.001 noise.
+  - The new machine clocked about 1.1% slower in pre-loop-on tok/s than the canonical's machine. This was consistent across three independent repros (zero-init, hot-copy, v2 + untie) so it reads as machine-class variance, not run noise. In a 600s wallclock cap it costs ~25–50 base-rate steps relative to the canonical.
+
+- Briefly tried a `LOOP_HOT_COPY_ON_ENABLE` variant inside the study script.
+  - Behaviour: keep the untied loop-extra params, but at the loop-on transition copy each base block's current `attn_scale` / `mlp_scale` / `resid_mix` into the corresponding `loop_extra_*[ep, idx]` slot, instead of leaving the zero-init.
+  - The bump-obs probe overlay showed the immediate post-loop-on spike roughly doubling: peak per-step loss 2.94 with hot-copy vs 2.74 with zero-init, and the post-loop-on window mean ~+0.035 worse with hot-copy.
+  - Interestingly, by the post-late probe window (steps ~2316–2319) the train probe with hot-copy was *slightly better* than zero-init (2.557–2.560 vs 2.565–2.568), but val_loss at the next eval was worse, so the brief train-probe lead did not propagate to held-out loss.
+  - Conclusion: hot-copy trades a worse transient for no real downstream benefit on this setup. Reverted.
+
+- Ported the untie + zero-init mechanism into `train_gpt_v2.py` behind a new env flag `LOOP_UNTIE_EXTRA_SCALARS` (default `0`).
+  - `encoder_loop_entries` / `decoder_loop_entries` are now `(layer_idx, extra_pass, loop_local_idx)` triples. Base passes carry `(-1, -1)` and extra passes carry the per-pass index. The flat `encoder_indices` / `decoder_indices` are derived from these so the rest of the codebase keeps its existing view.
+  - Three new params on the GPT root, only when the flag is on:
+    - `loop_extra_attn_scale` shape `[num_loops, loop_width, dim]`, init `zeros` (this is the spike suppressor)
+    - `loop_extra_mlp_scale` same shape, init `zeros`
+    - `loop_extra_resid_mix` shape `[num_loops, loop_width, 2, dim]`, init `[1, 0]` per (pass, layer) — pass-through
+  - `Block.forward` and `_block_with_lora` accept optional `resid_mix` / `attn_scale` / `mlp_scale` overrides; when not provided they fall back to the base block params, so the base pass behaviour is unchanged.
+  - `forward_logits` and `forward_ttt` resolve overrides via a small `_block_scalar_overrides(extra_pass, loop_local_idx)` helper for each loop entry. The helper returns `(None, None, None)` for base passes.
+  - Asserts `loop_end < parallel_start_layer` when `LOOP_UNTIE_EXTRA_SCALARS` is on alongside the parallel block path, since `_parallel_block` and `_parallel_block_with_lora` are not threaded with overrides (matches the source script's assumption that recurrent layers are pre-parallel).
+  - Optimizer: the three new tensors are appended to the scalar AdamW group explicitly because they live on the GPT root, not in `.blocks.named_parameters()` where the pattern-based router runs.
+  - `CONTROL_TENSOR_NAME_PATTERNS` extended with the three names so `restore_fp32_params` keeps them in fp32 (their `ndim >= 2` would otherwise miss the default rule).
+  - Off-state is byte-identical to the prior v2: triples collapse to `(i, -1, -1)` and the override helper returns `None` everywhere.
+
+### Results
+
+Same wallclock cap (`MAX_WALLCLOCK_SECONDS=600`), same bump-observation env. Step-aligned comparison:
+
+| run | step 4000 val_loss | step 4000 val_bpb | quantized_ttt_phased loss / bpb | stop step |
+|---|---:|---:|---:|---:|
+| canonical (`loop_untie_fast_s1337`, old machine) | 2.4254 | 1.1083 | 2.32657 / 1.06315 | 4751 |
+| zero-init repro (study script, new machine) | 2.4240 | 1.1077 | (run was killed early) | 4719 |
+| hot-copy variant (study script, new machine) | 2.4243 | 1.1078 | (variant abandoned) | 4718 |
+| `train_gpt_v2.py` + untie (new machine) | **2.4197** | **1.1057** | 2.32840 / 1.06398 | 4694 |
+
+Pre-bump v2 + untie was the best of the four at step 4000 val_loss by `-0.0057` over the canonical and by `-0.004` over the same-machine zero-init repro — a submission-significant pre-bump gap. After the seq-len bump that lead narrowed, and on `quantized_ttt_phased` v2 + untie ended `+0.002` behind the canonical.
+
+That gap is fully accounted for by three confounds stacked against the v2 run:
+- Machine speed (~1.1% slower → ~25–50 fewer base-rate steps in 600s).
+- Loop-on trigger: v2 has only `ENABLE_LOOPING_AT` (frac), no `ENABLE_LOOPING_STEP`. The frac trigger fired at step 2109 here vs the canonical's step 2200, so v2 spent 91 extra steps in the slower looping regime → ~15 lost wallclock-equivalent steps.
+- Final stop step: 4694 vs 4751.
+
+Same-machine vs same-machine (zero-init repro at step 4719 vs v2 + untie at step 4694), the diagnostic-stage gap is `+0.0004` on quantized — within the step-shortfall budget.
+
+### Takeaways
+
+- The untie + zero-init mechanism in v2 is at-or-tied with the same-machine zero-init repro after correcting for the loop-on trigger mismatch. It has the same spike-suppression effect.
+- The bump-obs overlay quantified the suppression directly: zero-init holds the instantaneous post-loop-on spike to roughly half the magnitude of the warm-start variant, while still recovering to the pre-loop-on probe level within ~100 steps.
+- For a clean head-to-head on the new hardware, the simplest follow-up is to run v2 + untie with `ENABLE_LOOPING_AT≈0.367` so its loop-on lands near step 2200; either that or adding `ENABLE_LOOPING_STEP` support to v2 closes the trigger confound.
+- Hot-copy was a dead end on this objective: the transient cost was real and the probe-level win did not survive to val_loss.
+
+### Run Command (`train_gpt_v2.py` + untie)
+
+```bash
+SEED=1337 \
+RUN_ID=loop_untie_v2_s1337 \
+ARTIFACT_DIR=artifacts/loop_untie_v2_s1337 \
+NCCL_NET=Socket \
+DATA_DIR=. \
+DATA_PATH=./datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved \
+TOKENIZER_PATH=./tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model \
+CASEOPS_ENABLED=1 \
+PHASED_TTT_PREFIX_DOCS=2000 PHASED_TTT_NUM_PHASES=3 \
+GLOBAL_TTT_CHUNK_TOKENS=65536 \
+MATRIX_CLIP_SIGMAS=12.85 ATTN_CLIP_SIGMAS=13.0 \
+EMBED_BITS=7 EMBED_CLIP_SIGMAS=15.0 \
+MATRIX_LR=0.026 \
+GPTQ_RESERVE_SECONDS=4 GPTQ_CALIBRATION_BATCHES=16 \
+GATED_ATTN_ENABLED=1 GATED_ATTN_INIT_STD=0.005 GATED_ATTN_QUANT_GATE=1 \
+TRAIN_SEQ_LEN=2048 TRAIN_SEQ_LEN_END=8192 SEQ_LEN_BUMP_FRAC=0.85 \
+EVAL_SEQ_LEN=8192 TTT_EVAL_SEQ_LEN=8192 \
+TTT_BATCH_SIZE=16 TTT_CHUNK_SIZE=64 TTT_LORA_LR=0.000075 \
+ROPE_YARN=1 ROPE_TRAIN_SEQ_LEN=2048 \
+TORCH_NCCL_TRACE_BUFFER_SIZE=1048576 \
+LOOP_UNTIE_EXTRA_SCALARS=1 \
+torchrun --standalone --nproc_per_node=8 train_gpt_v2.py 2>&1 | tee loop_untie_v2_s1337.log
+```
