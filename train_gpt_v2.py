@@ -48,6 +48,7 @@ class Hyperparameters:
     loop_start = int(os.environ.get("LOOP_START", 3))
     loop_end = int(os.environ.get("LOOP_END", 5))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
+    loop_untie_extra_scalars = bool(int(os.environ.get("LOOP_UNTIE_EXTRA_SCALARS", "0")))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 8))
     parallel_final_lane = os.environ.get("PARALLEL_FINAL_LANE", "mean")
     min_lr = float(os.environ.get("MIN_LR", 0.0))
@@ -929,9 +930,12 @@ class Block(nn.Module):
 
     def forward(
         self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None,
-        max_seqlen=0, rotary_slot=None,
+        max_seqlen=0, rotary_slot=None, resid_mix=None, attn_scale=None, mlp_scale=None,
     ):
-        mix = self.resid_mix.to(dtype=x.dtype)
+        mix_src = self.resid_mix if resid_mix is None else resid_mix
+        attn_scale_src = self.attn_scale if attn_scale is None else attn_scale
+        mlp_scale_src = self.mlp_scale if mlp_scale is None else mlp_scale
+        mix = mix_src.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(
             self.attn_norm(x_in) * self.ln_scale_factor,
@@ -940,8 +944,8 @@ class Block(nn.Module):
             max_seqlen=max_seqlen,
             rotary_slot=rotary_slot,
         )
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
+        x_out = x_in + attn_scale_src.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_out + mlp_scale_src.to(dtype=x_out.dtype)[
             None, None, :
         ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         return x_out
@@ -1010,18 +1014,56 @@ class GPT(nn.Module):
             for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
                 self.blocks[i].attn.use_xsa = True
         self.looping_active = False
+        self.loop_untie_extra_scalars = bool(h.loop_untie_extra_scalars and h.num_loops > 0)
+        self.loop_width = max(h.loop_end - h.loop_start + 1, 0) if h.num_loops > 0 else 0
+        self.base_encoder_loop_entries = [
+            (i, -1, -1) for i in range(self.num_encoder_layers)
+        ]
+        self.base_decoder_loop_entries = [
+            (i, -1, -1) for i in range(self.num_encoder_layers, h.num_layers)
+        ]
         if h.num_loops > 0:
+            if self.loop_untie_extra_scalars and h.parallel_start_layer > 0:
+                if h.loop_end >= h.parallel_start_layer:
+                    raise ValueError(
+                        "LOOP_UNTIE_EXTRA_SCALARS assumes recurrent layers are pre-parallel: "
+                        f"loop_end={h.loop_end} parallel_start_layer={h.parallel_start_layer}"
+                    )
             loop_seg = list(range(h.loop_start, h.loop_end + 1))
-            all_indices = list(range(h.loop_start))
-            for _ in range(h.num_loops + 1):
-                all_indices.extend(loop_seg)
-            all_indices.extend(range(h.loop_end + 1, h.num_layers))
-            num_enc = len(all_indices) // 2
-            self.encoder_indices = all_indices[:num_enc]
-            self.decoder_indices = all_indices[num_enc:]
+            all_entries = [(i, -1, -1) for i in range(h.loop_start)]
+            for pass_idx in range(h.num_loops + 1):
+                extra_pass = pass_idx - 1
+                all_entries.extend(
+                    (i, extra_pass, local_idx)
+                    for local_idx, i in enumerate(loop_seg)
+                )
+            all_entries.extend((i, -1, -1) for i in range(h.loop_end + 1, h.num_layers))
+            num_enc = len(all_entries) // 2
+            self.encoder_loop_entries = all_entries[:num_enc]
+            self.decoder_loop_entries = all_entries[num_enc:]
+            self.encoder_indices = [i for i, _, _ in self.encoder_loop_entries]
+            self.decoder_indices = [i for i, _, _ in self.decoder_loop_entries]
         else:
+            self.encoder_loop_entries = self.base_encoder_loop_entries
+            self.decoder_loop_entries = self.base_decoder_loop_entries
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
+        if self.loop_untie_extra_scalars:
+            self.loop_extra_attn_scale = nn.Parameter(
+                torch.zeros(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
+            )
+            self.loop_extra_mlp_scale = nn.Parameter(
+                torch.zeros(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
+            )
+            extra_resid_mix = torch.zeros(
+                h.num_loops, self.loop_width, 2, h.model_dim, dtype=torch.float32
+            )
+            extra_resid_mix[:, :, 0, :] = 1.0
+            self.loop_extra_resid_mix = nn.Parameter(extra_resid_mix)
+        else:
+            self.loop_extra_attn_scale = None
+            self.loop_extra_mlp_scale = None
+            self.loop_extra_resid_mix = None
         self.num_skip_weights = min(
             len(self.encoder_indices), len(self.decoder_indices)
         )
@@ -1092,6 +1134,19 @@ class GPT(nn.Module):
             self.mlp_down_bank[i],
         )
 
+    def _block_scalar_overrides(self, extra_pass, loop_local_idx):
+        if (
+            self.loop_extra_attn_scale is not None
+            and extra_pass >= 0
+            and loop_local_idx >= 0
+        ):
+            return (
+                self.loop_extra_resid_mix[extra_pass, loop_local_idx],
+                self.loop_extra_attn_scale[extra_pass, loop_local_idx],
+                self.loop_extra_mlp_scale[extra_pass, loop_local_idx],
+            )
+        return None, None, None
+
     def _parallel_block(
         self, block_idx, lane0, lane1, x0,
         q_w, k_w, v_w, out_w, up_w, down_w,
@@ -1140,29 +1195,30 @@ class GPT(nn.Module):
         x0 = x
         skips = []
         enc_iter = (
-            self.encoder_indices
+            self.encoder_loop_entries
             if self.looping_active
-            else range(self.num_encoder_layers)
+            else self.base_encoder_loop_entries
         )
         dec_iter = (
-            self.decoder_indices
+            self.decoder_loop_entries
             if self.looping_active
-            else range(
-                self.num_encoder_layers,
-                self.num_encoder_layers + self.num_decoder_layers,
-            )
+            else self.base_decoder_loop_entries
         )
-        for i in enc_iter:
+        for i, extra_pass, loop_local_idx in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
+            resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
+                extra_pass, loop_local_idx
+            )
             x = self.blocks[i](
                 x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
                 cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                resid_mix=resid_mix, attn_scale=attn_scale, mlp_scale=mlp_scale,
             )
             skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
-        for skip_idx, i in enumerate(dec_iter):
+        for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
                 if lane0 is None:
@@ -1191,9 +1247,13 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
+                resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
+                    extra_pass, loop_local_idx
+                )
                 x = self.blocks[i](
                     x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                    resid_mix=resid_mix, attn_scale=attn_scale, mlp_scale=mlp_scale,
                 )
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
@@ -1226,33 +1286,29 @@ class GPT(nn.Module):
         x0 = x
         skips = []
         enc_iter = (
-            self.encoder_indices
+            self.encoder_loop_entries
             if self.looping_active
-            else list(range(self.num_encoder_layers))
+            else self.base_encoder_loop_entries
         )
         dec_iter = (
-            self.decoder_indices
+            self.decoder_loop_entries
             if self.looping_active
-            else list(
-                range(
-                    self.num_encoder_layers,
-                    self.num_encoder_layers + self.num_decoder_layers,
-                )
-            )
+            else self.base_decoder_loop_entries
         )
         slot = 0
-        for i in enc_iter:
+        for i, extra_pass, loop_local_idx in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             x = self._block_with_lora(
                 self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w,
                 down_w, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                extra_pass=extra_pass, loop_local_idx=loop_local_idx,
             )
             slot += 1
             skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
-        for skip_idx, i in enumerate(dec_iter):
+        for skip_idx, (i, extra_pass, loop_local_idx) in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
                 if lane0 is None:
@@ -1286,6 +1342,7 @@ class GPT(nn.Module):
                 x = self._block_with_lora(
                     self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w,
                     down_w, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                    extra_pass=extra_pass, loop_local_idx=loop_local_idx,
                 )
             slot += 1
         if lane0 is not None:
@@ -1304,9 +1361,15 @@ class GPT(nn.Module):
 
     def _block_with_lora(
         self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
-        max_seqlen=0, rotary_slot=None,
+        max_seqlen=0, rotary_slot=None, extra_pass=-1, loop_local_idx=-1,
     ):
-        mix = block.resid_mix.to(dtype=x.dtype)
+        resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
+            extra_pass, loop_local_idx
+        )
+        mix_src = block.resid_mix if resid_mix is None else resid_mix
+        attn_scale_src = block.attn_scale if attn_scale is None else attn_scale
+        mlp_scale_src = block.mlp_scale if mlp_scale is None else mlp_scale
+        mix = mix_src.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1354,12 +1417,12 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_in + attn_scale_src.to(dtype=x_in.dtype)[None, None, :] * attn_out
         mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+        x_out = x_out + mlp_scale_src.to(dtype=x_out.dtype)[None, None, :] * mlp_out
         return x_out
 
     def _parallel_block_with_lora(
@@ -1665,7 +1728,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,loop_extra_attn_scale,loop_extra_mlp_scale,loop_extra_resid_mix,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda",
     ).split(",")
     if pattern
 )
@@ -1697,6 +1760,10 @@ class Optimizers:
             scalar_params.append(base_model.parallel_post_lambdas)
         if base_model.parallel_resid_lambdas is not None:
             scalar_params.append(base_model.parallel_resid_lambdas)
+        if getattr(base_model, "loop_extra_attn_scale", None) is not None:
+            scalar_params.append(base_model.loop_extra_attn_scale)
+            scalar_params.append(base_model.loop_extra_mlp_scale)
+            scalar_params.append(base_model.loop_extra_resid_mix)
         # SmearGate params live on GPT root (not in .blocks), so add them by hand.
         # Both are tiny (gate_window scalars + 1 lambda). Optimized via scalar Adam.
         if getattr(base_model, "smear_gate_enabled", False):
