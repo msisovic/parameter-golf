@@ -22,18 +22,24 @@
 
 ## Current state of `train_gpt_v3.py`
 
-**As committed in this snapshot**: the split-methods version. **Pre-loop is clean (+0.002 vs base_v3) but the post-loop recompile hangs.** Do NOT just rerun this as-is; it won't finish.
+**Now contains the unified-forward refactor (UNTESTED)** — see commit message.
 
-Diff vs `train_gpt_base_v3.py` is ~260 lines, mostly:
+The split-methods version (which hangs post-loop) was committed as `d4b1670`. On top of that, `Block.forward` and `_block_with_lora` were unified back into single methods that take `resid_mix`, `attn_scale`, `mlp_scale` as **required positional args** (no defaults, no `is None`). Callers always pass tensors, sourced via the new `_resolve_block_scalars(block, extra_pass, loop_local_idx)` helper:
+- Base entries (`extra_pass < 0`): returns `(block.resid_mix, block.attn_scale, block.mlp_scale)`.
+- Extra entries: returns the `loop_extra_*[extra_pass, loop_local_idx]` slices.
+
+Diff vs `train_gpt_base_v3.py` (current state):
 - LOOP_UNTIE_EXTRA_SCALARS hparam
 - triple-form `encoder_loop_entries` / `decoder_loop_entries`
 - `loop_extra_attn_scale` / `loop_extra_mlp_scale` / `loop_extra_resid_mix` Parameters (init: ones / [1,0])
-- `_block_scalar_overrides` helper
-- `Block.forward` (base_v3's exact body) + `Block.forward_with_overrides` (override path)
-- `_block_with_lora` (base_v3's exact body) + `_block_with_lora_with_overrides`
-- `_forward_hidden` and `forward_ttt` branch on `extra_pass < 0`
+- `_resolve_block_scalars` helper (returns block scalars or loop_extra slot)
+- `Block.forward` modified to take `resid_mix, attn_scale, mlp_scale` as required positional args
+- `_block_with_lora` modified to take same 3 required positional args
+- `_forward_hidden` and `forward_ttt` use `_resolve_block_scalars` + a single uniform call (no if/else branch)
 - Optimizer scalar group append + `CONTROL_TENSOR_NAME_PATTERNS` extension
 - `_clone_loop_extras_from_source` helper called at loop activation (copies block params + AdamW state into the loop_extra slots)
+
+**Key open question for tomorrow**: does this unified version finish recompile after loop activation in reasonable time (like base_v3 does, ~30s)? If yes, also check pre-loop step 500 train_loss is ≤ 2.564 (matching base_v3 + noise). The split-methods version was at the right pre-loop value but never finished post-loop recompile.
 
 ## What to try next (in order)
 
@@ -79,8 +85,10 @@ base_v3 control (LOOP_UNTIE=0, ROPE_YARN=0):
 
 ## Run command (reuse base_v3 hparams + LOOP_UNTIE)
 
+Use this exact command to test the unified-forward version. Replace `<variant>` with a label (e.g. `unified`).
+
 ```bash
-SEED=42 RUN_ID=v3_loop_untie_<variant>_s42 ARTIFACT_DIR=artifacts/v3_loop_untie_<variant>_s42 \
+SEED=42 RUN_ID=v3_loop_untie_unified_s42 ARTIFACT_DIR=artifacts/v3_loop_untie_unified_s42 \
 NCCL_NET=Socket \
 DATA_PATH=./datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved \
 TOKENIZER_PATH=./tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model \
@@ -97,8 +105,24 @@ LQER_ENABLED=1 LQER_ASYM_ENABLED=1 LQER_RANK=4 LQER_FACTOR_BITS=4 LQER_ASYM_GROU
 FUSED_CE_ENABLED=1 COMPRESSOR=pergroup \
 GPTQ_RESERVE_SECONDS=0.5 GPTQ_CALIBRATION_BATCHES=16 VAL_LOSS_EVERY=0 \
 LOOP_UNTIE_EXTRA_SCALARS=1 \
-torchrun --standalone --nproc_per_node=8 train_gpt_v3.py > logs/v3_loop_untie_<variant>_s42.log 2>&1
+torchrun --standalone --nproc_per_node=8 train_gpt_v3.py > logs/v3_loop_untie_unified_s42.log 2>&1
 ```
+
+To verify it works as expected, watch for:
+- Step 500 train_loss ≈ 2.564 (within ~0.001–0.003 of base_v3's 2.5617)
+- `layer_loop:enabled step:2160` log line appearing within ~30s of step 2000 (recompile must finish quickly)
+- Continuous progress past step 2500 (train_loss should rejoin base_v3's ~2.539 trajectory)
+- Run reaches `stopping_early: wallclock_cap` and produces `pre-quantization post-ema val_bpb`
+
+Compare final `quantized_ttt_phased val_bpb` to base_v3's `1.06016974` and to the kwargs-only run's previous result (which finished the run with +0.00019 val_bpb improvement at the pre-quant stage).
+
+To run with the mechanism off (sanity check that the new code path is functionally equivalent to base_v3):
+
+```bash
+LOOP_UNTIE_EXTRA_SCALARS=0 ...
+```
+
+This should produce step 500 train_loss within ~0.001–0.003 of base_v3 (oscillating noise). If it drifts more, there's a bug in `_resolve_block_scalars` falling back to `block.*` for base passes.
 
 ## Pointers
 

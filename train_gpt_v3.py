@@ -1124,23 +1124,9 @@ class Block(nn.Module):
         )
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
-    def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(
-            self.attn_norm(x_in) * self.ln_scale_factor,
-            q_w, k_w, v_w, out_w,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
-            None, None, :
-        ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
-        return x_out
-
-    def forward_with_overrides(
-        self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, resid_mix, attn_scale, mlp_scale,
+    def forward(
+        self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+        resid_mix, attn_scale, mlp_scale,
         cu_seqlens=None, max_seqlen=0,
     ):
         mix = resid_mix.to(dtype=x.dtype)
@@ -1347,7 +1333,10 @@ class GPT(nn.Module):
             self.mlp_down_bank[i],
         )
 
-    def _block_scalar_overrides(self, extra_pass, loop_local_idx):
+    def _resolve_block_scalars(self, block, extra_pass, loop_local_idx):
+        """Return (resid_mix, attn_scale, mlp_scale) tensors as required positional
+        args for the unified Block.forward. Always tensors — falls back to the
+        block's own scalars when not in an extra loop pass."""
         if (
             self.loop_extra_attn_scale is not None
             and extra_pass >= 0
@@ -1358,7 +1347,7 @@ class GPT(nn.Module):
                 self.loop_extra_attn_scale[extra_pass, loop_local_idx],
                 self.loop_extra_mlp_scale[extra_pass, loop_local_idx],
             )
-        return (None, None, None)
+        return (block.resid_mix, block.attn_scale, block.mlp_scale)
 
     def _parallel_block(
         self, block_idx, lane0, lane1, x0,
@@ -1422,17 +1411,12 @@ class GPT(nn.Module):
         )
         for i, extra_pass, loop_local_idx in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            if extra_pass < 0:
-                x = self.blocks[i](
-                    x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                )
-            else:
-                rm, as_, ms = self._block_scalar_overrides(extra_pass, loop_local_idx)
-                x = self.blocks[i].forward_with_overrides(
-                    x, x0, q_w, k_w, v_w, out_w, up_w, down_w, rm, as_, ms,
-                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                )
+            block = self.blocks[i]
+            rm, as_, ms = self._resolve_block_scalars(block, extra_pass, loop_local_idx)
+            x = block(
+                x, x0, q_w, k_w, v_w, out_w, up_w, down_w, rm, as_, ms,
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            )
             skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
@@ -1466,17 +1450,12 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                if extra_pass < 0:
-                    x = self.blocks[i](
-                        x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                    )
-                else:
-                    rm, as_, ms = self._block_scalar_overrides(extra_pass, loop_local_idx)
-                    x = self.blocks[i].forward_with_overrides(
-                        x, x0, q_w, k_w, v_w, out_w, up_w, down_w, rm, as_, ms,
-                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                    )
+                block = self.blocks[i]
+                rm, as_, ms = self._resolve_block_scalars(block, extra_pass, loop_local_idx)
+                x = block(
+                    x, x0, q_w, k_w, v_w, out_w, up_w, down_w, rm, as_, ms,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                )
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
@@ -1539,16 +1518,12 @@ class GPT(nn.Module):
         slot = 0
         for i, extra_pass, loop_local_idx in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            if extra_pass < 0:
-                x = self._block_with_lora(
-                    self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
-                )
-            else:
-                rm, as_, ms = self._block_scalar_overrides(extra_pass, loop_local_idx)
-                x = self._block_with_lora_with_overrides(
-                    self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
-                    rm, as_, ms,
-                )
+            block = self.blocks[i]
+            rm, as_, ms = self._resolve_block_scalars(block, extra_pass, loop_local_idx)
+            x = self._block_with_lora(
+                block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
+                rm, as_, ms,
+            )
             slot += 1
             skips.append(x)
         psl = self.parallel_start_layer
@@ -1583,16 +1558,12 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                if extra_pass < 0:
-                    x = self._block_with_lora(
-                        self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
-                    )
-                else:
-                    rm, as_, ms = self._block_scalar_overrides(extra_pass, loop_local_idx)
-                    x = self._block_with_lora_with_overrides(
-                        self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
-                        rm, as_, ms,
-                    )
+                block = self.blocks[i]
+                rm, as_, ms = self._resolve_block_scalars(block, extra_pass, loop_local_idx)
+                x = self._block_with_lora(
+                    block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
+                    rm, as_, ms,
+                )
             slot += 1
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
@@ -1608,8 +1579,11 @@ class GPT(nn.Module):
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
         ).reshape(bsz, sl)
 
-    def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
-        mix = block.resid_mix.to(dtype=x.dtype)
+    def _block_with_lora(
+        self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
+        resid_mix, attn_scale, mlp_scale,
+    ):
+        mix = resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1648,61 +1622,6 @@ class GPT(nn.Module):
         # Sparse attention head-output gate (TTT path) — must match the eval path in
         # forward() exactly, else training (which applied the gate) and TTT eval (which
         # skipped it) produce mismatched representations and catastrophic BPB regression.
-        if attn.sparse_attn_gate:
-            gate_in = n[..., : attn.gate_window].contiguous()
-            g = torch.sigmoid(
-                attn.sparse_attn_gate_scale
-                * F.linear(gate_in, attn.attn_gate_w.to(n.dtype))
-            )
-            y = y * g[..., None]
-        y = y.reshape(bsz, seqlen, dim)
-        attn_out = F.linear(y, out_w.to(n.dtype))
-        if lora.o_loras is not None:
-            attn_out = attn_out + lora.o_loras[slot](n)
-        x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
-        mlp_out = block.mlp(mlp_n, up_w, down_w)
-        if lora.mlp_loras is not None:
-            mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
-        return x_out
-
-    def _block_with_lora_with_overrides(
-        self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
-        resid_mix, attn_scale, mlp_scale,
-    ):
-        mix = resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        n = block.attn_norm(x_in) * block.ln_scale_factor
-        attn = block.attn
-        bsz, seqlen, dim = n.shape
-        q_raw = F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)
-        q = q_raw.reshape(bsz, seqlen, attn.num_heads, attn.head_dim)
-        k = F.linear(n, k_w.to(n.dtype))
-        if lora.k_loras is not None:
-            k = k + lora.k_loras[slot](n)
-        k = k.reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
-        v = (F.linear(n, v_w.to(n.dtype)) + lora.v_loras[slot](n)).reshape(
-            bsz, seqlen, attn.num_kv_heads, attn.head_dim
-        )
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = attn.rotary(seqlen, n.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
-        k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
-        q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
-        if attn.use_xsa:
-            y = attn._xsa_efficient(y, v)
-        if attn.attn_out_gate:
-            gate_src = q_raw if attn.attn_out_gate_src == "q" else n
-            gate_in = gate_src[..., : attn.gate_window].contiguous()
-            g = 2.0 * torch.sigmoid(attn.attn_gate_proj(gate_in))
-            y = y * g[..., None]
-        if attn.gated_attn:
-            n_c = n.contiguous()
-            g = torch.sigmoid(F.linear(n_c, attn.attn_gate_w.to(n.dtype)))
-            y = y * g[..., None]
         if attn.sparse_attn_gate:
             gate_in = n[..., : attn.gate_window].contiguous()
             g = torch.sigmoid(
