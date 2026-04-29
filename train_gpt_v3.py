@@ -1246,13 +1246,11 @@ class GPT(nn.Module):
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
         if self.loop_untie_extra_scalars:
-            # Init mirrors source defaults; real values are cloned from per-block
-            # source scalars at loop activation (see _clone_loop_extras_from_source).
             self.loop_extra_attn_scale = nn.Parameter(
-                torch.ones(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
+                torch.zeros(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
             )
             self.loop_extra_mlp_scale = nn.Parameter(
-                torch.ones(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
+                torch.zeros(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
             )
             extra_resid_mix = torch.zeros(
                 h.num_loops, self.loop_width, 2, h.model_dim, dtype=torch.float32
@@ -3408,39 +3406,22 @@ def timed_eval(label, fn, *args, **kwargs):
     return val_loss, val_bpb
 
 
-def _clone_loop_extras_from_source(base_model, optimizers, h):
-    """At loop activation, copy each block's attn_scale/mlp_scale/resid_mix into
-    the corresponding loop_extra_* slot, and broadcast the source AdamW state
-    (exp_avg, exp_avg_sq, step) into each [pass_idx, local_idx] dest slice."""
+def _reset_loop_extras_to_init(base_model, optimizers):
+    """Restore v2-style zero-contribution extra loop scalars at activation."""
     if base_model.loop_extra_attn_scale is None:
         return
-    state = optimizers.optimizer_scalar.state
-    pairs = (
-        ("attn_scale", base_model.loop_extra_attn_scale),
-        ("mlp_scale", base_model.loop_extra_mlp_scale),
-        ("resid_mix", base_model.loop_extra_resid_mix),
-    )
     with torch.no_grad():
-        for src_name, dst in pairs:
-            for local_idx in range(base_model.loop_width):
-                src = getattr(base_model.blocks[h.loop_start + local_idx], src_name)
-                for pass_idx in range(h.num_loops):
-                    dst.data[pass_idx, local_idx].copy_(src.data)
-                src_state = state.get(src)
-                if src_state is None or "exp_avg" not in src_state:
-                    continue
-                dst_state = state.get(dst)
-                if dst_state is None or "exp_avg" not in dst_state:
-                    step_src = src_state["step"]
-                    dst_state = {
-                        "step": step_src.clone() if torch.is_tensor(step_src) else torch.tensor(float(step_src)),
-                        "exp_avg": torch.zeros_like(dst.data),
-                        "exp_avg_sq": torch.zeros_like(dst.data),
-                    }
-                    state[dst] = dst_state
-                for pass_idx in range(h.num_loops):
-                    dst_state["exp_avg"][pass_idx, local_idx].copy_(src_state["exp_avg"])
-                    dst_state["exp_avg_sq"][pass_idx, local_idx].copy_(src_state["exp_avg_sq"])
+        base_model.loop_extra_attn_scale.zero_()
+        base_model.loop_extra_mlp_scale.zero_()
+        base_model.loop_extra_resid_mix.zero_()
+        base_model.loop_extra_resid_mix[:, :, 0, :] = 1.0
+    state = optimizers.optimizer_scalar.state
+    for p in (
+        base_model.loop_extra_attn_scale,
+        base_model.loop_extra_mlp_scale,
+        base_model.loop_extra_resid_mix,
+    ):
+        state.pop(p, None)
 
 
 def train_model(h, device, val_data):
@@ -3621,13 +3602,23 @@ def train_model(h, device, val_data):
         elapsed_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
-        if (
+        enable_looping_now = (
             h.num_loops > 0
             and not base_model.looping_active
             and frac >= h.enable_looping_at
-        ):
+        )
+        if h.distributed and h.num_loops > 0 and not base_model.looping_active:
+            # `frac` includes local wallclock time, so ranks can cross the threshold
+            # on adjacent steps. LOOP_UNTIE adds params only used after activation;
+            # require all ranks to agree before flipping to keep grad buckets equal.
+            enable_flag = torch.tensor(
+                [1 if enable_looping_now else 0], device=device, dtype=torch.int32
+            )
+            dist.all_reduce(enable_flag, op=dist.ReduceOp.MIN)
+            enable_looping_now = bool(enable_flag.item())
+        if enable_looping_now:
             base_model.looping_active = True
-            _clone_loop_extras_from_source(base_model, optimizers, h)
+            _reset_loop_extras_to_init(base_model, optimizers)
             log(
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
