@@ -236,8 +236,6 @@ class Hyperparameters:
     # eager softcap+F.cross_entropy. Default ON since validated as at-worst neutral.
     fused_ce_enabled = bool(int(os.environ.get("FUSED_CE_ENABLED", "1")))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
-    train_seq_len_end = int(os.environ.get("TRAIN_SEQ_LEN_END", "0")) or train_seq_len
-    seq_len_bump_frac = float(os.environ.get("SEQ_LEN_BUMP_FRAC", 0.5))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
@@ -264,10 +262,6 @@ class Hyperparameters:
     loop_end = int(os.environ.get("LOOP_END", 5))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     loop_untie_extra_scalars = bool(int(os.environ.get("LOOP_UNTIE_EXTRA_SCALARS", "0")))
-    # Cross-rank all_reduce(MIN) on the looping_active / bumped trigger flips. Default
-    # ON to prevent the rank-skew NCCL deadlock with LOOP_UNTIE_EXTRA_SCALARS=1.
-    # Set =0 to disable (matches v2's behavior; deadlock-prone with LOOP_UNTIE on).
-    loop_trigger_sync = bool(int(os.environ.get("LOOP_TRIGGER_SYNC", "1")))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 8))
     parallel_final_lane = os.environ.get("PARALLEL_FINAL_LANE", "mean")
     min_lr = float(os.environ.get("MIN_LR", 0.0))
@@ -706,9 +700,9 @@ class DocumentPackingLoader:
 
 
 class ShuffledSequenceLoader:
-    def __init__(self, h, device, seq_len=None):
+    def __init__(self, h, device):
         self.world_size = h.world_size
-        self.seq_len = h.train_seq_len if seq_len is None else seq_len
+        self.seq_len = h.train_seq_len
         self.device = device
         all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
         if not all_files:
@@ -894,7 +888,7 @@ FusedLeakyReLUSquareMLP = FusedLinearLeakyReLUSquareFunction.apply
 
 
 class Rotary(nn.Module):
-    def __init__(self, dim, base=1e4, train_seq_len=1024, rope_dims=0, yarn=True, seq_len=None):
+    def __init__(self, dim, base=1e4, train_seq_len=1024, rope_dims=0, yarn=True):
         super().__init__()
         self.dim = dim
         self.base = base
@@ -905,83 +899,32 @@ class Rotary(nn.Module):
             torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._fixed_short_seq_len = 0
-        self._fixed_short_cos = None
-        self._fixed_short_sin = None
-        self._fixed_short_attn_scale_multiplier = 1.0
-        self._fixed_long_seq_len = 0
-        self._fixed_long_cos = None
-        self._fixed_long_sin = None
-        self._fixed_long_attn_scale_multiplier = 1.0
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
 
-    def _get_attn_scale_multiplier(self, yarn_seq_len):
-        if not (self.yarn and yarn_seq_len > self.train_seq_len):
-            return 1.0
-        yarn_scale = yarn_seq_len / self.train_seq_len
-        return 1.0 + 0.1 * math.log(yarn_scale)
-
-    def _build_cache(self, seq_len, device, yarn_seq_len=None):
-        yarn_seq_len = seq_len if yarn_seq_len is None else yarn_seq_len
-        rd = self.rope_dims
-        if self.yarn and yarn_seq_len > self.train_seq_len:
-            scale = yarn_seq_len / self.train_seq_len
-            new_base = self.base * scale ** (rd / (rd - 2))
-            inv_freq = 1.0 / new_base ** (
-                torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd
-            )
-        else:
-            inv_freq = self.inv_freq.float().to(device)
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-        return freqs.cos()[None, :, None, :], freqs.sin()[None, :, None, :]
-
-    def prime_fixed_slot(self, slot, seq_len, device, dtype, yarn_seq_len=None):
-        yarn_seq_len = seq_len if yarn_seq_len is None else yarn_seq_len
-        cos, sin = self._build_cache(seq_len, device, yarn_seq_len=yarn_seq_len)
-        if slot == 0:
-            self._fixed_short_cos = cos.to(dtype=dtype)
-            self._fixed_short_sin = sin.to(dtype=dtype)
-            self._fixed_short_seq_len = seq_len
-            self._fixed_short_attn_scale_multiplier = self._get_attn_scale_multiplier(
-                yarn_seq_len
-            )
-        elif slot == 1:
-            self._fixed_long_cos = cos.to(dtype=dtype)
-            self._fixed_long_sin = sin.to(dtype=dtype)
-            self._fixed_long_seq_len = seq_len
-            self._fixed_long_attn_scale_multiplier = self._get_attn_scale_multiplier(
-                yarn_seq_len
-            )
-        else:
-            raise ValueError(f"unsupported rotary slot {slot}")
-
-    def get_attn_scale_multiplier(self, cache_slot):
-        if cache_slot == 0:
-            return self._fixed_short_attn_scale_multiplier
-        if cache_slot == 1:
-            return self._fixed_long_attn_scale_multiplier
-        raise ValueError(f"unsupported rotary slot {cache_slot}")
-
-    def forward(self, seq_len, device, dtype, yarn_seq_len=None, cache_slot=None):
-        if cache_slot == 0:
-            if self._fixed_short_cos is None or self._fixed_short_seq_len < seq_len:
-                raise RuntimeError(
-                    f"rotary short slot not primed for seq_len={seq_len}, cached={self._fixed_short_seq_len}"
+    def forward(self, seq_len, device, dtype):
+        if (
+            self._cos_cached is None
+            or self._sin_cached is None
+            or self._seq_len_cached < seq_len
+            or self._cos_cached.device != device
+        ):
+            rd = self.rope_dims
+            if self.yarn and seq_len > self.train_seq_len:
+                scale = seq_len / self.train_seq_len
+                new_base = self.base * scale ** (rd / (rd - 2))
+                inv_freq = 1.0 / new_base ** (
+                    torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd
                 )
-            return (
-                self._fixed_short_cos[:, :seq_len].to(dtype=dtype),
-                self._fixed_short_sin[:, :seq_len].to(dtype=dtype),
-            )
-        if cache_slot == 1:
-            if self._fixed_long_cos is None or self._fixed_long_seq_len < seq_len:
-                raise RuntimeError(
-                    f"rotary long slot not primed for seq_len={seq_len}, cached={self._fixed_long_seq_len}"
-                )
-            return (
-                self._fixed_long_cos[:, :seq_len].to(dtype=dtype),
-                self._fixed_long_sin[:, :seq_len].to(dtype=dtype),
-            )
-        raise ValueError("rotary forward requires an explicit fixed cache_slot")
+            else:
+                inv_freq = self.inv_freq.float().to(device)
+            t = torch.arange(seq_len, device=device, dtype=torch.float32)
+            freqs = torch.outer(t, inv_freq)
+            self._cos_cached = freqs.cos()[None, :, None, :]
+            self._sin_cached = freqs.sin()[None, :, None, :]
+            self._seq_len_cached = seq_len
+        return self._cos_cached[:, :seq_len].to(dtype=dtype), self._sin_cached[:, :seq_len].to(dtype=dtype)
 
 
 def apply_rotary_emb(x, cos, sin, rope_dims=0):
@@ -1067,10 +1010,7 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
-    def _softmax_scale(self, rotary_slot):
-        return (self.head_dim ** -0.5) * self.rotary.get_attn_scale_multiplier(rotary_slot)
-
-    def forward(self, x, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0, rotary_slot=None):
+    def forward(self, x, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0):
         bsz, seqlen, dim = x.shape
         # q_raw kept around as a tap point for attn_out_gate_src='q' (post-projection,
         # pre-reshape, pre-RoPE).
@@ -1080,13 +1020,10 @@ class CausalSelfAttention(nn.Module):
         v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(
-            seqlen, x.device, q.dtype, yarn_seq_len=max_seqlen or seqlen, cache_slot=rotary_slot
-        )
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        softmax_scale = self._softmax_scale(rotary_slot)
         if cu_seqlens is not None:
             y = flash_attn_varlen_func(
                 q[0],
@@ -1097,11 +1034,10 @@ class CausalSelfAttention(nn.Module):
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
                 causal=True,
-                softmax_scale=softmax_scale,
                 window_size=(-1, -1),
             )[None]
         else:
-            y = flash_attn_3_func(q, k, v, causal=True, softmax_scale=softmax_scale)
+            y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         # AttnOutGate inlined (PR #1667). Inline + .contiguous() barrier so torch.compile
@@ -1188,24 +1124,35 @@ class Block(nn.Module):
         )
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
-    def forward(
-        self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None,
-        max_seqlen=0, rotary_slot=None, resid_mix=None, attn_scale=None, mlp_scale=None,
-    ):
-        mix_src = self.resid_mix if resid_mix is None else resid_mix
-        attn_scale_src = self.attn_scale if attn_scale is None else attn_scale
-        mlp_scale_src = self.mlp_scale if mlp_scale is None else mlp_scale
-        mix = mix_src.to(dtype=x.dtype)
+    def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
+        mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(
             self.attn_norm(x_in) * self.ln_scale_factor,
             q_w, k_w, v_w, out_w,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-            rotary_slot=rotary_slot,
         )
-        x_out = x_in + attn_scale_src.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + mlp_scale_src.to(dtype=x_out.dtype)[
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
+            None, None, :
+        ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        return x_out
+
+    def forward_with_overrides(
+        self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, resid_mix, attn_scale, mlp_scale,
+        cu_seqlens=None, max_seqlen=0,
+    ):
+        mix = resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(
+            self.attn_norm(x_in) * self.ln_scale_factor,
+            q_w, k_w, v_w, out_w,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        x_out = x_in + attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_out + mlp_scale.to(dtype=x_out.dtype)[
             None, None, :
         ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         return x_out
@@ -1313,11 +1260,13 @@ class GPT(nn.Module):
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
         if self.loop_untie_extra_scalars:
+            # Init mirrors source defaults; real values are cloned from per-block
+            # source scalars at loop activation (see _clone_loop_extras_from_source).
             self.loop_extra_attn_scale = nn.Parameter(
-                torch.zeros(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
+                torch.ones(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
             )
             self.loop_extra_mlp_scale = nn.Parameter(
-                torch.zeros(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
+                torch.ones(h.num_loops, self.loop_width, h.model_dim, dtype=torch.float32)
             )
             extra_resid_mix = torch.zeros(
                 h.num_loops, self.loop_width, 2, h.model_dim, dtype=torch.float32
@@ -1409,12 +1358,12 @@ class GPT(nn.Module):
                 self.loop_extra_attn_scale[extra_pass, loop_local_idx],
                 self.loop_extra_mlp_scale[extra_pass, loop_local_idx],
             )
-        return None, None, None
+        return (None, None, None)
 
     def _parallel_block(
         self, block_idx, lane0, lane1, x0,
         q_w, k_w, v_w, out_w, up_w, down_w,
-        cu_seqlens=None, max_seqlen=0, rotary_slot=None,
+        cu_seqlens=None, max_seqlen=0,
     ):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
@@ -1422,7 +1371,7 @@ class GPT(nn.Module):
         attn_out = block.attn(
             block.attn_norm(attn_read) * block.ln_scale_factor,
             q_w, k_w, v_w, out_w,
-            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
         )
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
         mlp_read = lane1
@@ -1444,7 +1393,7 @@ class GPT(nn.Module):
             return lane0
         return 0.5 * (lane0 + lane1)
 
-    def _forward_hidden(self, input_ids, cu_seqlens=None, max_seqlen=0, rotary_slot=None):
+    def _forward_hidden(self, input_ids, cu_seqlens=None, max_seqlen=0):
         """Run the encoder/decoder stack to the final RMSNorm; returns pre-projection hidden.
         Shared by eval (softcap+projection via forward_logits) and train (fused CE path)."""
         x = self.tok_emb(input_ids)
@@ -1473,14 +1422,17 @@ class GPT(nn.Module):
         )
         for i, extra_pass, loop_local_idx in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
-                extra_pass, loop_local_idx
-            )
-            x = self.blocks[i](
-                x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
-                resid_mix=resid_mix, attn_scale=attn_scale, mlp_scale=mlp_scale,
-            )
+            if extra_pass < 0:
+                x = self.blocks[i](
+                    x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                )
+            else:
+                rm, as_, ms = self._block_scalar_overrides(extra_pass, loop_local_idx)
+                x = self.blocks[i].forward_with_overrides(
+                    x, x0, q_w, k_w, v_w, out_w, up_w, down_w, rm, as_, ms,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                )
             skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
@@ -1501,7 +1453,7 @@ class GPT(nn.Module):
                         lane0 = lane0 + w * skip
                 lane0, lane1 = self._parallel_block(
                     i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                 )
             else:
                 if skip_idx < self.num_skip_weights and skips:
@@ -1514,14 +1466,17 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
-                    extra_pass, loop_local_idx
-                )
-                x = self.blocks[i](
-                    x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
-                    resid_mix=resid_mix, attn_scale=attn_scale, mlp_scale=mlp_scale,
-                )
+                if extra_pass < 0:
+                    x = self.blocks[i](
+                        x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    )
+                else:
+                    rm, as_, ms = self._block_scalar_overrides(extra_pass, loop_local_idx)
+                    x = self.blocks[i].forward_with_overrides(
+                        x, x0, q_w, k_w, v_w, out_w, up_w, down_w, rm, as_, ms,
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    )
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
@@ -1532,17 +1487,13 @@ class GPT(nn.Module):
             return F.linear(hidden, self.tok_emb.weight)
         return self.lm_head(hidden)
 
-    def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0, rotary_slot=None):
-        hidden = self._forward_hidden(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot
-        )
+    def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
+        hidden = self._forward_hidden(input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         logits_proj = self._project_logits(hidden)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids, target_ids, cu_seqlens=None, max_seqlen=0, rotary_slot=None):
-        hidden = self._forward_hidden(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rotary_slot=rotary_slot
-        )
+    def forward(self, input_ids, target_ids, cu_seqlens=None, max_seqlen=0):
+        hidden = self._forward_hidden(input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         logits_proj = self._project_logits(hidden)
         flat_targets = target_ids.reshape(-1)
         # Fused softcapped-CE kernel (training path only). Applies softcap inside the
@@ -1562,7 +1513,7 @@ class GPT(nn.Module):
             reduction="mean",
         )
 
-    def forward_ttt(self, input_ids, target_ids, lora, max_seqlen=0, rotary_slot=None):
+    def forward_ttt(self, input_ids, target_ids, lora):
         x = self.tok_emb(input_ids)
         # SmearGate on the TTT path — same inline compute as forward_logits.
         # Cross-doc leak fix: see _forward_hidden comment.
@@ -1588,11 +1539,16 @@ class GPT(nn.Module):
         slot = 0
         for i, extra_pass, loop_local_idx in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            x = self._block_with_lora(
-                self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w,
-                down_w, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
-                extra_pass=extra_pass, loop_local_idx=loop_local_idx,
-            )
+            if extra_pass < 0:
+                x = self._block_with_lora(
+                    self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
+                )
+            else:
+                rm, as_, ms = self._block_scalar_overrides(extra_pass, loop_local_idx)
+                x = self._block_with_lora_with_overrides(
+                    self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
+                    rm, as_, ms,
+                )
             slot += 1
             skips.append(x)
         psl = self.parallel_start_layer
@@ -1615,8 +1571,6 @@ class GPT(nn.Module):
                 lane0, lane1 = self._parallel_block_with_lora(
                     i, lane0, lane1, x0, lora, slot,
                     q_w, k_w, v_w, out_w, up_w, down_w,
-                    max_seqlen=max_seqlen,
-                    rotary_slot=rotary_slot,
                 )
             else:
                 if skip_idx < self.num_skip_weights and skips:
@@ -1629,11 +1583,16 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                x = self._block_with_lora(
-                    self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w,
-                    down_w, max_seqlen=max_seqlen, rotary_slot=rotary_slot,
-                    extra_pass=extra_pass, loop_local_idx=loop_local_idx,
-                )
+                if extra_pass < 0:
+                    x = self._block_with_lora(
+                        self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
+                    )
+                else:
+                    rm, as_, ms = self._block_scalar_overrides(extra_pass, loop_local_idx)
+                    x = self._block_with_lora_with_overrides(
+                        self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
+                        rm, as_, ms,
+                    )
             slot += 1
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
@@ -1649,17 +1608,8 @@ class GPT(nn.Module):
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
         ).reshape(bsz, sl)
 
-    def _block_with_lora(
-        self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
-        max_seqlen=0, rotary_slot=None, extra_pass=-1, loop_local_idx=-1,
-    ):
-        resid_mix, attn_scale, mlp_scale = self._block_scalar_overrides(
-            extra_pass, loop_local_idx
-        )
-        mix_src = block.resid_mix if resid_mix is None else resid_mix
-        attn_scale_src = block.attn_scale if attn_scale is None else attn_scale
-        mlp_scale_src = block.mlp_scale if mlp_scale is None else mlp_scale
-        mix = mix_src.to(dtype=x.dtype)
+    def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
+        mix = block.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1676,19 +1626,11 @@ class GPT(nn.Module):
         )
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = attn.rotary(
-            seqlen,
-            n.device,
-            q.dtype,
-            yarn_seq_len=max_seqlen or seqlen,
-            cache_slot=rotary_slot,
-        )
+        cos, sin = attn.rotary(seqlen, n.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(
-            q, k, v, causal=True, softmax_scale=attn._softmax_scale(rotary_slot)
-        )
+        y = flash_attn_3_func(q, k, v, causal=True)
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         # AttnOutGate (TTT path) — inline + .contiguous() barrier, same as the eval path.
@@ -1717,18 +1659,72 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        x_out = x_in + attn_scale_src.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        x_out = x_out + mlp_scale_src.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+        x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+        return x_out
+
+    def _block_with_lora_with_overrides(
+        self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w,
+        resid_mix, attn_scale, mlp_scale,
+    ):
+        mix = resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        n = block.attn_norm(x_in) * block.ln_scale_factor
+        attn = block.attn
+        bsz, seqlen, dim = n.shape
+        q_raw = F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)
+        q = q_raw.reshape(bsz, seqlen, attn.num_heads, attn.head_dim)
+        k = F.linear(n, k_w.to(n.dtype))
+        if lora.k_loras is not None:
+            k = k + lora.k_loras[slot](n)
+        k = k.reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
+        v = (F.linear(n, v_w.to(n.dtype)) + lora.v_loras[slot](n)).reshape(
+            bsz, seqlen, attn.num_kv_heads, attn.head_dim
+        )
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = attn.rotary(seqlen, n.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
+        k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
+        q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        y = flash_attn_3_func(q, k, v, causal=True)
+        if attn.use_xsa:
+            y = attn._xsa_efficient(y, v)
+        if attn.attn_out_gate:
+            gate_src = q_raw if attn.attn_out_gate_src == "q" else n
+            gate_in = gate_src[..., : attn.gate_window].contiguous()
+            g = 2.0 * torch.sigmoid(attn.attn_gate_proj(gate_in))
+            y = y * g[..., None]
+        if attn.gated_attn:
+            n_c = n.contiguous()
+            g = torch.sigmoid(F.linear(n_c, attn.attn_gate_w.to(n.dtype)))
+            y = y * g[..., None]
+        if attn.sparse_attn_gate:
+            gate_in = n[..., : attn.gate_window].contiguous()
+            g = torch.sigmoid(
+                attn.sparse_attn_gate_scale
+                * F.linear(gate_in, attn.attn_gate_w.to(n.dtype))
+            )
+            y = y * g[..., None]
+        y = y.reshape(bsz, seqlen, dim)
+        attn_out = F.linear(y, out_w.to(n.dtype))
+        if lora.o_loras is not None:
+            attn_out = attn_out + lora.o_loras[slot](n)
+        x_out = x_in + attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
+        mlp_out = block.mlp(mlp_n, up_w, down_w)
+        if lora.mlp_loras is not None:
+            mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
+        x_out = x_out + mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
         return x_out
 
     def _parallel_block_with_lora(
         self, block_idx, lane0, lane1, x0, lora, slot,
         q_w, k_w, v_w, out_w, up_w, down_w,
-        max_seqlen=0, rotary_slot=None,
     ):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
@@ -1747,19 +1743,11 @@ class GPT(nn.Module):
         )
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = attn.rotary(
-            seqlen,
-            n.device,
-            q.dtype,
-            yarn_seq_len=max_seqlen or seqlen,
-            cache_slot=rotary_slot,
-        )
+        cos, sin = attn.rotary(seqlen, n.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(
-            q, k, v, causal=True, softmax_scale=attn._softmax_scale(rotary_slot)
-        )
+        y = flash_attn_3_func(q, k, v, causal=True)
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         # AttnOutGate (TTT parallel path) — inline + .contiguous() barrier.
@@ -2305,7 +2293,7 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
     with torch.no_grad():
         for _ in range(n_calibration_batches):
             x, _ = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
-            model.forward_logits(x, max_seqlen=h.eval_seq_len, rotary_slot=1)
+            model.forward_logits(x)
     for hook in hooks:
         hook.remove()
     for i, block in enumerate(model.blocks):
@@ -2826,7 +2814,7 @@ def serialize(h, base_model, code):
     sd_cpu = _unbank_state_dict(base_model.state_dict(), h.num_layers)
     device = torch.device("cuda", h.local_rank)
     t0 = time.perf_counter()
-    calib_loader = ShuffledSequenceLoader(h, device, seq_len=h.eval_seq_len)
+    calib_loader = ShuffledSequenceLoader(h, device)
     log("GPTQ:collecting Hessians from calibration data...")
     hessians = collect_hessians(
         base_model,
@@ -2902,7 +2890,7 @@ def _loss_bpb(loss_sum, token_count, byte_count):
     return val_loss, val_bpb
 
 
-def eval_val(h, device, val_data, model, forward_logits_fn=None, fixed_max_seqlen=None):
+def eval_val(h, device, val_data, model, forward_logits_fn=None):
     seq_len = h.eval_seq_len
     local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
     if local_batch_tokens < seq_len:
@@ -2943,10 +2931,9 @@ def eval_val(h, device, val_data, model, forward_logits_fn=None, fixed_max_seqle
             cu_seqlens, max_seqlen = _build_cu_seqlens(
                 bos_pos, x.numel(), x.device, h.eval_seq_len, 64
             )
-            eval_max_seqlen = max_seqlen if fixed_max_seqlen is None else fixed_max_seqlen
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = run_forward_logits(
-                    x[None], cu_seqlens=cu_seqlens, max_seqlen=eval_max_seqlen
+                    x[None], cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
                 ).detach()
             per_token_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
@@ -3140,55 +3127,44 @@ def train_val_ttt_global_sgd_distributed(h, device, val_data, base_model, val_to
             )
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
-        # Keep optimizer/all-reduce cadence identical across ranks even when a
-        # chunk contains fewer eval-length sequences than GPUs. The old static
-        # shard could give some ranks zero local work for a chunk, causing them
-        # to skip the gradient all-reduces entirely and deadlock the others.
-        global_step_span = max(1, batch_seqs * h.world_size)
-        num_sync_steps = (chunk_seqs + global_step_span - 1) // global_step_span
+        my_seq_s = chunk_seqs * h.rank // h.world_size
+        my_seq_e = chunk_seqs * (h.rank + 1) // h.world_size
+        my_chunk_seqs = my_seq_e - my_seq_s
         for _ in range(h.global_ttt_epochs):
-            for sync_step in range(num_sync_steps):
-                seq_base = sync_step * global_step_span + h.rank * batch_seqs
-                local_seq_s = min(seq_base, chunk_seqs)
-                local_seq_e = min(seq_base + batch_seqs, chunk_seqs)
-                local_chunk_seqs = local_seq_e - local_seq_s
+            for bs in range(0, my_chunk_seqs, batch_seqs):
+                be = min(bs + batch_seqs, my_chunk_seqs)
+                actual_bs = my_seq_s + bs
+                start_tok = chunk_start + actual_bs * seq_len
+                end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
+                if end_tok > val_tokens.numel():
+                    continue
+                local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
+                x_flat = local[:-1]
+                y_flat = local[1:]
                 optimizer.zero_grad(set_to_none=True)
-                if local_chunk_seqs > 0:
-                    start_tok = chunk_start + local_seq_s * seq_len
-                    end_tok = chunk_start + local_seq_e * seq_len + 1
-                    if end_tok <= val_tokens.numel():
-                        local = val_tokens[start_tok:end_tok].to(
-                            device=device, dtype=torch.int64
-                        )
-                        x_flat = local[:-1]
-                        y_flat = local[1:]
-                        with torch.enable_grad():
-                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                if h.global_ttt_respect_doc_boundaries:
-                                    bos_pos = (x_flat == BOS_ID).nonzero(as_tuple=True)[0].tolist()
-                                    cu_seqlens, max_seqlen = _build_cu_seqlens(
-                                        bos_pos, x_flat.numel(), x_flat.device, h.eval_seq_len, 64
-                                    )
-                                    loss = base_model(
-                                        x_flat[None],
-                                        y_flat[None],
-                                        cu_seqlens=cu_seqlens,
-                                        max_seqlen=h.ttt_eval_seq_len,
-                                        rotary_slot=1,
-                                    )
-                                else:
-                                    x = x_flat.reshape(-1, seq_len)
-                                    y = y_flat.reshape(-1, seq_len)
-                                    loss = base_model(
-                                        x, y, max_seqlen=h.ttt_eval_seq_len, rotary_slot=1
-                                    )
-                        loss.backward()
+                with torch.enable_grad():
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        if h.global_ttt_respect_doc_boundaries:
+                            bos_pos = (x_flat == BOS_ID).nonzero(as_tuple=True)[0].tolist()
+                            cu_seqlens, max_seqlen = _build_cu_seqlens(
+                                bos_pos, x_flat.numel(), x_flat.device, h.eval_seq_len, 64
+                            )
+                            loss = base_model(
+                                x_flat[None],
+                                y_flat[None],
+                                cu_seqlens=cu_seqlens,
+                                max_seqlen=max_seqlen,
+                            )
+                        else:
+                            x = x_flat.reshape(-1, seq_len)
+                            y = y_flat.reshape(-1, seq_len)
+                            loss = base_model(x, y)
+                loss.backward()
                 if dist.is_available() and dist.is_initialized():
                     for p in ttt_params:
-                        if p.grad is None:
-                            p.grad = torch.zeros_like(p)
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                        p.grad.mul_(1.0 / h.world_size)
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                            p.grad.mul_(1.0 / h.world_size)
                 if h.global_ttt_grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(ttt_params, h.global_ttt_grad_clip)
                 optimizer.step()
@@ -3513,96 +3489,49 @@ def timed_eval(label, fn, *args, **kwargs):
     return val_loss, val_bpb
 
 
-def _reset_rotary_caches(model):
-    for block in model.blocks:
-        rotary = block.attn.rotary
-        rotary._fixed_short_seq_len = 0
-        rotary._fixed_short_cos = None
-        rotary._fixed_short_sin = None
-        rotary._fixed_short_attn_scale_multiplier = 1.0
-        rotary._fixed_long_seq_len = 0
-        rotary._fixed_long_cos = None
-        rotary._fixed_long_sin = None
-        rotary._fixed_long_attn_scale_multiplier = 1.0
-
-
-def _prime_rotary_fixed_slots(model, slot_specs, device, dtype=torch.bfloat16):
-    for block in model.blocks:
-        rotary = block.attn.rotary
-        for slot, seq_len, yarn_seq_len in slot_specs:
-            rotary.prime_fixed_slot(
-                slot, seq_len, device, dtype, yarn_seq_len=yarn_seq_len
-            )
-
-
-def _validate_fixed_rotary_config(h):
-    if h.train_seq_len_end != h.eval_seq_len:
-        raise ValueError(
-            "fixed rotary short/long regimes require TRAIN_SEQ_LEN_END == EVAL_SEQ_LEN"
-        )
-    if h.ttt_enabled and h.ttt_eval_seq_len != h.eval_seq_len:
-        raise ValueError(
-            "fixed rotary short/long regimes require TTT_EVAL_SEQ_LEN == EVAL_SEQ_LEN"
-        )
+def _clone_loop_extras_from_source(base_model, optimizers, h):
+    """At loop activation, copy each block's attn_scale/mlp_scale/resid_mix into
+    the corresponding loop_extra_* slot, and broadcast the source AdamW state
+    (exp_avg, exp_avg_sq, step) into each [pass_idx, local_idx] dest slice."""
+    if base_model.loop_extra_attn_scale is None:
+        return
+    state = optimizers.optimizer_scalar.state
+    pairs = (
+        ("attn_scale", base_model.loop_extra_attn_scale),
+        ("mlp_scale", base_model.loop_extra_mlp_scale),
+        ("resid_mix", base_model.loop_extra_resid_mix),
+    )
+    with torch.no_grad():
+        for src_name, dst in pairs:
+            for local_idx in range(base_model.loop_width):
+                src = getattr(base_model.blocks[h.loop_start + local_idx], src_name)
+                for pass_idx in range(h.num_loops):
+                    dst.data[pass_idx, local_idx].copy_(src.data)
+                src_state = state.get(src)
+                if src_state is None or "exp_avg" not in src_state:
+                    continue
+                dst_state = state.get(dst)
+                if dst_state is None or "exp_avg" not in dst_state:
+                    step_src = src_state["step"]
+                    dst_state = {
+                        "step": step_src.clone() if torch.is_tensor(step_src) else torch.tensor(float(step_src)),
+                        "exp_avg": torch.zeros_like(dst.data),
+                        "exp_avg_sq": torch.zeros_like(dst.data),
+                    }
+                    state[dst] = dst_state
+                for pass_idx in range(h.num_loops):
+                    dst_state["exp_avg"][pass_idx, local_idx].copy_(src_state["exp_avg"])
+                    dst_state["exp_avg_sq"][pass_idx, local_idx].copy_(src_state["exp_avg_sq"])
 
 
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
-    short_train_seq_len = h.train_seq_len
-    long_train_seq_len = h.train_seq_len_end
-    microbatch_tokens_local = h.train_batch_tokens // (
-        h.world_size * h.grad_accum_steps
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_forward_logits = torch.compile(
+        base_model.forward_logits, dynamic=False, fullgraph=True
     )
-    eval_batch_tokens_local = h.val_batch_tokens // (
-        h.world_size * h.grad_accum_steps
-    )
-    rotary_slot_tokens = max(microbatch_tokens_local, eval_batch_tokens_local)
-    _prime_rotary_fixed_slots(
-        base_model,
-        (
-            (0, rotary_slot_tokens, short_train_seq_len),
-            (1, rotary_slot_tokens, long_train_seq_len),
-        ),
-        device,
-    )
-
-    def _train_forward_short(input_ids, target_ids, cu_seqlens=None):
-        return base_model(
-            input_ids,
-            target_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=short_train_seq_len,
-            rotary_slot=0,
-        )
-
-    def _train_forward_long(input_ids, target_ids, cu_seqlens=None):
-        return base_model(
-            input_ids,
-            target_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=long_train_seq_len,
-            rotary_slot=1,
-        )
-
-    compiled_train_short = torch.compile(
-        _train_forward_short, dynamic=False, fullgraph=True
-    )
-    compiled_train_long = (
-        compiled_train_short
-        if long_train_seq_len == short_train_seq_len
-        else torch.compile(_train_forward_long, dynamic=False, fullgraph=True)
-    )
-
-    def _forward_logits_long(input_ids, cu_seqlens=None, max_seqlen=0):
-        return base_model.forward_logits(
-            input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len, rotary_slot=1
-        )
-
-    compiled_forward_logits_long = torch.compile(
-        _forward_logits_long, dynamic=False, fullgraph=True
-    )
-    model = base_model
+    model = compiled_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
     optimizers = Optimizers(h, base_model)
     train_loader = DocumentPackingLoader(h, device)
@@ -3628,14 +3557,14 @@ def train_model(h, device, val_data):
         return 1.0
 
     _clip_params = [p for p in base_model.parameters() if p.requires_grad]
-    def step_fn(step, lr_scale, train_forward):
+    def step_fn(step, lr_scale):
         train_loss = torch.zeros((), device=device)
         for micro_step in range(h.grad_accum_steps):
             x, y, cu_seqlens, _max_seqlen = train_loader.next_batch(
                 h.train_batch_tokens, h.grad_accum_steps
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = train_forward(x, y, cu_seqlens=cu_seqlens)
+                loss = model(x, y, cu_seqlens=cu_seqlens, max_seqlen=h.train_seq_len)
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
@@ -3677,17 +3606,19 @@ def train_model(h, device, val_data):
             copy.deepcopy(opt.state_dict()) for opt in optimizers
         ]
         model.train()
+        num_tokens_local = h.train_batch_tokens // h.world_size
+        for blk in base_model.blocks:
+            blk.attn.rotary(num_tokens_local, device, torch.bfloat16)
         cu_bucket_size = train_loader.cu_bucket_size
         warmup_cu_buckets = tuple(cu_bucket_size * i for i in range(1, 5))
         warmup_cu_iters = 3
+        x, y, cu_seqlens, _ = train_loader.next_batch(
+            h.train_batch_tokens, h.grad_accum_steps
+        )
         log(f"warmup_cu_buckets:{','.join(str(b) for b in warmup_cu_buckets)} iters_each:{warmup_cu_iters}")
-
-        def _run_cu_bucket_warmup(train_forward, seq_len):
-            x, y, cu_seqlens, _ = train_loader.next_batch(
-                h.train_batch_tokens, h.grad_accum_steps
-            )
+        def _run_cu_bucket_warmup():
             for bucket_len in warmup_cu_buckets:
-                boundaries = list(range(0, x.size(1), max(seq_len, 1)))
+                boundaries = list(range(0, x.size(1), max(h.train_seq_len, 1)))
                 if boundaries[-1] != x.size(1):
                     boundaries.append(x.size(1))
                 cu = torch.full((bucket_len,), x.size(1), dtype=torch.int32, device=device)
@@ -3695,17 +3626,16 @@ def train_model(h, device, val_data):
                 for _ in range(warmup_cu_iters):
                     optimizers.zero_grad_all()
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        wloss = train_forward(x, y, cu_seqlens=cu)
+                        wloss = model(x, y, cu_seqlens=cu, max_seqlen=h.train_seq_len)
                     (wloss / h.grad_accum_steps).backward()
             optimizers.zero_grad_all()
-
-        _run_cu_bucket_warmup(compiled_train_short, short_train_seq_len)
+        _run_cu_bucket_warmup()
         if h.num_loops > 0:
             base_model.looping_active = True
-            _run_cu_bucket_warmup(compiled_train_short, short_train_seq_len)
+            _run_cu_bucket_warmup()
             base_model.looping_active = False
         for warmup_step in range(h.warmup_steps):
-            step_fn(warmup_step, 1.0, compiled_train_short)
+            step_fn(warmup_step, 1.0)
             if (
                 warmup_step <= 5
                 or (warmup_step + 1) % 10 == 0
@@ -3718,7 +3648,7 @@ def train_model(h, device, val_data):
                 f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
             for warmup_step in range(h.warmup_steps):
-                step_fn(warmup_step, 1.0, compiled_train_short)
+                step_fn(warmup_step, 1.0)
                 if (
                     warmup_step <= 5
                     or (warmup_step + 1) % 10 == 0
@@ -3731,75 +3661,6 @@ def train_model(h, device, val_data):
             opt.load_state_dict(state)
         optimizers.zero_grad_all()
         train_loader = DocumentPackingLoader(h, device)
-        if h.train_seq_len_end != h.train_seq_len:
-            bump_model_state = {
-                name: tensor.detach().cpu().clone()
-                for (name, tensor) in base_model.state_dict().items()
-            }
-            bump_optimizer_states = [
-                copy.deepcopy(opt.state_dict()) for opt in optimizers
-            ]
-            old_seq_len = train_loader.max_seq_len
-            old_looping = base_model.looping_active
-            train_loader.max_seq_len = long_train_seq_len
-            log(
-                f"bump_prewarm:seq_len:{old_seq_len}->{train_loader.max_seq_len} "
-                f"looping:{int(h.num_loops > 0 and h.enable_looping_at <= h.seq_len_bump_frac)}"
-            )
-            _run_cu_bucket_warmup(compiled_train_long, long_train_seq_len)
-            if h.num_loops > 0 and h.enable_looping_at <= h.seq_len_bump_frac:
-                base_model.looping_active = True
-                _run_cu_bucket_warmup(compiled_train_long, long_train_seq_len)
-                for warmup_step in range(h.warmup_steps):
-                    step_fn(warmup_step, 1.0, compiled_train_long)
-                    if (
-                        warmup_step <= 5
-                        or (warmup_step + 1) % 10 == 0
-                        or warmup_step + 1 == h.warmup_steps
-                    ):
-                        log(f"bump_loop_warmup_step: {warmup_step+1}/{h.warmup_steps}")
-            else:
-                for warmup_step in range(h.warmup_steps):
-                    step_fn(warmup_step, 1.0, compiled_train_long)
-                    if (
-                        warmup_step <= 5
-                        or (warmup_step + 1) % 10 == 0
-                        or warmup_step + 1 == h.warmup_steps
-                    ):
-                        log(f"bump_warmup_step: {warmup_step+1}/{h.warmup_steps}")
-            base_model.load_state_dict(bump_model_state, strict=True)
-            for (opt, state) in zip(optimizers, bump_optimizer_states, strict=True):
-                opt.load_state_dict(state)
-            optimizers.zero_grad_all()
-            train_loader.max_seq_len = old_seq_len
-            base_model.looping_active = old_looping
-            train_loader = DocumentPackingLoader(h, device)
-
-    def _warm_eval_logits(forward_logits_fn):
-        global BOS_ID
-        if BOS_ID is None:
-            BOS_ID = 1
-        local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
-        local_batch_seqs = max(local_batch_tokens // h.eval_seq_len, 1)
-        raw_end = local_batch_seqs * h.eval_seq_len + 1
-        local = val_data.val_tokens[:raw_end].to(
-            device=device, dtype=torch.int64, non_blocking=True
-        )
-        x = local[:-1]
-        bos_pos = (x == BOS_ID).nonzero(as_tuple=True)[0].tolist()
-        for bucket_len in (64, 128, 192, 256):
-            cu_seqlens, _ = _build_cu_seqlens(
-                bos_pos, x.numel(), x.device, h.eval_seq_len, 64
-            )
-            if cu_seqlens.numel() > bucket_len:
-                continue
-            cu = torch.full((bucket_len,), x.numel(), dtype=torch.int32, device=device)
-            cu[: cu_seqlens.numel()] = cu_seqlens
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                forward_logits_fn(x[None], cu_seqlens=cu, max_seqlen=h.eval_seq_len).detach()
-        torch.cuda.synchronize()
-
-    _warm_eval_logits(compiled_forward_logits_long)
     _live_state = base_model.state_dict(keep_vars=True)
     ema_state = {
         name: t.detach().float().clone()
@@ -3809,7 +3670,6 @@ def train_model(h, device, val_data):
     ema_decay = h.ema_decay
     training_time_ms = 0.0
     stop_after_step = None
-    bumped = h.train_seq_len_end == h.train_seq_len
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -3826,12 +3686,7 @@ def train_model(h, device, val_data):
             torch.cuda.synchronize()
             training_time_ms += 1e3 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
-                h,
-                device,
-                val_data,
-                model,
-                compiled_forward_logits_long,
-                fixed_max_seqlen=h.eval_seq_len,
+                h, device, val_data, model, compiled_forward_logits
             )
             log(
                 f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}"
@@ -3847,38 +3702,17 @@ def train_model(h, device, val_data):
         elapsed_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
-        # Sync trigger flips across ranks via all_reduce(MIN) — without this,
-        # per-rank elapsed_ms drift can produce divergent forward graphs at the
-        # threshold-crossing step. With LOOP_UNTIE the gradient set differs
-        # (loop_extra_* on some ranks, not others) → packed-grad bucket size
-        # mismatch → NCCL deadlock. Once flipped, the gate skips the all_reduce.
-        if h.num_loops > 0 and not base_model.looping_active:
-            should_activate = torch.tensor(
-                int(frac >= h.enable_looping_at), device=device, dtype=torch.int32
+        if (
+            h.num_loops > 0
+            and not base_model.looping_active
+            and frac >= h.enable_looping_at
+        ):
+            base_model.looping_active = True
+            _clone_loop_extras_from_source(base_model, optimizers, h)
+            log(
+                f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
-            if h.distributed and h.loop_trigger_sync:
-                dist.all_reduce(should_activate, op=dist.ReduceOp.MIN)
-            if should_activate.item():
-                base_model.looping_active = True
-                log(
-                    f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
-                )
-        if not bumped:
-            should_bump = torch.tensor(
-                int(frac >= h.seq_len_bump_frac), device=device, dtype=torch.int32
-            )
-            if h.distributed and h.loop_trigger_sync:
-                dist.all_reduce(should_bump, op=dist.ReduceOp.MIN)
-            if should_bump.item():
-                bumped = True
-                old_seq_len = train_loader.max_seq_len
-                train_loader.max_seq_len = long_train_seq_len
-                log(
-                    f"seq_len_curriculum:bump step:{step} frac:{frac:.3f} "
-                    f"seq_len:{old_seq_len}->{train_loader.max_seq_len}"
-                )
-        active_train_forward = compiled_train_long if bumped else compiled_train_short
-        train_loss = step_fn(step, scale, active_train_forward)
+        train_loss = step_fn(step, scale)
         with torch.no_grad():
             for ema_t, t in _ema_pairs:
                 ema_t.mul_(ema_decay).add_(t.detach(), alpha=1.0 - ema_decay)
@@ -3910,11 +3744,10 @@ def train_model(h, device, val_data):
         name: t.to(dtype=current_state[name].dtype) for (name, t) in ema_state.items()
     }
     base_model.load_state_dict(avg_state, strict=True)
-    return base_model, base_model, compiled_forward_logits_long
+    return base_model, compiled_model, compiled_forward_logits
 
 
 def train_and_eval(h, device):
-    _validate_fixed_rotary_config(h)
     random.seed(h.seed)
     np.random.seed(h.seed)
     torch.manual_seed(h.seed)
@@ -3948,7 +3781,6 @@ def train_and_eval(h, device):
             val_data,
             compiled_model,
             compiled_forward_logits,
-            fixed_max_seqlen=h.eval_seq_len,
         )
         if os.environ.get("PREQUANT_ONLY", "0") == "1":
             log("PREQUANT_ONLY=1 — skipping serialize/GPTQ/post-quant eval/TTT")
@@ -3957,26 +3789,12 @@ def train_and_eval(h, device):
         if h.distributed:
             dist.barrier()
     eval_model = deserialize(h, device)
-    eval_batch_tokens_local = h.val_batch_tokens // (
-        h.world_size * h.grad_accum_steps
-    )
-    _prime_rotary_fixed_slots(
-        eval_model,
-        ((1, eval_batch_tokens_local, h.eval_seq_len),),
-        device,
-    )
     if h.num_loops > 0:
         eval_model.looping_active = True
     if not ttt_eval_only:
         compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
-
-        def _forward_logits_eval_quant(input_ids, cu_seqlens=None, max_seqlen=0):
-            return eval_model.forward_logits(
-                input_ids, cu_seqlens=cu_seqlens, max_seqlen=h.eval_seq_len, rotary_slot=1
-            )
-
         compiled_forward_logits = torch.compile(
-            _forward_logits_eval_quant, dynamic=False, fullgraph=True
+            eval_model.forward_logits, dynamic=False, fullgraph=True
         )
         timed_eval(
             "diagnostic quantized",
@@ -3986,12 +3804,11 @@ def train_and_eval(h, device):
             val_data,
             compiled_model,
             compiled_forward_logits,
-            fixed_max_seqlen=h.eval_seq_len,
         )
         del eval_model
     if h.ttt_enabled:
         if not ttt_eval_only:
-            del compiled_model, compiled_forward_logits
+            del compiled_model
         if ttt_eval_only:
             del eval_model
         torch._dynamo.reset()
@@ -4002,31 +3819,19 @@ def train_and_eval(h, device):
         for p in ttt_model.parameters():
             p.requires_grad_(False)
 
-        _prime_rotary_fixed_slots(
-            ttt_model,
-            (
-                (
-                    1,
-                    max(
-                        eval_batch_tokens_local,
-                        h.ttt_chunk_size,
-                        h.ttt_eval_seq_len,
-                        h.global_ttt_batch_seqs * h.eval_seq_len,
-                    ),
-                    h.ttt_eval_seq_len,
-                ),
-            ),
-            device,
-        )
+        if h.rope_yarn:
+            _yarn_seqlen = h.train_batch_tokens // h.grad_accum_steps
+            for block in ttt_model.blocks:
+                block.attn.rotary(_yarn_seqlen, device, torch.bfloat16)
+        else:
+            for block in ttt_model.blocks:
+                block.attn.rotary._cos_cached = None
+                block.attn.rotary._sin_cached = None
+                block.attn.rotary._seq_len_cached = 0
+                block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
 
         def _fwd_ttt_inner(input_ids, target_ids, lora):
-            return ttt_model.forward_ttt(
-                input_ids,
-                target_ids,
-                lora=lora,
-                max_seqlen=h.ttt_eval_seq_len,
-                rotary_slot=1,
-            )
+            return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
 
         _fwd_ttt_compiled_inner = None
 
@@ -4042,15 +3847,7 @@ def train_and_eval(h, device):
         if BOS_ID is None:
             BOS_ID = 1
         t_warmup = time.perf_counter()
-        # The TTT loop runs the LoRA path with the frozen base model in eval
-        # mode. Warm that exact guard state, plus the possible final partial
-        # doc batch, so the timed TTT pass does not pay for avoidable compiles.
-        ttt_model.eval()
         warmup_bszes = [h.ttt_batch_size]
-        warmup_docs = len(_select_ttt_doc_entries(_find_docs(val_data.val_tokens), h))
-        tail_bsz = warmup_docs % h.ttt_batch_size
-        if tail_bsz:
-            warmup_bszes.append(tail_bsz)
         for bsz in warmup_bszes:
             wl = BatchedTTTLoRA(
                 bsz, ttt_model, h.ttt_lora_rank,
@@ -4125,7 +3922,7 @@ def main():
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
     torch._dynamo.config.optimize_ddp = False
-    torch._dynamo.config.cache_size_limit = 512
+    torch._dynamo.config.cache_size_limit = 64
     h = Hyperparameters()
     set_logging_hparams(h)
     if h.is_main_process:
